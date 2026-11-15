@@ -24,10 +24,7 @@
   brew install wimlib qemu libslirp glib pkg-config python
   ```
   `qemu` 只用来取它附带的 UEFI 固件文件（`edk2-aarch64-code.fd`、`edk2-arm-vars.fd`），不会运行 QEMU。
-- **Windows 11 24H2 ARM64 零售版 ESD**（英文版，`Win11_24H2_ARM64_en-us.esd`）。它是微软 Media Creation Tool
-  下载的那种安装文件，下载地址在微软的 `products.xml` 里（Media Creation Tool 使用的目录文件：
-  `https://go.microsoft.com/fwlink/?LinkId=2156292`，打开后在里面找 `Architecture` 为 `ARM64`、语言 `en-us`、
-  版本含 `Professional` 的那一项的 `FilePath`）。
+- **Windows 11 24H2 ARM64 零售版 ESD**（英文版，约 4.5 GB），从微软官方服务器下载，见第 3 步。
 - 你自己的 Windows 11 授权。
 
 ## 第 1 步：取得源码并打上补丁
@@ -49,16 +46,43 @@ make -j8 all
 
 得到 `build/winvm`（Mac 上运行的同一个模拟器，用来安装 Windows）和 `build/hvsparse`（打包工具）。
 
-## 第 3 步：放好 ESD，检查它的内容
+## 第 3 步：下载 Windows 11 ARM64 ESD
+
+ESD 是微软 Media Creation Tool 下载的安装文件。下载地址在微软的目录文件里，在 `WindowsiOS` 目录下运行：
 
 ```bash
-mkdir -p work/downloads
-mv ~/Downloads/<下载的文件>.esd work/downloads/Win11_24H2_ARM64_en-us.esd
+mkdir -p work/downloads && cd work/downloads
+# 微软的 Windows 11 24H2 目录（Media Creation Tool 用的），解开得到 products.xml
+curl -L -o products.cab "https://go.microsoft.com/fwlink/?LinkId=2156292"
+tar -xf products.cab
+# 找出 ARM64、英文、专业版那一项的下载地址和 SHA1
+python3 - <<'PY'
+import xml.etree.ElementTree as ET
+for f in ET.parse('products.xml').getroot().iter('File'):
+    if f.findtext('Architecture') == 'ARM64' and f.findtext('LanguageCode') == 'en-us' and f.findtext('Edition') == 'Professional':
+        print(f.findtext('FilePath')); print('SHA1', f.findtext('Sha1')); break
+PY
+```
+
+用打印出来的地址下载，存成脚本要的名字，再核对 SHA1（必须和上面打印的一致）：
+
+```bash
+curl -L -o Win11_24H2_ARM64_en-us.esd "<上面打印出的地址>"
+shasum -a 1 Win11_24H2_ARM64_en-us.esd
+cd ../..
+```
+
+> 2026 年 11 月核对时，这个目录给出的是 Build **26100.4349**（`..._CLIENTCONSUMER_RET_A64FRE_en-us.esd`，4.5 GB，
+> SHA1 `c78fd344e845d3b17cb91c40bf4a856459da1b6c`）。微软更新目录后版本号和 SHA1 会变，以你下载时打印的为准。
+
+制作脚本要求 ESD 里：第 1 个映像是安装介质、第 2 个是 WinPE、**第 6 个是 Windows 11 Pro**。上面这个 ESD 正是如此
+（1 安装介质、2 WinPE、3 Windows Setup、4 Home、5 Home Single Language、6 Pro）。用别的 ESD 时先检查：
+
+```bash
 wimlib-imagex info work/downloads/Win11_24H2_ARM64_en-us.esd
 ```
 
-制作脚本默认：第 1 个映像是安装介质、第 2 个是 WinPE、**第 6 个是 Windows 11 Pro**。
-如果你的 ESD 里 Pro 不是第 6 个，把 `scripts/provision_windows_arm64.py` 里 `export", ESD, "6"` 的 `6` 改成对应的序号。
+Pro 不是第 6 个的话，把 `scripts/provision_windows_arm64.py` 里 `export", ESD, "6"` 的 `6` 改成对应的序号。
 
 ## 第 4 步：自动安装 Windows
 
