@@ -36,7 +36,7 @@ App 和制作工具都来自 [WindowsiOS](https://github.com/ammaarreshi/Windows
 git clone https://github.com/ammaarreshi/WindowsiOS
 cd WindowsiOS
 git checkout 0071d69
-git apply /path/to/WinKit/source/windowsios-full.patch
+git apply /path/to/AppleVM/source/windowsios-full.patch
 ```
 
 ## 第 2 步：编译 Mac 版模拟器和打包工具

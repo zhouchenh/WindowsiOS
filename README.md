@@ -1,4 +1,4 @@
-# WinKit
+# Apple VM
 
 Windows 11 ARM64 and Arch Linux virtual machines on iPhone / iPad, **with GPU acceleration** (Windows: DirectX 11).
 This repository holds the app (**Apple VM**, in the Releases), the Windows GPU driver kit, the tutorial for making
