@@ -9,22 +9,26 @@ driver from [osy's viogpu3d](https://github.com/osy/kvm-guest-drivers-windows). 
 [WindowsiOS](https://github.com/ammaarreshi/WindowsiOS)，不是独立项目；3D 部分来自 UTM 的 Neptune（virglrenderer）
 和 DXMT，Windows 里的 3D 驱动来自 osy 的 viogpu3d。上游见文末。
 
+## 从哪开始
+
+- **装 App**：[Releases](../../releases) 里的 `AppleVM-unsigned.ipa`（未签名，用 LiveContainer / SideStore / Sideloadly 等安装）。
+- **Windows 11**：按 **[教程：制作 Windows 11 ARM64 虚拟机](docs/windows11-vm.md)** 在 Mac 上做一次镜像，
+  得到 `code.fd`、`vars.fd`、`windows11.hvsparse` 三个文件，在 App 里导入；再在 Windows 里运行 WINKIT 盘的 `START.bat` 装 GPU 驱动。
+- **Arch Linux**：不用做镜像，App 里选 Arch Linux → **安装镜像**，自动下载安装（KDE 桌面 + GPU 驱动）。
+
 ## 内容
 
 | 目录 | 是什么 | 用在哪 |
 |---|---|---|
 | [`winkit/`](winkit) | 装进 Windows 的补齐包：3D 显卡驱动（viogpu3d + Neptune UMD）、网卡驱动（NetKVM）、一键安装 `START.bat` / `winkit.ps1`、分辨率 `setres.ps1`、3D 自检 `d3dtest.ps1`、卸载 `uninstall_3d.ps1`、可选精简 `tune.ps1`、改用户名、后台小助手 | Windows 里，双击 `START.bat`（说明：[`winkit/README.md`](winkit/README.md)） |
+| [`docs/`](docs) | [Windows 11 虚拟机制作教程](docs/windows11-vm.md) | Mac 上 |
+| [`source/`](source) | `windowsios-full.patch`：Release 里那个 App 的完整源码改动（相对 WindowsiOS `0071d69`），GPL 要求随二进制提供 | `git apply` 到原项目上 |
 | [`3d-kit/`](3d-kit) | 给 WindowsiOS 加上 3D 的套件：模拟器补丁（virtio-gpu 3D、virglrenderer、DXMT 接入）、取依赖和构建脚本、`setup.sh` 向导、提高内存上限的工具 | Mac 上，`./setup.sh`（说明：[`3d-kit/README.md`](3d-kit/README.md)） |
 
-不包含：编译好的 App（IPA）、`drivers.img` 磁盘镜像、Windows 镜像本身。`winkit/` 就是 `drivers.img` 里的全部内容。
+不包含：Windows 镜像（需要自己做，见教程）。编译好的 App 在 Releases 里，不在代码里；`winkit/` 就是 App 自带的 WINKIT 盘里的全部内容。
 你需要自己合法的 Windows 11 授权。
 
-## 快速开始
-
-1. Mac 上：`cd 3d-kit && ./setup.sh`，按向导装好带 3D 的 App（或用已经编译好的 App）。
-2. 装好 Windows 11 ARM64，用 StikDebug 开 JIT 进桌面。
-3. Windows 里：打开 WINKIT 盘（或把 `winkit/` 拷进 Windows），双击 `START.bat`，权限提示点“是”。
-4. 彻底关掉 App 再打开、再开 JIT。验证：`dxdiag` 的“显示”页应为 **Red Hat VirtIO GPU 3D controller**，Feature Levels 到 **11_0**。
+`3d-kit/` 是早期（打补丁到原版 WindowsiOS 只加 3D）的做法；现在直接用 Releases 里的 App 更简单，它已包含 3D。
 
 ## Upstream
 

@@ -3,7 +3,16 @@
 `3d-kit/` (scripts and patch) redistributes nothing below: it downloads each component from its own release page.
 `winkit/` does contain two Windows drivers, unmodified, as their upstreams publish them: viogpu3d with the Neptune
 UMD (`winkit/viogpu3d/`) and Red Hat's NetKVM (`winkit/NetKVM/`, its license in `winkit/virtio-win_license.txt`).
-No prebuilt app (IPA) is part of this repository.
+The prebuilt app (`AppleVM-unsigned.ipa`, in the Releases) is WindowsiOS with `source/windowsios-full.patch`
+applied (GPL-2.0-or-later; that patch is its complete source relative to WindowsiOS `0071d69`). It also carries:
+
+| Component in the IPA | Source | License |
+|---|---|---|
+| virglrenderer (Neptune), DXMT, ANGLE EGL/GLESv2, libepoxy, Vulkan loader, MoltenVK, zstd: unmodified frameworks from the UTM iOS build | github.com/utmapp/UTM and the projects below | MIT / LGPL (DXMT, a separate replaceable framework) / BSD-3-Clause / Apache-2.0 / BSD |
+| KosmicKrisp (Mesa's Vulkan-on-Metal driver), from the UTM iOS build, **binary-patched** in `kk_image_layout_init` (linear images are never made 2D arrays) | gitlab.freedesktop.org/osy/mesa, commit eed3e1d9bf; the change: two instructions at kk_image_layout_init, described in source/README.md | MIT |
+| Arch Linux installer disk (`arch-installer.img.z`): the Arch Linux ARM `linux-aarch64` 7.3.4 kernel and an initramfs of unmodified Arch Linux ARM packages (busybox, curl, libarchive/bsdtar, util-linux, e2fsprogs, dosfstools, iproute2, systemd-stub), plus the installer scripts from `source/` | archlinuxarm.org (sources: github.com/archlinuxarm/PKGBUILDs) | GPL-2.0 (kernel, busybox, util-linux, e2fsprogs, dosfstools, iproute2), MIT (curl), BSD-2-Clause (libarchive), LGPL-2.1 (systemd) |
+| EDK2 ArmVirtQemu UEFI firmware (`arch-code.fd.z`, `arch-vars.fd.z`), as shipped by QEMU | github.com/tianocore/edk2 | BSD-2-Clause-Patent |
+| WinKit disk (`winkit.img`): the contents of `winkit/` | this repository | see above |
 
 | Component | Used for | Source | License |
 |---|---|---|---|
