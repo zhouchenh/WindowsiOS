@@ -2,7 +2,7 @@
 
 > **早期版本，仅供参考。** 这个套件对应最初只加 3D 的旧版 App（`WindowsiOS-3D`），其中的步骤（DRIVERS 盘、`setup.ps1`、
 > LiveContainer 向导用的预编译 IPA 等）已经过时，那个 IPA 也不在本仓库里。
-> 现在请用 [Releases](https://github.com/zktfjcksxk-spec/WinKit/releases) 里的 **Apple VM** 和仓库根目录的说明；最新完整源码是 [`source/windowsios-full.patch`](../source)。
+> 现在请用 [Releases](https://github.com/zktfjcksxk-spec/AppleVM/releases) 里的 **Apple VM** 和仓库根目录的说明；最新完整源码是 [`source/windowsios-full.patch`](../source)。
 
 
 让 iPhone / iPad 上的 Windows 11 ARM64 虚拟机用上 **DirectX 11 GPU 加速**、贴合屏幕的分辨率和最高 8 GB 内存。

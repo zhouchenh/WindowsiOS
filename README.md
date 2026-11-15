@@ -15,7 +15,7 @@ iPhone / iPad 上带 **GPU 加速**的 Windows 11 ARM64 和 Arch Linux 虚拟机
 
 ## 从哪开始
 
-- **装 App**：[Releases](https://github.com/zktfjcksxk-spec/WinKit/releases) 里的 `AppleVM-unsigned.ipa`（未签名，用 LiveContainer / SideStore / Sideloadly 等安装）。
+- **装 App**：[Releases](https://github.com/zktfjcksxk-spec/AppleVM/releases) 里的 `AppleVM-unsigned.ipa`（未签名，用 LiveContainer / SideStore / Sideloadly 等安装）。
 - **Windows 11**：按 **[教程：制作 Windows 11 ARM64 虚拟机](docs/windows11-vm.md)** 在 Mac 上做一次镜像，
   得到 `code.fd`、`vars.fd`、`windows11.hvsparse` 三个文件，在 App 里导入；再在 Windows 里运行 WINKIT 盘的 `START.bat` 装 GPU 驱动。
 - **Arch Linux**：不用做镜像，App 里选 Arch Linux → **安装镜像**，自动下载安装（KDE 桌面 + GPU 驱动）。

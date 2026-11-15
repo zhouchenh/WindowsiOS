@@ -114,7 +114,7 @@ python3 scripts/provision_windows_arm64.py
 
 ## 第 6 步：装 App，放入文件
 
-1. 从本仓库的 [Releases](https://github.com/zktfjcksxk-spec/WinKit/releases) 下载 `AppleVM-unsigned.ipa`，用你平时的方式安装
+1. 从本仓库的 [Releases](https://github.com/zktfjcksxk-spec/AppleVM/releases) 下载 `AppleVM-unsigned.ipa`，用你平时的方式安装
    （LiveContainer、SideStore、Sideloadly，或自己用 Xcode 签名）。重签时保留 `3d-kit/ipa/WindowsiOS.entitlements`
    里的权限：`get-task-allow`（开 JIT 必需）和 `increased-memory-limit`（大内存）。
 2. 把三个文件传到设备上（AirDrop、“文件” App、iCloud 都可以）。

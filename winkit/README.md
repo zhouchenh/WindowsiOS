@@ -1,6 +1,6 @@
 # WinKit：Windows 里的一键补齐包
 
-在 **Apple VM**（本仓库 [Releases](https://github.com/zktfjcksxk-spec/WinKit/releases) 里的 App）里装好 Windows 11 ARM64 之后，用它把功能补齐：
+在 **Apple VM**（本仓库 [Releases](https://github.com/zktfjcksxk-spec/AppleVM/releases) 里的 App）里装好 Windows 11 ARM64 之后，用它把功能补齐：
 **网络驱动 → 3D 显卡驱动（DirectX 11）→ 打开 3D → 分辨率贴合屏幕 → 可选的后台精简**。
 整个过程只在设备上操作，不需要 Mac。Windows 镜像怎么做见 [教程](../docs/windows11-vm.md)。
 

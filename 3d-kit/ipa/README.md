@@ -1,6 +1,6 @@
 # 预编译 IPA（未签名）
 
-> **本仓库不包含这个旧版 IPA。** 以下说明仅供参考；当前的 App 是 [Releases](https://github.com/zktfjcksxk-spec/WinKit/releases) 里的 `AppleVM-unsigned.ipa`
+> **本仓库不包含这个旧版 IPA。** 以下说明仅供参考；当前的 App 是 [Releases](https://github.com/zktfjcksxk-spec/AppleVM/releases) 里的 `AppleVM-unsigned.ipa`
 > （Bundle ID `com.applevm.app`），重签时同样保留 `WindowsiOS.entitlements` 里的权限。
 
 
