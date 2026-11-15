@@ -1,5 +1,9 @@
 # 预编译 IPA（未签名）
 
+> **本仓库不包含这个旧版 IPA。** 以下说明仅供参考；当前的 App 是 [Releases](https://github.com/zktfjcksxk-spec/WinKit/releases) 里的 `AppleVM-unsigned.ipa`
+> （Bundle ID `com.applevm.app`），重签时同样保留 `WindowsiOS.entitlements` 里的权限。
+
+
 `WindowsiOS-3D-unsigned.ipa` 是打好补丁、已嵌入 3D 框架的 App，**没有签名**，Bundle ID 是占位的 `org.windowsios.app3d`。
 
 **最简单的用法：** 运行上级目录的 `./setup.sh` 并选择 LiveContainer 方式，向导会直接把它装进 LiveContainer，不需要签名。

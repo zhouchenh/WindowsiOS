@@ -14,6 +14,10 @@ Build: `make -j8 all ios-lib`, then the Xcode project in `ios/` (`xcodegen gener
 `scripts/build_arch_installer.py` (it builds the installer inside a running Arch Linux machine). Device identifiers in
 the developer helper scripts (`scripts/arch_dev.sh`, `scripts/win_dev.sh`, ...) are placeholders: put in your own.
 
+The WinKit disk the app carries (`winkit.img`, copied in by `scripts/embed_gpu3d.sh` from `dist/WinKit/drivers.img`)
+is a 64 MB disk with one FAT32 partition labelled `WINKIT` holding the files of this repository's `winkit/`
+(without its README): make it with Disk Utility or `hdiutil` + `diskutil`, or mtools.
+
 Not in the patch: the upstream `scripts/optimize_windows_lite.py` changes (not part of the app).
 
 ## The KosmicKrisp binary patch

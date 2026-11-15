@@ -23,6 +23,7 @@
   ```bash
   brew install wimlib qemu libslirp glib pkg-config python
   ```
+  制作脚本按 Apple 芯片 Mac 上 Homebrew 的默认位置（`/opt/homebrew`）找这些工具。
   `qemu` 只用来取它附带的 UEFI 固件文件（`edk2-aarch64-code.fd`、`edk2-arm-vars.fd`），不会运行 QEMU。
 - **Windows 11 24H2 ARM64 零售版 ESD**（英文版，约 4.5 GB），从微软官方服务器下载，见第 3 步。
 - 你自己的 Windows 11 授权。
@@ -113,12 +114,12 @@ python3 scripts/provision_windows_arm64.py
 
 ## 第 6 步：装 App，放入文件
 
-1. 从本仓库的 [Releases](../../releases) 下载 `AppleVM-unsigned.ipa`，用你平时的方式安装
+1. 从本仓库的 [Releases](https://github.com/zktfjcksxk-spec/WinKit/releases) 下载 `AppleVM-unsigned.ipa`，用你平时的方式安装
    （LiveContainer、SideStore、Sideloadly，或自己用 Xcode 签名）。重签时保留 `3d-kit/ipa/WindowsiOS.entitlements`
    里的权限：`get-task-allow`（开 JIT 必需）和 `increased-memory-limit`（大内存）。
 2. 把三个文件传到设备上（AirDrop、“文件” App、iCloud 都可以）。
 3. 打开 App → 左边选 **Windows 11** → **导入镜像** → 一次选中 `code.fd`、`vars.fd`、`windows11.hvsparse`。
-4. 用 **StikDebug** 开 JIT，点 **启动 Windows 11**。第一次会先解包系统盘（几分钟），然后进入桌面。
+4. 用 **StikDebug** 开 JIT（在 StikDebug 里选 **Apple VM**），点 **启动 Windows 11**。第一次会先解包系统盘（几分钟），然后进入桌面。
 
 ## 第 7 步：装 GPU 和网卡驱动
 
