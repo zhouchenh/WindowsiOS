@@ -95,6 +95,10 @@ static uint32_t g_cfg_jit_mb, g_cfg_ram_mb;
 static bool g_detach_requested;
 static time_t g_detach_at;
 static int g_lingering_tries;
+/* A built-in helper enable request is still outstanding (winios_jit_set_helper_pending), and the
+   detach requests sent since it became so. */
+static bool g_helper_pending;
+static int g_helper_tries;
 
 void winios_jit_configure(uint32_t jit_mb, uint32_t ram_mb) {
     g_cfg_jit_mb = jit_mb;
@@ -215,10 +219,36 @@ bool winios_jit_is_traced(void) {
    another helper session: a second StikDebug request attaches as soon as the first lets go. */
 #define WINIOS_LINGERING_WINDOW_S 30
 
+void winios_jit_set_helper_pending(bool pending) {
+    if (pending && !g_helper_pending) g_helper_tries = 0;
+    g_helper_pending = pending;
+}
+
+static void send_lingering_detach(int tries) {
+    WINIOS_LOG("a debugger is still attached after the JIT region was held (a second StikDebug session "
+               "or a late built-in helper?); asking it to detach (%d of 3)", tries);
+    g_expecting_jit_trap = true;
+    winios_brk_jit_detach();
+    g_expecting_jit_trap = false;
+    WINIOS_LOG("after the detach request, traced: %s", winios_jit_is_traced() ? "yes" : "no");
+}
+
 bool winios_jit_release_lingering_debugger(void) {
+    if (!atomic_load(&g_jit_live)) return false;
+    /* A built-in helper request the app gave up on (or a second Enable's) is still running: it can
+       attach at any time, often well after the window below (it repeats the Developer Disk Image work
+       first), and the debugger it attaches runs henge-jit.js, which answers the detach brk. So while
+       one is outstanding, a debugger seen is taken for it however late it comes; just not in the first
+       seconds after this launch's own debugger was told to let go, so that detach can land. */
+    if (g_helper_pending) {
+        if (g_detach_requested && time(NULL) - g_detach_at < 3) return false;
+        if (g_helper_tries >= 3 || !winios_jit_is_traced()) return false;
+        send_lingering_detach(++g_helper_tries);
+        return true;
+    }
     /* Only after this launch's own debugger was told to let go, and not straight away: give that
        detach a moment to land before calling what is left a second debugger. */
-    if (!atomic_load(&g_jit_live) || !g_detach_requested || g_lingering_tries >= 3) return false;
+    if (!g_detach_requested || g_lingering_tries >= 3) return false;
     time_t since = time(NULL) - g_detach_at;
     if (since < 3) return false;
     /* brk #0xf00d is answered only by the JIT script; any other debugger (Xcode's Attach to Process,
@@ -230,13 +260,7 @@ bool winios_jit_release_lingering_debugger(void) {
         g_detach_requested = false;
         return false;
     }
-    g_lingering_tries++;
-    WINIOS_LOG("a debugger is still attached after the JIT region was held (a second StikDebug session?); "
-               "asking it to detach (%d of 3)", g_lingering_tries);
-    g_expecting_jit_trap = true;
-    winios_brk_jit_detach();
-    g_expecting_jit_trap = false;
-    WINIOS_LOG("after the detach request, traced: %s", winios_jit_is_traced() ? "yes" : "no");
+    send_lingering_detach(++g_lingering_tries);
     return true;
 }
 

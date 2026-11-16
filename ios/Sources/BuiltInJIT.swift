@@ -75,7 +75,16 @@ enum WinBuiltInJIT {
     static let helperFile = "WinJITHelper.appex"
 
     /// Requests that have started and not finished, kept alive until they do.
-    private static var running: [HelperRequest] = []
+    private static var running: [HelperRequest] = [] {
+        didSet { winios_jit_set_helper_pending(enableOutstanding) }
+    }
+
+    /// An enable request has not finished yet. It can still attach, even after the app stopped
+    /// waiting for it (JITSetup's 150 s), until its script detaches or attaching fails; it is not
+    /// cancelled instead, since ending the helper while its debugger is attached could take the app
+    /// down with it. JITSetup keeps watching for it, and winios_jit.c asks it to detach when JIT is
+    /// already on by then.
+    static var enableOutstanding: Bool { running.contains { $0.isEnable } }
 
     /// Why Built-in JIT cannot work in this installation, or nil when it can.
     static var unavailableReason: String? {
@@ -161,6 +170,8 @@ private final class HelperRequest {
     private let `extension`: AnyObject   // the NSExtension, kept alive for the request
     private let operation: String
     private var completion: ((Result<WinJITRequest.Response, Error>) -> Void)?
+
+    var isEnable: Bool { operation == WinJITRequest.Operation.enable.rawValue }
 
     init(extension found: AnyObject, operation: String,
          completion: @escaping (Result<WinJITRequest.Response, Error>) -> Void) {

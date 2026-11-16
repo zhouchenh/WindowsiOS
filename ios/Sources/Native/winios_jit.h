@@ -42,8 +42,13 @@ bool winios_jit_is_traced(void);
    while a debugger has stayed attached since; a debugger that attaches after the process was seen
    untraced is left alone (it would stop on a brk it does not handle at every continue).
    Cheap when there is nothing to do; returns true when a detach request was sent. Main thread only.
+   While winios_jit_set_helper_pending(true) holds, a debugger attached at any time is taken for the
+   built-in helper still on its way (it runs henge-jit.js, which answers the detach) and asked to let
+   go, up to three times per stretch of pending requests.
    Adapted from Henge's JITBootstrap.releaseLingeringDebugger (Leviidev/Henge ca44144). */
 bool winios_jit_release_lingering_debugger(void);
+/* Whether a built-in JIT helper enable request (BuiltInJIT.swift) is still outstanding. Main thread only. */
+void winios_jit_set_helper_pending(bool pending);
 bool winios_jit_acquire(size_t bytes, bool detach_after);
 bool winios_jit_is_live(void);
 WinIosDualMapping winios_jit_mapping(void);

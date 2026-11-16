@@ -69,6 +69,8 @@ final class JITSetup: ObservableObject {
     private var activationTask: Task<Void, Never>?
     private var awaitTask: Task<Void, Never>?
     private var lingeringTask: Task<Void, Never>?
+    /// Watches for a built-in helper that may still attach after the app stopped waiting for it.
+    private var lateHelperTask: Task<Void, Never>?
     /// Back from LocalDevVPN, on to StikDebug. Its own task: another activation (Control Center pulled
     /// down, say) cancels activationTask, and that must not drop the request with busy still set.
     private var vpnTask: Task<Void, Never>?
@@ -176,7 +178,7 @@ final class JITSetup: ObservableObject {
             return .failed
         }
         // Attached, but nothing answered the JIT script's traps.
-        if resolvedMethod == .builtIn && busy {
+        if resolvedMethod == .builtIn && (busy || WinBuiltInJIT.enableOutstanding) {
             fail(L("内置助手已连接，但没有回应 Apple VM 的 JIT 脚本。请彻底关闭 Apple VM 再打开，然后重试。",
                    "The built-in helper attached but did not answer Apple VM's JIT script. Close Apple VM completely, open it again and retry.")
                  + "\n(" + detail + ")")
@@ -195,6 +197,8 @@ final class JITSetup: ObservableObject {
         error = nil
         awaitTask?.cancel()
         awaitTask = nil
+        lateHelperTask?.cancel()
+        lateHelperTask = nil
         watchForLingeringDebugger()
         if changed {
             jitLog("JIT is on")
@@ -211,15 +215,40 @@ final class JITSetup: ObservableObject {
         jitLog("failed: " + message)
     }
 
-    /// Every 10 s while JIT is on: a debugger still attached after the region was held is told to let go
-    /// (three tries a launch, in winios_jit.c). One sysctl when there is nothing to do.
+    /// Every 10 s while JIT is on, every 2 s while a built-in helper request is still out: a debugger
+    /// still attached after the region was held is told to let go (winios_jit.c decides which). One
+    /// sysctl when there is nothing to do.
     private func watchForLingeringDebugger() {
         guard lingeringTask == nil else { return }
         lingeringTask = Task {
+            var tick = 0
             while !Task.isCancelled {
-                try? await Task.sleep(nanoseconds: 3_500_000_000)
-                _ = winios_jit_release_lingering_debugger()
-                try? await Task.sleep(nanoseconds: 6_500_000_000)
+                try? await Task.sleep(nanoseconds: 500_000_000)
+                tick += 1
+                if WinBuiltInJIT.enableOutstanding ? tick % 4 == 0 : tick % 20 == 7 {
+                    _ = winios_jit_release_lingering_debugger()
+                }
+            }
+        }
+    }
+
+    /// The app stopped waiting for the built-in helper, but its request is still out: it can attach
+    /// late (a slow Developer Disk Image download, cellular). Keep watching until that request ends,
+    /// so a late attach turns JIT on now rather than at the next activation.
+    private func watchForLateHelper() {
+        guard WinBuiltInJIT.enableOutstanding else { return }
+        jitLog("the helper's request is still running; still watching for it to attach")
+        lateHelperTask?.cancel()
+        lateHelperTask = Task { [weak self] in
+            while !Task.isCancelled, WinBuiltInJIT.enableOutstanding {
+                guard let self else { return }
+                switch self.check() {
+                case .live, .failed:
+                    return
+                case .waiting:
+                    break
+                }
+                do { try await Task.sleep(nanoseconds: 250_000_000) } catch { return }
             }
         }
     }
@@ -350,6 +379,7 @@ final class JITSetup: ObservableObject {
                 }
                 if Date() >= deadline {
                     self.fail(timeoutMessage)
+                    self.watchForLateHelper()
                     return
                 }
                 do { try await Task.sleep(nanoseconds: 250_000_000) } catch { return }
@@ -438,6 +468,8 @@ final class JITSetup: ObservableObject {
     /// The helper's enable request ended: after the script detached (success), or when attaching failed.
     private func builtInEnableFinished(_ result: Result<WinJITRequest.Response, Error>, attempt: Int, request: Int) {
         let current = request == builtInRequest
+        // This request failed, but an earlier one the app gave up on may still attach.
+        defer { if !jitLive && !busy { watchForLateHelper() } }
         switch result {
         case .success(let response):
             txmPresent = response.txmPresent ?? txmPresent
