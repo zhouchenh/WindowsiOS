@@ -49,6 +49,9 @@ final class JITSetup: ObservableObject {
     private var activationTask: Task<Void, Never>?
     private var awaitTask: Task<Void, Never>?
     private var lingeringTask: Task<Void, Never>?
+    /// Back from LocalDevVPN, on to StikDebug. Its own task: another activation (Control Center pulled
+    /// down, say) cancels activationTask, and that must not drop the request with busy still set.
+    private var vpnTask: Task<Void, Never>?
     private var awaitingVPN = false
     private var autoTried = false
 
@@ -74,7 +77,7 @@ final class JITSetup: ObservableObject {
         }
         if awaitingVPN {
             awaitingVPN = false
-            await continueAfterVPN()
+            vpnTask = Task { [weak self] in await self?.continueAfterVPN() }
             return
         }
         // StikDebug can open the app before it attaches: watch for a debugger for about 10 s.
