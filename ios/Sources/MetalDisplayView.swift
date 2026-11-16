@@ -172,10 +172,13 @@ final class MetalCanvasUIView: UIView, UITextInput {
         if let winBounds = window?.bounds.size, winBounds.width > 0 {
             bridge.updateScreenSize(winBounds, scale: screen.scale)
         }
-        // While the on-screen keyboard is up the view is shorter: do not ask Windows to change
-        // resolution for that. With a hardware keyboard (focus without the on-screen keyboard) or in
-        // the laptop lid (never resized by the keyboard) the size is the real one.
-        if bounds.width > 0 && bounds.height > 0 && (!isFirstResponder || hardwareKeyboard || !keyboardResizesView) {
+        // When the on-screen keyboard shrinks the view (HV_KBD_PAN=0), the view is shorter while it is up:
+        // do not ask Windows to change resolution for that. With the keyboard pan (the default) the view
+        // keeps its size under the keyboard, so every size it takes (a rotation, Immersive, the toolbar, a
+        // posture change) is a real one and goes to Windows at once. So does the size with a hardware
+        // keyboard (focus without the on-screen keyboard) and in the laptop lid (never resized by it).
+        let keyboardShrinks = keyboardResizesView && !KeyboardOptions.panInsteadOfShrink
+        if bounds.width > 0 && bounds.height > 0 && (!isFirstResponder || hardwareKeyboard || !keyboardShrinks) {
             bridge.updateDisplayViewSize(bounds.size, nativeScale: screen.nativeScale)
         }
         if window != nil && bounds.width > 0 { DisplaySettings.shared.record(view: self, drawable: drawable) }
