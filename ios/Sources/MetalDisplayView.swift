@@ -583,6 +583,18 @@ final class MetalCanvasUIView: UIView, UITextInput {
     }
     var keyboardAppearance: UIKeyboardAppearance = .dark
 
+    /// Set while the session view itself takes the focus away (a sheet needs the keyboard, the keyboard
+    /// was turned off): it already knows. Any other resign comes from the system, e.g. the iPad keyboard's
+    /// own hide key, and is reported as a dismissal, or the next update would raise the keyboard again.
+    private var resigningForSession = false
+
+    /// The session view's own resign (MetalDisplayView.updateUIView).
+    func resignFocusForSession() {
+        resigningForSession = true
+        defer { resigningForSession = false }
+        _ = resignFirstResponder()
+    }
+
     @discardableResult
     override func resignFirstResponder() -> Bool {
         let r = super.resignFirstResponder()
@@ -594,6 +606,7 @@ final class MetalCanvasUIView: UIView, UITextInput {
             keyboardAutoShown = false
             setNeedsLayout()
             updateFloatingMap()
+            if !resigningForSession && !hardwareKeyboard { onKeyboardDismissed?() }
         }
         return r
     }
@@ -611,8 +624,7 @@ final class MetalCanvasUIView: UIView, UITextInput {
     }
 
     func dismissKeyboard() {
-        resignFirstResponder()
-        onKeyboardDismissed?()
+        if !resignFirstResponder() || hardwareKeyboard { onKeyboardDismissed?() } // else the resign reported it
     }
 
     // MARK: - Panning for the keyboard, viewport zoom
@@ -896,7 +908,7 @@ struct MetalCanvasRepresentable: UIViewRepresentable {
         if wantsFocus && !uiView.isFirstResponder {
             DispatchQueue.main.async { _ = uiView.becomeFirstResponder() }
         } else if !wantsFocus && uiView.isFirstResponder {
-            DispatchQueue.main.async { _ = uiView.resignFirstResponder() }
+            DispatchQueue.main.async { uiView.resignFocusForSession() }
         }
     }
 }
