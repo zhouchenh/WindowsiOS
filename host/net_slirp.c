@@ -1363,10 +1363,12 @@ static void fwd_apply(const HvFwdRule *c, const Want *w, Applied *ap, Outcome *o
     if (!w->has6) return;
     int e6 = 0;
     const char *p6 = NULL;
+    struct in_addr target = w->a4; /* the relay's way in: the IPv4 listener (on loopback when it is on every interface) */
+    if (target.s_addr == htonl(INADDR_ANY)) target.s_addr = htonl(INADDR_LOOPBACK);
     for (int udp = 0; udp <= 1; udp++) {
         if (!(c->proto & (udp ? HV_FWD_UDP : HV_FWD_TCP))) continue;
         int e = 0;
-        Bridge *br = bridge_start(udp, &w->a6, c->host_port, w->a4, &e);
+        Bridge *br = bridge_start(udp, &w->a6, c->host_port, target, &e);
         if (udp) ap->udp6 = br;
         else ap->tcp6 = br;
         if (!br && !e6) e6 = e, p6 = udp ? "UDP" : "TCP";
