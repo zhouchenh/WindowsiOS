@@ -146,6 +146,10 @@ typedef struct HvCpu {
        are cleared. */
     uint16_t asid_cid[65536];
     uint16_t cid_asid[65536]; /* --stats: the ASID a user id was given to (to tell live tags from dead ones) */
+    /* HV_IJC_TTBKEY (Henge 94ca6a9): the TTBR0 base asid_cid[ASID] was given under. An ASID back with another base
+       gets a fresh id, as the TLB stashes are keyed by ASID and base too (hv_mmu_ukey). With TCR.A1 the ASID comes
+       from TTBR1 and the base still from TTBR0. ASID 0 keeps its own guard (asid0_ttbr0). */
+    uint64_t asid_base[65536];
     uint32_t next_cid, kernel_gen;
 
     /* Generic timer: physical and virtual. The counter is host time scaled to 24 MHz. */

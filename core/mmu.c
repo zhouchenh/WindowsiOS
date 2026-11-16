@@ -276,8 +276,13 @@ void hv_ijc_switch(HvCpu *cpu) {
             cpu->asid0_used = 0;
         }
     }
-    if (!cpu->asid_cid[asid]) {
+    uint64_t base = cpu->ttbr0_el1 & OA_MASK & ~1ull;
+    /* HV_IJC_TTBKEY: an ASID (other than 0, guarded above) that comes back with another table base is another
+       address space: a fresh id, so its predecessor's cached targets are not used. */
+    int rebased = asid != 0 && hv_knob[HV_K_IJCTTBKEY] && cpu->asid_cid[asid] && cpu->asid_base[asid] != base;
+    if (!cpu->asid_cid[asid] || rebased) {
         cpu->asid_cid[asid] = fresh_cid(cpu);
+        cpu->asid_base[asid] = base;
         cpu->cid_asid[cpu->asid_cid[asid]] = (uint16_t)asid;
     }
     cpu->ijc_salt[0] = (uint64_t)cpu->asid_cid[asid] << 48;

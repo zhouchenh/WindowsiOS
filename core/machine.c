@@ -20,7 +20,7 @@ static int init_rest(HvMachine *m);
 
 int hv_knob[HV_K_COUNT];
 static const char *const hv_knob_names[] = {"HV_NO_RAS", "HV_SUPERBLOCKS", "HV_GROUPS", "HV_WFI_SPIN", "HV_FLUSH", "HV_K1", "HV_K2", "HV_K3", "HV_TLBT", "HV_JIT_CAP", "HV_RECHECK",
-                                            "HV_FAST_ICACHE"};
+                                            "HV_FAST_ICACHE", "HV_IJC_TTBKEY"};
 _Static_assert(sizeof hv_knob_names / sizeof hv_knob_names[0] == HV_K_COUNT, "a name for every knob");
 
 static void knobs_init(void) {
@@ -69,6 +69,9 @@ static int init_rest(HvMachine *m) {
     /* Henge a47f5e1: chaining rewrites one B as another B and drops just that instruction-cache line, without waiting
        for every CPU; a placed block's hot and cold parts share one wait (host/jit_region.c). */
     knob_env(HV_K_FASTICACHE, 0);
+    /* Henge 94ca6a9 (its first part): a process's id in the branch cache (asid_cid) also goes with the table base its
+       ASID had, so an ASID back with another TTBR0 base, with no TLBI by ASID in between, starts with no cached targets. */
+    knob_env(HV_K_IJCTTBKEY, 0);
     /* As many blocks as the region holds (a block is at least ~160 bytes of
        code), so the region filling, not this table, is what flushes; two
        chainable exits each at most. Untouched entries cost nothing. */

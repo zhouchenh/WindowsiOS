@@ -67,6 +67,7 @@ int main(void) {
     static HvMachine m;
     static HvCpu cpu;
     hv_machine_init(&m, 1 << 20);
+    printf("knobs: HV_IJC_TTBKEY=%d\n", hv_knob[HV_K_IJCTTBKEY]);
     pt = aligned_alloc(65536, PT_SIZE);
     hv_machine_add_ram(&m, PT_PA, PT_SIZE, pt, 0);
     hv_cpu_reset(&cpu, &m);
@@ -351,22 +352,73 @@ int main(void) {
             failures++;
         }
 
-        /* Transient ASID 0 switches with no user IJC fills must allocate at most 1 ASID-0 cid. */
-        uint32_t cid_mid = cpu.next_cid;
-        for (int iter = 0; iter < 100; iter++) {
+        /* Transient ASID 0 switches with no user IJC fills must allocate at most 1 ASID-0 cid. Four processes, each
+           with its own ASID and table base (an ASID back with another base is another address space, HV_IJC_TTBKEY):
+           once each has an id, switching among them through ASID 0 gives out no more. */
+        uint32_t cid_mid = cpu.next_cid, cid_warm = 0;
+        for (int iter = 0; iter < 104; iter++) {
+            if (iter == 4) cid_warm = cpu.next_cid;
             cpu.x[0] = 0x40000000ull;
             hv_sysreg_msr(&cpu, 0xd5182020u, 0);
             cpu.x[0] = 0x40050000ull + ((uint64_t)(iter & 3) << 16);
             hv_sysreg_msr(&cpu, 0xd5182000u, 0);
-            cpu.x[0] = (22ull << 48) | 0x40040000ull;
+            cpu.x[0] = ((22ull + (iter & 3)) << 48) | 0x40040000ull;
             hv_sysreg_msr(&cpu, 0xd5182020u, 0);
         }
         checks++;
-        if (cpu.next_cid != cid_mid || cid_mid - cid_before > 4) {
-            printf("  FAIL transient ASID 0 switches churned next_cid (%u -> %u -> %u)\n",
-                   cid_before, cid_mid, cpu.next_cid);
+        if (cpu.next_cid != cid_warm || cid_mid - cid_before > 4 || cid_warm - cid_mid > 5) {
+            printf("  FAIL transient ASID 0 switches churned next_cid (%u -> %u -> %u -> %u)\n",
+                   cid_before, cid_mid, cid_warm, cpu.next_cid);
             failures++;
         }
+    }
+
+    /* HV_IJC_TTBKEY: branch-cache ids keyed by ASID and TTBR0 base, with the ASID in TTBR0 (TCR.A1 0) and in TTBR1
+       (TCR.A1 1, Windows' KiSwapProcess order: TTBR1 to ASID 0, TTBR0, TTBR1 to the new ASID). */
+    for (int a1 = 0; a1 < 2; a1++) {
+        hv_cpu_reset(&cpu, &m);
+        cpu.el = 1;
+        cpu.tcr_el1 = (uint64_t)a1 << 22 | 1ull << 36;
+        const uint64_t base_a = 0x40100000ull, base_b = 0x40200000ull, base_c = 0x40300000ull, kpa = 0x40400000ull;
+        /* Switch to (asid, base) as the guest would. */
+        #define SWITCH_TO(asid, base) do { \
+            if (a1) { cpu.x[0] = kpa; hv_sysreg_msr(&cpu, 0xd5182020u, 0); cpu.x[0] = (base); hv_sysreg_msr(&cpu, 0xd5182000u, 0); \
+                      cpu.x[0] = (uint64_t)(asid) << 48 | kpa; hv_sysreg_msr(&cpu, 0xd5182020u, 0); } \
+            else { cpu.x[0] = (uint64_t)(asid) << 48 | (base); hv_sysreg_msr(&cpu, 0xd5182000u, 0); } } while (0)
+        SWITCH_TO(9, base_a);
+        uint64_t salt_a = cpu.ijc_salt[0];
+        static HvBlock blk;
+        blk = (HvBlock){.va = 0x7ff600001230ull, .flags = 0, .code = (uint32_t *)(uintptr_t)0x5678};
+        hv_ijc_fill(&cpu, &blk);
+        SWITCH_TO(10, base_b);
+        uint64_t salt_b = cpu.ijc_salt[0];
+        SWITCH_TO(9, base_a);
+        checks++;
+        if (cpu.ijc_salt[0] != salt_a || salt_b == salt_a) {
+            printf("  FAIL A1=%d: a process switched back to (same ASID, same base) lost its branch-cache id\n", a1);
+            failures++;
+        }
+        /* ASID 9 now names another address space (base C) without a TLBI by ASID first. */
+        SWITCH_TO(9, base_c);
+        uint64_t tag = blk.va ^ cpu.ijc_salt[0];
+        uint64_t *ent = m.percpu[0].ijc + (size_t)hv_ijc_index(tag) * 2;
+        int hit = ent[0] == tag || ent[2] == tag;
+        checks++;
+        if (hv_knob[HV_K_IJCTTBKEY] ? (hit || cpu.ijc_salt[0] == salt_a) : cpu.ijc_salt[0] != salt_a) {
+            printf("  FAIL A1=%d HV_IJC_TTBKEY=%d: ASID 9 with a new table base %s the old process's cached target\n", a1,
+                   hv_knob[HV_K_IJCTTBKEY], hit ? "finds" : "does not find");
+            failures++;
+        }
+        /* And the ASID with its own base again keeps the id it has now. */
+        uint64_t salt_c = cpu.ijc_salt[0];
+        SWITCH_TO(10, base_b);
+        SWITCH_TO(9, base_c);
+        checks++;
+        if (cpu.ijc_salt[0] != salt_c) {
+            printf("  FAIL A1=%d: switching back to (ASID 9, base C) gave a new id\n", a1);
+            failures++;
+        }
+        #undef SWITCH_TO
     }
 
     printf("%d checks, %d failures\n", checks, failures);
