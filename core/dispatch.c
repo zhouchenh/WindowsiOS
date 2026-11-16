@@ -20,7 +20,10 @@ void hv_flush_blocks(HvMachine *m) {
     if ((hv_knob[HV_K_TLBT] != 0) != hv_tlb_tmajor) {
         hv_tlb_tmajor = hv_knob[HV_K_TLBT] != 0;
         for (int i = 0; i < m->ncpus; i++)
-            if (m->cpus[i]) hv_tlb_flush(m->cpus[i]);
+            if (m->cpus[i]) {
+                m->cpus[i]->nkernel_fills = HV_KERNEL_FILLS + 1; /* the logs hold slots of the old layout: clear it all */
+                hv_tlb_flush(m->cpus[i]);
+            }
     }
     m->stats.block_flushes++;
     __atomic_add_fetch(&m->jit_gen, 1, __ATOMIC_SEQ_CST);

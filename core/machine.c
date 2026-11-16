@@ -20,7 +20,7 @@ static int init_rest(HvMachine *m);
 
 int hv_knob[HV_K_COUNT];
 static const char *const hv_knob_names[] = {"HV_NO_RAS", "HV_SUPERBLOCKS", "HV_GROUPS", "HV_WFI_SPIN", "HV_FLUSH", "HV_K1", "HV_K2", "HV_K3", "HV_TLBT", "HV_JIT_CAP", "HV_RECHECK",
-                                            "HV_FAST_ICACHE", "HV_IJC_TTBKEY"};
+                                            "HV_FAST_ICACHE", "HV_IJC_TTBKEY", "HV_TLB_LOGFLUSH"};
 _Static_assert(sizeof hv_knob_names / sizeof hv_knob_names[0] == HV_K_COUNT, "a name for every knob");
 
 static void knobs_init(void) {
@@ -72,6 +72,10 @@ static int init_rest(HvMachine *m) {
     /* Henge 94ca6a9 (its first part): a process's id in the branch cache (asid_cid) also goes with the table base its
        ASID had, so an ASID back with another TTBR0 base, with no TLBI by ASID in between, starts with no cached targets. */
     knob_env(HV_K_IJCTTBKEY, 0);
+    /* Henge 061b250 (its first part): a whole-TLB flush clears the entries logged since the last one (user_fills,
+       kernel_fills) instead of all four tables, and a user branch-cache reset the ASIDs given ids since the last one
+       (asid_log) instead of all 64K. The large-page filters are still cleared whole. */
+    knob_env(HV_K_LOGFLUSH, 0);
     /* As many blocks as the region holds (a block is at least ~160 bytes of
        code), so the region filling, not this table, is what flushes; two
        chainable exits each at most. Untouched entries cost nothing. */
@@ -552,5 +556,6 @@ void hv_cpu_reset_index(HvCpu *cpu, HvMachine *m, uint32_t index) {
     cpu->excl_addr = ~0ull;
     /* Architectural reset value has the MMU and caches off; RES1 bits set. */
     cpu->sctlr_el1 = 0x30d00800;
+    cpu->nkernel_fills = HV_KERNEL_FILLS + 1; /* the TLB is all zeros, not logged: make every entry invalid */
     hv_tlb_flush(cpu);
 }

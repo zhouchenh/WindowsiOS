@@ -144,7 +144,16 @@ void hv_tlb_flush(HvCpu *cpu) {
     if (cpu->m) cpu->m->stats.reset_why[0]++;
     hv_ijc_reset(cpu, 0); /* mappings changed: branch targets cached by VA are no longer trusted */
     hv_ijc_reset(cpu, 1);
-    memset(cpu->tlb, 0x80, sizeof cpu->tlb);
+    /* HV_TLB_LOGFLUSH (Henge 061b250): only the entries filled since the last flush can be valid (both logs, unless
+       one ran over: then all four tables, 2 MB). Every write of an entry goes through tlb_fill or a stash restore,
+       which log it; whoever leaves the TLB without that (a reset, a change of layout) sets nkernel_fills past the log. */
+    uint32_t nu = cpu->nuser_fills, nk = cpu->nkernel_fills;
+    if (hv_knob[HV_K_LOGFLUSH] && nu <= HV_USER_FILLS && nk <= HV_KERNEL_FILLS) {
+        for (uint32_t k = 0; k < nu; k++) memset(&cpu->tlb[cpu->user_fills[k]], 0x80, sizeof cpu->tlb[0]);
+        for (uint32_t k = 0; k < nk; k++) memset(&cpu->tlb[cpu->kernel_fills[k]], 0x80, sizeof cpu->tlb[0]);
+    } else {
+        memset(cpu->tlb, 0x80, sizeof cpu->tlb);
+    }
     cpu->nuser_fills = 0;
     cpu->nkernel_fills = 0;
     hv_tlb_stash_drop(cpu, -1);
@@ -219,6 +228,7 @@ void hv_ucode_add(HvCpu *cpu, uint64_t va) {
     for (; m->ucode[i]; i = (i + 1) & ((1u << HV_UCODE_BITS) - 1))
         if (m->ucode[i] == key) return;
     if (m->ucode_count >= (1u << HV_UCODE_BITS) / 2) { /* half full: start the user half over */
+        if (hv_knob[HV_K_LOGFLUSH]) ucode_clear(m); /* hv_ijc_reset keeps it then */
         hv_ijc_reset(cpu, 0);
         hv_ijc_switch(cpu);
         cid = (uint32_t)(cpu->ijc_salt[0] >> 48);
@@ -237,6 +247,7 @@ static uint16_t fresh_cid(HvCpu *cpu) {
         ijc_clear(cpu, 0);
         ucode_clear(cpu->pc_state);
         memset(cpu->asid_cid, 0, sizeof cpu->asid_cid);
+        cpu->nasid_log = 0;
         cpu->asid0_used = 0;
         cpu->next_cid = 1;
     }
@@ -284,6 +295,9 @@ void hv_ijc_switch(HvCpu *cpu) {
         cpu->asid_cid[asid] = fresh_cid(cpu);
         cpu->asid_base[asid] = base;
         cpu->cid_asid[cpu->asid_cid[asid]] = (uint16_t)asid;
+        /* after fresh_cid, which may have started the log over */
+        if (cpu->nasid_log < HV_ASID_LOG) cpu->asid_log[cpu->nasid_log] = (uint16_t)asid;
+        if (cpu->nasid_log <= HV_ASID_LOG) cpu->nasid_log++;
     }
     cpu->ijc_salt[0] = (uint64_t)cpu->asid_cid[asid] << 48;
 }
@@ -324,9 +338,17 @@ void hv_ijc_reset(HvCpu *cpu, int kernel) {
         }
         return;
     }
-    memset(cpu->asid_cid, 0, sizeof cpu->asid_cid);
+    if (hv_knob[HV_K_LOGFLUSH] && cpu->nasid_log <= HV_ASID_LOG) {
+        /* HV_TLB_LOGFLUSH (Henge 061b250): every process gets a new user id by clearing the ids given since the last
+           time, not all 64K of them. The (id, page) set keeps the dead ids' pages (no live id matches them, and ids
+           are not given again before fresh_cid empties it) until it is half full (hv_ucode_add). */
+        for (uint32_t k = 0; k < cpu->nasid_log; k++) cpu->asid_cid[cpu->asid_log[k]] = 0;
+    } else {
+        memset(cpu->asid_cid, 0, sizeof cpu->asid_cid);
+        if (!hv_knob[HV_K_LOGFLUSH]) ucode_clear(cpu->pc_state); /* every user id is new now */
+    }
+    cpu->nasid_log = 0;
     cpu->asid0_used = 0;
-    ucode_clear(cpu->pc_state); /* every user id is new now */
     hv_ijc_switch(cpu);
 }
 

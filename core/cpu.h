@@ -135,6 +135,11 @@ typedef struct HvCpu {
 #define HV_KERNEL_FILLS 4096
     uint16_t kernel_fills[HV_KERNEL_FILLS];
     uint32_t nkernel_fills;
+    /* ASIDs given a user id (asid_cid) since the user half was last started over, so that (HV_TLB_LOGFLUSH) clears
+       just these and a code change (HV_IJC_PAGES) knows every live user id. More than HV_ASID_LOG: not all known. */
+#define HV_ASID_LOG 512
+    uint16_t asid_log[HV_ASID_LOG];
+    uint32_t nasid_log;
 #define HV_KTTBR_SLOTS 64
     struct { uint64_t ttbr1; uint16_t kgen; } kttbr_map[HV_KTTBR_SLOTS];
     uint32_t kttbr_next, kttbr_count;

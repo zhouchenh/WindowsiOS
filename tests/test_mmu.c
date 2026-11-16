@@ -1,9 +1,11 @@
 // Stage 1 walker: granules, block sizes, TTBR0/TTBR1, TBI, permissions and
 // fault codes, checked directly against hv_mmu_walk.
+#include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
+#include "dispatch.h"
 #include "machine.h"
 #include "mmu.h"
 #include "sysreg.h"
@@ -63,13 +65,178 @@ static void expect(const char *what, HvCpu *cpu, uint64_t va, HvAccess acc, int 
     }
 }
 
+static void check_that(int ok, const char *fmt, ...) __attribute__((format(printf, 2, 3)));
+static void check_that(int ok, const char *fmt, ...) {
+    checks++;
+    if (ok) return;
+    va_list ap;
+    va_start(ap, fmt);
+    printf("  FAIL ");
+    vprintf(fmt, ap);
+    printf("\n");
+    va_end(ap);
+    failures++;
+}
+
+/* Entries of all four TLB tables that are not invalid. */
+static int live_entries(HvCpu *cpu) {
+    int n = 0;
+    for (uint32_t i = 0; i < HV_TLB_SIZE * 4; i++) {
+        const HvTlbEntry *e = &cpu->tlb[i];
+        n += e->read_tag != HV_TLB_INVALID || e->write_tag != HV_TLB_INVALID || e->exec_tag != HV_TLB_INVALID;
+    }
+    return n;
+}
+
+static int blooms_clear(HvCpu *cpu) {
+    const HvPerCpu *p = cpu->pc_state;
+    for (int i = 0; i < 64; i++)
+        if (p->large_2m_bloom[i]) return 0;
+    for (int i = 0; i < 8; i++)
+        if (p->large_big_bloom[i]) return 0;
+    return 1;
+}
+
+/* 4 KB granule, 39 bits both halves, for the TLB tests: 512 pages and four 2 MB blocks in each half, all on
+   RAM at BIG_PA (4 MB: two blocks' worth). User pages are EL0 RW; kernel ones EL1 only. */
+#define BIG_PA 0x100000000ull
+#define UPAGES 0x20000000ull
+#define UBLOCKS 0x40000000ull
+#define KPAGES 0xffffffc020000000ull
+#define KBLOCKS 0xffffffc040000000ull
+static uint64_t tlb_r0, tlb_r1;
+
+static void tlb_tables(void) {
+    pt_next = 2 * 65536;
+    tlb_r0 = alloc_table();
+    tlb_r1 = alloc_table();
+    for (uint64_t i = 0; i < 512; i++) {
+        map(tlb_r0, 12, 39, UPAGES + (i << 12), 3, (BIG_PA + (i << 12)) | PAGE | AF | AP(1), 0);
+        map(tlb_r1, 12, 39, KPAGES + (i << 12), 3, (BIG_PA + (i << 12)) | PAGE | AF | AP(0), 0);
+    }
+    for (uint64_t b = 0; b < 4; b++) {
+        map(tlb_r0, 12, 39, UBLOCKS + (b << 21), 2, (BIG_PA + ((b & 1) << 21)) | BLOCK | AF | AP(1), 0);
+        map(tlb_r1, 12, 39, KBLOCKS + (b << 21), 2, (BIG_PA + ((b & 1) << 21)) | BLOCK | AF | AP(0), 0);
+    }
+}
+
+static void tlb_mmu_on(HvCpu *cpu, uint64_t asid) {
+    cpu->el = 1;
+    cpu->mair_el1 = 0xff;
+    cpu->tcr_el1 = 25 | 25u << 16 | 2u << 30 | 5ull << 32 | 1ull << 36; /* T0SZ T1SZ 25, TG0 TG1 4K, 16-bit ASIDs */
+    cpu->ttbr0_el1 = asid << 48 | tlb_r0;
+    cpu->ttbr1_el1 = tlb_r1;
+    cpu->sctlr_el1 |= 1;
+    hv_ijc_switch(cpu);
+    hv_tlb_flush(cpu);
+}
+
+/* n accesses from `first`, one page apart (wrapping at 2048 pages, the blocks' worth), through TLB table `table`. */
+static void tlb_touch(HvCpu *cpu, uint64_t first, uint32_t n, int table, uint64_t span) {
+    uint64_t pa;
+    uint64_t pan = cpu->pstate_extra;
+    if (table == 2) cpu->pstate_extra |= HV_PSTATE_PAN;
+    for (uint32_t i = 0; i < n; i++) {
+        uint64_t va = first + (((uint64_t)i % span) << 12);
+        uint32_t fsc = hv_mmu_access(cpu, va, HV_ACC_READ, table ? 1 : 0, &pa);
+        if (fsc) {
+            check_that(0, "TLB test setup: access to %llx (table %d) faulted %x", (unsigned long long)va, table, fsc);
+            break;
+        }
+    }
+    cpu->pstate_extra = pan;
+}
+
+/* HV_TLB_LOGFLUSH: a whole-TLB flush clears only the logged entries; check that nothing at all survives one, after
+   every way entries get into the TLB and out of the logs, with 4 KB pages and 2 MB blocks in both halves. */
+static void test_logged_flush(HvMachine *m, HvCpu *cpu) {
+    tlb_tables();
+    struct { const char *what; uint32_t user, kernel; } fills[] = {
+        {"a few", 100, 100}, {"user log full", 3000, 100}, {"kernel log full", 100, 5000}, {"both full", 3000, 5000},
+    };
+    for (int f = 0; f < 4; f++) {
+        hv_cpu_reset(cpu, m);
+        tlb_mmu_on(cpu, 5);
+        tlb_touch(cpu, UPAGES, fills[f].user < 512 ? fills[f].user : 512, 0, 512);
+        tlb_touch(cpu, UBLOCKS, fills[f].user, 1, 2048);
+        tlb_touch(cpu, KPAGES, fills[f].kernel / 2, 1, 512);
+        tlb_touch(cpu, KBLOCKS, fills[f].kernel - fills[f].kernel / 2, 2, 2048);
+        int before = live_entries(cpu);
+        hv_tlb_flush(cpu);
+        int after = live_entries(cpu);
+        check_that(before > 0 && after == 0 && blooms_clear(cpu), "whole-TLB flush, %s: %d entries before, %d after%s (HV_TLB_LOGFLUSH=%d)",
+                   fills[f].what, before, after, blooms_clear(cpu) ? "" : ", large-page filters set", hv_knob[HV_K_LOGFLUSH]);
+    }
+
+    /* User entries overwritten by kernel ones in the same slots, a kernel flush, a user flush, then everything. */
+    hv_cpu_reset(cpu, m);
+    tlb_mmu_on(cpu, 5);
+    tlb_touch(cpu, UPAGES, 200, 1, 512);         /* slots 0..199 of table 1: user */
+    hv_tlb_flush_kernel(cpu);
+    tlb_touch(cpu, KPAGES, 100, 1, 512);         /* slots 0..99 of table 1: kernel now */
+    hv_tlb_flush_user(cpu);                      /* clears 100..199, keeps the kernel ones */
+    tlb_touch(cpu, UPAGES + (300 << 12), 50, 0, 512);
+    tlb_touch(cpu, KBLOCKS, 30, 2, 2048);
+    hv_tlb_flush(cpu);
+    check_that(live_entries(cpu) == 0, "flush after kernel and user flushes over shared slots: %d entries left", live_entries(cpu));
+
+    /* A process switch puts entries aside and back (a stash restore fills the TLB without tlb_fill). */
+    hv_cpu_reset(cpu, m);
+    tlb_mmu_on(cpu, 5);
+    tlb_touch(cpu, UPAGES, 300, 0, 512);
+    cpu->x[0] = 6ull << 48 | tlb_r0;
+    hv_sysreg_msr(cpu, 0xd5182000u, 0);          /* msr ttbr0_el1, x0: ASID 6 */
+    tlb_touch(cpu, UBLOCKS, 100, 0, 2048);
+    cpu->x[0] = 5ull << 48 | tlb_r0;
+    hv_sysreg_msr(cpu, 0xd5182000u, 0);          /* back to ASID 5: its 300 come back */
+    int restored = live_entries(cpu);
+    hv_tlb_flush(cpu);
+    check_that(restored >= 300 && live_entries(cpu) == 0, "flush after a stash restore: %d restored, %d left", restored, live_entries(cpu));
+
+    /* A CPU reset leaves a zeroed TLB, logged nowhere. */
+    tlb_touch(cpu, KPAGES, 64, 1, 512);
+    hv_cpu_reset(cpu, m);
+    check_that(live_entries(cpu) == 0, "CPU reset: %d entries not invalid", live_entries(cpu));
+
+    /* A change of TLB layout (HV_TLBT) at a flush: the logs name slots of the old one. */
+    for (int round = 0; round < 2; round++) {
+        tlb_mmu_on(cpu, 5);
+        tlb_touch(cpu, UPAGES, 400, 0, 512);
+        tlb_touch(cpu, KBLOCKS, 900, 1, 2048);
+        hv_knob[HV_K_TLBT] = !hv_knob[HV_K_TLBT];
+        hv_flush_blocks(m);
+        check_that(live_entries(cpu) == 0, "TLB layout change to %s: %d entries left", hv_tlb_tmajor ? "table-major" : "slot-major", live_entries(cpu));
+    }
+
+    /* The user half of the branch cache starts over: no ASID keeps its id (a few logged, then more than the log). */
+    for (uint32_t n = 100; n <= 700; n += 600) {
+        hv_cpu_reset(cpu, m);
+        tlb_mmu_on(cpu, 1);
+        for (uint64_t a = 1; a <= n; a++) {
+            cpu->x[0] = a << 48 | tlb_r0;
+            hv_sysreg_msr(cpu, 0xd5182000u, 0);
+        }
+        uint32_t next = cpu->next_cid;
+        hv_ijc_reset(cpu, 0);
+        int kept = 0;
+        for (uint32_t a = 0; a < 65536; a++)
+            if (cpu->asid_cid[a] && a != n) kept++;
+        check_that(kept == 0 && cpu->asid_cid[n] >= next, "user branch-cache reset after %u ASIDs: %d kept their ids, current %u (next was %u)",
+                   n, kept, cpu->asid_cid[n], next);
+    }
+    hv_cpu_reset(cpu, m);
+}
+
 int main(void) {
     static HvMachine m;
     static HvCpu cpu;
     hv_machine_init(&m, 1 << 20);
-    printf("knobs: HV_IJC_TTBKEY=%d\n", hv_knob[HV_K_IJCTTBKEY]);
+    printf("knobs: HV_IJC_TTBKEY=%d HV_TLB_LOGFLUSH=%d\n", hv_knob[HV_K_IJCTTBKEY], hv_knob[HV_K_LOGFLUSH]);
     pt = aligned_alloc(65536, PT_SIZE);
     hv_machine_add_ram(&m, PT_PA, PT_SIZE, pt, 0);
+    uint8_t *big = aligned_alloc(1u << 21, 4u << 20);
+    memset(big, 0, 4u << 20);
+    hv_machine_add_ram(&m, BIG_PA, 4u << 20, big, 0);
     hv_cpu_reset(&cpu, &m);
 
     expect("mmu off", &cpu, 0x12345678, HV_ACC_WRITE, 1, 0x12345678, 0);
@@ -420,6 +587,8 @@ int main(void) {
         }
         #undef SWITCH_TO
     }
+
+    test_logged_flush(&m, &cpu);
 
     printf("%d checks, %d failures\n", checks, failures);
     return failures != 0;
