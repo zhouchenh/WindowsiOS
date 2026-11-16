@@ -533,9 +533,49 @@ extension View {
     }
 }
 
+/// How a chrome menu's button looks: a toolbar item (iOS draws it), a round button beside the
+/// deck's trackpad, or a key in the deck's action row.
+enum ChromeLabelStyle {
+    case bar
+    case round(CGFloat)
+    case key
+}
+
+struct ChromeMenuLabel: View {
+    let title: String
+    let symbol: String
+    var style: ChromeLabelStyle = .bar
+
+    var body: some View {
+        switch style {
+        case .bar:
+            Label(title, systemImage: symbol)
+        case .round(let size):
+            Image(systemName: symbol)
+                .font(.system(size: size * 0.38, weight: .medium))
+                .foregroundStyle(.white.opacity(0.9))
+                .frame(width: size, height: size)
+                .background(DeckPalette.roundButton, in: Circle())
+                .overlay(Circle().strokeBorder(DeckPalette.edge))
+                .contentShape(Circle())
+                .accessibilityLabel(title)
+        case .key:
+            Image(systemName: symbol)
+                .font(.system(size: 9.5, weight: .medium))
+                .foregroundStyle(DeckPalette.legend)
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+                .background(DeckPalette.key, in: RoundedRectangle(cornerRadius: 5, style: .continuous))
+                .overlay(RoundedRectangle(cornerRadius: 5, style: .continuous).strokeBorder(DeckPalette.edge, lineWidth: 0.5))
+                .contentShape(Rectangle())
+                .accessibilityLabel(title)
+        }
+    }
+}
+
 /// The Shortcuts palette: Windows shortcuts by name (the one place with text labels).
 struct ShortcutsMenu: View {
     let vm: VMViewModel
+    var style: ChromeLabelStyle = .bar
 
     var body: some View {
         Menu {
@@ -574,20 +614,22 @@ struct ShortcutsMenu: View {
             }
             Button("Esc", systemImage: "escape") { WinIOSBridge.shared.sendEscape() }
         } label: {
-            Label(L("快捷键", "Shortcuts"), systemImage: "keyboard.badge.ellipsis")
+            ChromeMenuLabel(title: L("快捷键", "Shortcuts"), symbol: "keyboard.badge.ellipsis", style: style)
         }
     }
 }
 
 /// Windows' own volume, from the keyboard's volume keys.
 struct SoundMenu: View {
+    var style: ChromeLabelStyle = .bar
+
     var body: some View {
         Menu {
             Button(L("音量加", "Volume up"), systemImage: "speaker.plus") { WinKeys.volumeUp() }
             Button(L("音量减", "Volume down"), systemImage: "speaker.minus") { WinKeys.volumeDown() }
             Button(L("静音 / 取消静音", "Mute / unmute"), systemImage: "speaker.slash") { WinKeys.mute() }
         } label: {
-            Label(L("声音", "Sound"), systemImage: "speaker.wave.2")
+            ChromeMenuLabel(title: L("声音", "Sound"), symbol: "speaker.wave.2", style: style)
         }
     }
 }
@@ -595,6 +637,8 @@ struct SoundMenu: View {
 /// Clipboard: Windows' clipboard history, and typing the iPhone's clipboard into Windows (iOS asks
 /// before the app reads it, and only on this tap).
 struct ClipboardMenu: View {
+    var style: ChromeLabelStyle = .bar
+
     var body: some View {
         Menu {
             Button(L("把 iPhone 剪贴板输入到 Windows", "Type the iPhone clipboard into Windows"),
@@ -606,7 +650,7 @@ struct ClipboardMenu: View {
                 WinKeys.clipboardHistory()
             }
         } label: {
-            Label(L("剪贴板", "Clipboard"), systemImage: "clipboard")
+            ChromeMenuLabel(title: L("剪贴板", "Clipboard"), symbol: "clipboard", style: style)
         }
     }
 
@@ -637,6 +681,7 @@ struct SessionMoreMenu: View {
     let showPower: () -> Void
     var rightClickArmed: Binding<Bool>? = nil
     var dragLocked: Binding<Bool>? = nil
+    var style: ChromeLabelStyle = .bar
 
     var body: some View {
         Menu {
@@ -647,7 +692,18 @@ struct SessionMoreMenu: View {
                 }
             }
             if deckExtras {
-                Section(L("触控板", "Trackpad")) {
+                Section(L("键盘和触控板", "Keyboard and trackpad")) {
+                    Picker(selection: Binding(
+                        get: { vm.deckLayout },
+                        set: { layout in withAnimation(.snappy(duration: 0.2)) { vm.deckLayout = layout } }
+                    )) {
+                        Label(L("键盘和触控板", "Keyboard and trackpad"), systemImage: DeckLayout.split.iconName).tag(DeckLayout.split)
+                        Label(L("只有触控板", "Trackpad only"), systemImage: DeckLayout.trackpad.iconName).tag(DeckLayout.trackpad)
+                        Label(L("只有键盘", "Keyboard only"), systemImage: DeckLayout.keyboard.iconName).tag(DeckLayout.keyboard)
+                    } label: {
+                        Label(L("下半屏", "Lower half"), systemImage: "rectangle.split.1x2")
+                    }
+                    .pickerStyle(.menu)
                     if let rightClickArmed {
                         Toggle(L("下一次轻点为右键", "Next tap is a right click"), systemImage: "computermouse", isOn: rightClickArmed)
                     }
@@ -704,7 +760,7 @@ struct SessionMoreMenu: View {
                 Button(L("电源…", "Power…"), systemImage: "power") { showPower() }
             }
         } label: {
-            Label(L("更多", "More"), systemImage: "ellipsis.circle")
+            ChromeMenuLabel(title: L("更多", "More"), symbol: "ellipsis.circle", style: style)
         }
     }
 }
