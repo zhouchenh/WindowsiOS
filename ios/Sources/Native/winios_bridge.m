@@ -1228,3 +1228,51 @@ static void winios_type_run(NSString *text) {
 }
 
 @end
+
+/* ---- the clipboard shared with Windows (host/share.c, docs/clipboard.md) ---- */
+
+NSNotificationName const WinIOSGuestClipboardDidChangeNotification = @"WinIOSGuestClipboardDidChange";
+
+/* On the share server's thread: only a hop to the main queue. */
+static void winios_guest_clip_changed(unsigned long seq, void *opaque) {
+    (void)seq;
+    (void)opaque;
+    dispatch_async(dispatch_get_main_queue(), ^{
+        [[NSNotificationCenter defaultCenter] postNotificationName:WinIOSGuestClipboardDidChangeNotification object:nil];
+    });
+}
+
+@implementation WinIOSBridge (Clipboard)
+
+- (void)startClipboardObserver {
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{ hv_share_set_clipboard_listener(winios_guest_clip_changed, NULL); });
+}
+
+- (nullable NSString *)takeGuestClipboard {
+    char *raw = hv_share_take_clipboard();
+    if (!raw) return nil;
+    NSString *s = [NSString stringWithUTF8String:raw];
+    free(raw);
+    return s;
+}
+
+- (NSUInteger)sendClipboardToGuest:(NSString *)text force:(BOOL)force {
+    const char *utf8 = text.UTF8String;
+    if (!utf8) return 0;
+    return (NSUInteger)(force ? hv_share_push_clipboard(utf8) : hv_share_set_clipboard(utf8));
+}
+
+- (NSInteger)clipboardAgentSeenSeconds {
+    return (NSInteger)hv_share_clipboard_agent_seen();
+}
+
+- (NSUInteger)clipboardAgentHasSeq {
+    return (NSUInteger)hv_share_clipboard_agent_has();
+}
+
+- (void)sendPasteShortcut {
+    [self sendKeyComboWithModifiers:@[@(0xe0)] key:0x19]; /* Left Control + V */
+}
+
+@end

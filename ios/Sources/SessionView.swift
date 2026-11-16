@@ -59,6 +59,7 @@ struct SessionView: View {
         .statusBarHidden(true)
         .persistentSystemOverlays(.hidden)
         .defersSystemGestures(on: .all)
+        .clipboardSync() // clipboard hook
         .onOpenURL { JITSetup.shared.handleOpenURL($0) } // app-jit hook
         .onAppear {
             WinIOSBridge.shared.updateScreenSize(UIScreen.main.bounds.size, scale: UIScreen.main.scale)
@@ -330,6 +331,7 @@ struct SessionView: View {
                     barIcon("sparkles", active: false)
                 }
                 .accessibilityLabel(L("应用", "Apps"))
+                ClipboardButton().padding(.horizontal, 4) // clipboard hook
                 barButton(vm.useSafariForOAuth ? "safari" : "network",
                           vm.useSafariForOAuth ? L("登录链接用 Safari 打开", "Sign-in links open in Safari")
                                                : L("登录链接用 Edge 打开", "Sign-in links open in Edge"),
@@ -763,6 +765,7 @@ private struct SettingsSheet: View {
                                "The CPU name is what Windows shows for the processor; applies at the next start. Left empty, it is the device's chip (e.g. Apple A20 Pro), or Apple Silicon on a device the app does not know."))
                     }
                 }
+                if !vm.isLinux { ClipboardSettingsSection() } // clipboard hook
 
                 Section {
                     NavigationLink(L("高级设置", "Advanced")) { AdvancedSettings(vm: vm) }
