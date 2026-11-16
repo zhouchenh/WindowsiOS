@@ -526,6 +526,7 @@ private struct SettingsSheet: View {
                 Section(L("状态", "Status")) {
                     LabeledContent(L("虚拟机", "Machine"), value: vm.vmStatusText)
                     LabeledContent("JIT", value: vm.isJITLive ? L("已开启", "On") : L("未开启", "Off"))
+                    ThermalStateRow() // app-jit hook
                     LabeledContent(L("画面", "Screen"),
                                    value: vm.fbWidth > 0 ? "\(vm.fbWidth) × \(vm.fbHeight)" : "-")
                     LabeledContent(L("显卡", "Graphics"), value: vm.gpuStatusSummary)

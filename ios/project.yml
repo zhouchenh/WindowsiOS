@@ -50,6 +50,11 @@ targets:
           - stikjit
           - stikdebug
           - localdevvpn
+        # Game Mode (iOS 18+): background work deprioritised and lower Bluetooth latency for keyboards,
+        # mice and controllers while the app is full screen. The games category is what turns it on.
+        LSApplicationCategoryType: public.app-category.games
+        LSSupportsGameMode: true
+        GCSupportsGameMode: true
         UIBackgroundModes:
           - audio
         UISupportedInterfaceOrientations:
