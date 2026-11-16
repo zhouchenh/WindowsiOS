@@ -71,6 +71,9 @@ final class ClipboardSync: ObservableObject {
     }
     /// A short confirmation ("Copied from Windows"), gone by itself.
     @Published private(set) var toast: Toast?
+    /// The same message for the settings, which cover the session (and its toast) on an iPhone: it stays
+    /// longer there, so that what Check or the paste button in settings found can be read.
+    @Published private(set) var notice: Toast?
 
     private let defaults = UserDefaults.standard
     private var bridge: WinIOSBridge { WinIOSBridge.shared }
@@ -280,9 +283,14 @@ final class ClipboardSync: ObservableObject {
         let generation = toastGeneration
         // The same message again only stays longer: not shown anew (no animation, no new announcement).
         if toast?.text != text || toast?.symbol != symbol { toast = Toast(text: text, symbol: symbol) }
+        notice = toast
         DispatchQueue.main.asyncAfter(deadline: .now() + 1.8) { [weak self] in
             guard let self, self.toastGeneration == generation else { return }
             self.toast = nil
+        }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 8) { [weak self] in
+            guard let self, self.toastGeneration == generation else { return }
+            self.notice = nil
         }
     }
 }

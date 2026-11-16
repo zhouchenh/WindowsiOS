@@ -63,6 +63,13 @@ struct ClipboardSettingsSection: View {
             TimelineView(.periodic(from: .now, by: 2)) { _ in
                 LabeledContent(L("Windows 里的剪贴板小助手", "Clipboard helper in Windows"), value: helperText)
             }
+            // The session's toast is under this sheet: what Check or the paste button here found shows here.
+            if let notice = sync.notice {
+                Label(notice.text, systemImage: notice.symbol)
+                    .font(.footnote)
+                    .foregroundStyle(.secondary)
+                    .id(notice.id)
+            }
         } header: {
             Text(L("剪贴板", "Clipboard"))
         } footer: {
