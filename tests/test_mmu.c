@@ -1,5 +1,6 @@
 // Stage 1 walker: granules, block sizes, TTBR0/TTBR1, TBI, permissions and
 // fault codes, checked directly against hv_mmu_walk.
+#include <pthread.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -351,6 +352,63 @@ static void test_code_page_drops(HvMachine *m, HvCpu *cpu, HvCpu *cpu1) {
     hv_cpu_process_requests(cpu1);
     check_that(t && !ijc_has(m, 1, 0, t), "code-page drops: a full request queue did not drop everything");
     hv_cpu_reset(cpu, m);
+}
+
+/* Slow-path writes to a code page (hv_phys_write) racing another CPU that translates the page, as lookup() in
+   dispatch.c does: mark the page as code (hv_code_page_mark), then read its code; a block stays in use while the
+   page's generation is unchanged. Once a write has returned, no block may be left that is current but was made
+   from the old bytes. Two ways that went wrong: dropping the translations before copying let the other CPU
+   translate the old bytes in between, under the new generation; and a write that saw the flag (and cleared it as
+   it invalidated) between marking and reading the generation left a current block with the flag clear, so the
+   next write did not invalidate it. */
+static struct {
+    HvMachine *m;
+    uint64_t pa;
+    int stop;
+    uint64_t made; /* the translator's current block: generation << 32 | the word it read */
+} wvt;
+
+static void *wvt_translator(void *arg) {
+    (void)arg;
+    HvRam *r = hv_ram_lookup(wvt.m, wvt.pa);
+    uint64_t pg = (wvt.pa - r->pa) >> HV_TLB_PAGE_BITS;
+    uint32_t *word = hv_phys_ptr(wvt.m, wvt.pa, 4);
+    uint32_t mine = ~0u;
+    while (!__atomic_load_n(&wvt.stop, __ATOMIC_ACQUIRE)) {
+        if (__atomic_load_n(&r->page_gen[pg], __ATOMIC_ACQUIRE) == mine) continue; /* our block is current */
+        uint32_t g = hv_code_page_mark(wvt.m, r, pg);
+        uint32_t v = __atomic_load_n(word, __ATOMIC_RELAXED);
+        __atomic_store_n(&wvt.made, (uint64_t)g << 32 | v, __ATOMIC_RELEASE);
+        mine = g;
+    }
+    return NULL;
+}
+
+static void test_write_vs_translate(HvMachine *m) {
+    wvt.m = m;
+    wvt.pa = BIG_PA + 0x9000;
+    wvt.stop = 0;
+    HvRam *r = hv_ram_lookup(m, wvt.pa);
+    uint64_t pg = (wvt.pa - r->pa) >> HV_TLB_PAGE_BITS;
+    uint32_t zero = 0;
+    hv_phys_write(m, wvt.pa, &zero, 4);
+    wvt.made = (uint64_t)~0u << 32;
+    pthread_t t;
+    pthread_create(&t, NULL, wvt_translator, NULL);
+    int stale = 0;
+    uint32_t i;
+    for (i = 1; i <= 200000 && !stale; i++) {
+        hv_phys_write(m, wvt.pa, &i, 4);
+        /* Give the translator a moment to pick the change up (or to keep a stale block). */
+        for (int k = 0; k < 200; k++) __asm__ volatile("yield");
+        uint64_t made = __atomic_load_n(&wvt.made, __ATOMIC_ACQUIRE);
+        uint32_t gen = __atomic_load_n(&r->page_gen[pg], __ATOMIC_ACQUIRE);
+        if ((uint32_t)(made >> 32) == gen && (uint32_t)made != i) stale = 1;
+    }
+    __atomic_store_n(&wvt.stop, 1, __ATOMIC_RELEASE);
+    pthread_join(t, NULL);
+    check_that(!stale, "write vs translate: after write %u a current block holds the old code", i - 1);
+    r->code_pages[pg] = 0;
 }
 
 /* Is user page va in cpu's TLB (table 0, as EL0 filled it)? */
@@ -880,6 +938,7 @@ int main(void) {
     test_code_page_drops(&m, &cpu, &cpu1);
     test_stash_va(&m, &cpu, &cpu1);
     test_walk_log(&m, &cpu, &cpu1);
+    test_write_vs_translate(&m);
 
     printf("%d checks, %d failures\n", checks, failures);
     return failures != 0;

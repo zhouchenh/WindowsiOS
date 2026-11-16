@@ -125,6 +125,29 @@ static void block_dump(const HvBlock *b, const uint32_t *code) {
     pthread_mutex_unlock(&mu);
 }
 
+/* Before a page's code is read for a translation: writes to the page must take the slow path from now on so they
+   are noticed (a write after the code is read, or the IC IVAU after it, invalidates what is made from it). Without
+   the translation lock (it may scan every CPU's TLB; two CPUs doing it at once is harmless). Returns the generation
+   to make the translation under.
+   The flag must still be set once the generation is read: a write that saw it (another CPU's, made slow by it)
+   clears it as it invalidates, and a translation made under the generation after that, with the flag clear, would
+   stay current through every later write (none would take the slow path or invalidate): mark it again then. */
+uint32_t hv_code_page_mark(HvMachine *m, HvRam *ram, uint64_t pg) {
+    for (;;) {
+        if (!__atomic_load_n(&ram->code_pages[pg], __ATOMIC_RELAXED)) {
+            __atomic_store_n(&ram->code_pages[pg], 1, __ATOMIC_SEQ_CST); /* before the TLBs: see the end of tlb_fill */
+            m->stats.code_protects++;
+            for (int i = 0; i < m->ncpus; i++) /* in every CPU's TLB, or a write from another CPU goes unnoticed */
+                if (m->cpus[i]) hv_tlb_protect_code_page(m->cpus[i], ram, pg);
+            /* The flag before the code is read (a store-release lets later loads pass it): a slow-path write either
+               lands before the code is read, or sees the flag after it lands (hv_dma_written). */
+            __atomic_thread_fence(__ATOMIC_SEQ_CST);
+        }
+        uint32_t gen = __atomic_load_n(&ram->page_gen[pg], __ATOMIC_ACQUIRE);
+        if (__atomic_load_n(&ram->code_pages[pg], __ATOMIC_ACQUIRE)) return gen;
+    }
+}
+
 static HvBlock *lookup(HvCpu *cpu, uint64_t va, uint64_t pa, uint32_t flags, const uint32_t *code, uint32_t avail) {
     HvMachine *m = cpu->m;
     uint32_t j = (uint32_t)((va >> 2) ^ (va >> 18) ^ ((uint64_t)flags << 13)) & ((1u << HV_JC_BITS) - 1);
@@ -142,17 +165,7 @@ static HvBlock *lookup(HvCpu *cpu, uint64_t va, uint64_t pa, uint32_t flags, con
     }
 
     if (m->flush_pending) goto flush_unlocked;
-    /* Writes to this page must take the slow path from now on so we notice them:
-       before its code is read (so a write after that, or the IC IVAU after it,
-       invalidates what we make), and without the lock (it may scan every CPU's
-       TLB; two CPUs doing it at once is harmless). */
-    if (!__atomic_load_n(&ram->code_pages[pg], __ATOMIC_RELAXED)) {
-        __atomic_store_n(&ram->code_pages[pg], 1, __ATOMIC_SEQ_CST); /* before the TLBs: see the end of tlb_fill */
-        m->stats.code_protects++;
-        for (int i = 0; i < m->ncpus; i++) /* in every CPU's TLB, or a write from another CPU goes unnoticed */
-            if (m->cpus[i]) hv_tlb_protect_code_page(m->cpus[i], ram, pg);
-        gen = __atomic_load_n(&ram->page_gen[pg], __ATOMIC_ACQUIRE);
-    }
+    gen = hv_code_page_mark(m, ram, pg);
     /* Translate without the lock, into this thread's buffer... */
     HvBlock nb = {.va = va, .pa = pa, .flags = flags, .gen = gen, .ram = ram, .pg = pg, .maker = cpu->index + 1, .jit_gen = __atomic_load_n(&m->jit_gen, __ATOMIC_SEQ_CST)};
     uint64_t t0 = m->stats_interval ? mach_absolute_time() : 0;

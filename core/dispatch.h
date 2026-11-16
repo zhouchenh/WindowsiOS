@@ -20,4 +20,8 @@ void hv_fp_leave(HvCpu *cpu);
 
 void hv_debug_el0_in_kernel(HvCpu *cpu, const char *what);
 
+/* Marks a page as holding translated code before it is read for a translation; returns the generation to make
+   the translation under. */
+uint32_t hv_code_page_mark(HvMachine *m, HvRam *ram, uint64_t pg);
+
 #endif
