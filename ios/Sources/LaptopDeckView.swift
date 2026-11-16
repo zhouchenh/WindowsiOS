@@ -342,6 +342,9 @@ struct LaptopDeckView: View {
     @State private var winLatched: Bool = false
     @State private var capsLocked: Bool = false
     @State private var fnActive: Bool = false
+    /// The usage each held key went down with (by key id): its key-up lifts exactly that one, even if Fn
+    /// was toggled meanwhile (Home down, then ← up, left Home held, repeating in Windows).
+    @State private var heldHid: [String: UInt8] = [:]
 
     @State private var dragLocked: Bool = false
     @State private var padTouching: Bool = false
@@ -714,6 +717,7 @@ struct LaptopDeckView: View {
                 if winLatched  { WinIOSBridge.shared.sendKeyHid(0xe3, down: true) }
                 if shiftLatched { WinIOSBridge.shared.sendKeyHid(0xe1, down: true) }
                 WinIOSBridge.shared.sendKeyHid(0x4c, down: true)
+                heldHid[spec.id] = 0x4c
                 return
             }
             performFunctionAction(action)
@@ -725,6 +729,7 @@ struct LaptopDeckView: View {
             if winLatched  { WinIOSBridge.shared.sendKeyHid(0xe3, down: true) }
             if shiftLatched { WinIOSBridge.shared.sendKeyHid(0xe1, down: true) }
             WinIOSBridge.shared.sendKeyHid(actualHid, down: true)
+            heldHid[spec.id] = actualHid
 
         case .upDownStack:
             break
@@ -733,15 +738,17 @@ struct LaptopDeckView: View {
 
     private func handleKeyUp(_ spec: LaptopKeySpec) {
         switch spec.role {
-        case .regular(let hid, _, _, let fnHid, _, _):
+        case .regular:
             keyUpHaptic.impactOccurred(intensity: 0.22)
-            let actualHid = (fnActive && fnHid != nil) ? fnHid! : hid
-            WinIOSBridge.shared.sendKeyHid(actualHid, down: false)
+            if let sent = heldHid.removeValue(forKey: spec.id) {
+                WinIOSBridge.shared.sendKeyHid(sent, down: false)
+            }
             releaseLatchedModifiers()
-        case .functionKey(let action, let fnHid, _, _, _) where action == .forwardDelete:
+        case .functionKey(let action, _, _, _, _) where action == .forwardDelete:
             keyUpHaptic.impactOccurred(intensity: 0.22)
-            if !(fnActive && fnHid != nil) {
-                WinIOSBridge.shared.sendKeyHid(0x4c, down: false)
+            // only if it went down as Delete (with Fn it was a tap of its Fn usage, already up)
+            if let sent = heldHid.removeValue(forKey: spec.id) {
+                WinIOSBridge.shared.sendKeyHid(sent, down: false)
                 releaseLatchedModifiers()
             }
         default:
