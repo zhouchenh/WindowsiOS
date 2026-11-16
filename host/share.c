@@ -754,8 +754,52 @@ static int open_url_put(Conn *c, Request *r) {
     return respond_empty(c, r, 400, "Bad Request");
 }
 
+/* /.henge/forwards (port forwards, net_slirp.c): GET lists them all with their state (JSON); PUT or POST
+   {"protocol":"tcp"|"udp"|"tcp+udp","hostPort":N,"guestPort":M,"name":"..."} adds one for this session, on the
+   device's loopback only and from port 1024 (the guest never opens a port to the network: that is the user's
+   choice in the app); DELETE ?id=... removes one the guest added. */
+static int forwards(Conn *c, Request *r) {
+    if (!strcmp(r->method, "GET")) {
+        if (body_discard(c, r) != 0) return -1;
+        char *json = hv_net_fwd_list_json();
+        int rc = respond(c, r, 200, "OK", "Content-Type: application/json\r\n", json ? json : "{}", json ? strlen(json) : 2);
+        free(json);
+        return rc;
+    }
+    if (!strcmp(r->method, "PUT") || !strcmp(r->method, "POST")) {
+        size_t len = 0;
+        char *body = body_small(c, r, &len);
+        if (!body) return -1;
+        HvFwdRule rule = {.proto = HV_FWD_TCP, .scope = HV_FWD_LOOPBACK, .enabled = 1};
+        int ok = hv_net_fwd_parse_rule(body, len, &rule) == 0;
+        free(body);
+        if (!ok) return respond(c, r, 400, "Bad Request", "Content-Type: text/plain\r\n", "bad JSON\n", 9);
+        if (!rule.guest_port) rule.guest_port = rule.host_port;
+        char err[160], out[96];
+        if (hv_net_fwd_put(&rule, HV_FWD_GUEST, err, sizeof err) != 0) {
+            size_t n = strlen(err);
+            if (n + 1 < sizeof err) err[n++] = '\n', err[n] = 0;
+            return respond(c, r, 409, "Conflict", "Content-Type: text/plain\r\n", err, n);
+        }
+        hv_net_fwd_sync(1000); /* so a GET right after shows whether it opened */
+        int n = snprintf(out, sizeof out, "{\"id\":\"%s\"}", rule.id);
+        return respond(c, r, 200, "OK", "Content-Type: application/json\r\n", out, (size_t)n);
+    }
+    if (!strcmp(r->method, "DELETE")) {
+        if (body_discard(c, r) != 0) return -1;
+        char id[48] = {0};
+        const char *q = strstr(r->query, "id=");
+        if (q && (q == r->query || q[-1] == '&')) snprintf(id, sizeof id, "%.*s", (int)strcspn(q + 3, "&"), q + 3);
+        if (!id[0] || hv_net_fwd_remove(id, 1) != 0) return respond_empty(c, r, 404, "Not Found");
+        return respond_empty(c, r, 204, "No Content");
+    }
+    if (body_discard(c, r) != 0) return -1;
+    return respond_empty(c, r, 405, "Method Not Allowed");
+}
+
 static int serve_henge(Conn *c, Request *r) {
     const char *what = r->path + strlen("/.henge/");
+    if (!strcmp(what, "forwards")) return forwards(c, r);
     if (!strcmp(what, "install") && !strcmp(r->method, "GET")) {
         if (body_discard(c, r) != 0) return -1;
         return respond(c, r, 200, "OK", "Content-Type: text/plain\r\n", install_script, sizeof install_script - 1);
@@ -781,7 +825,7 @@ static int serve_henge(Conn *c, Request *r) {
         int port = atoi(pstr);
         free(pstr);
         if (port >= 1024 && port <= 65535) {
-            hv_net_add_hostfwd(port, port);
+            hv_net_add_hostfwd(port, port); /* a session forward, loopback only: listed in /.henge/forwards */
             return respond_empty(c, r, 204, "No Content");
         }
         return respond_empty(c, r, 400, "Bad Request");
