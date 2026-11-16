@@ -55,6 +55,7 @@ static char clip_agent_id[40];  /* the helper that sent the last PUT, and its ow
 static unsigned long clip_agent_seq;
 static time_t clip_agent_seen;  /* the clipboard helper's last request */
 static int clip_waiters;        /* its long polls waiting right now */
+static unsigned long clip_agent_has; /* its last since=: it asks again only once it has put that one in place */
 static hv_share_clip_fn clip_listener;
 static void *clip_listener_opaque;
 static char *guest_open_url;
@@ -138,11 +139,11 @@ int hv_share_clip_valid(const char *text, size_t len) {
     return 1;
 }
 
-/* Puts text (malloc'd, valid) in the slot unless the slot holds it already, so text that goes round
-   (device -> guest -> device) stops. Returns the new sequence number, or 0 when nothing changed (text is
-   freed then). With clip_mu held. */
-static unsigned long clip_store_locked(char *text, int origin) {
-    if (clip_text && !strcmp(clip_text, text)) {
+/* Puts text (malloc'd, valid) in the slot unless the slot holds it already (and force is 0), so text that
+   goes round (device -> guest -> device) stops. Returns the new sequence number, or 0 when nothing changed
+   (text is freed then). With clip_mu held. */
+static unsigned long clip_store_locked(char *text, int origin, int force) {
+    if (!force && clip_text && !strcmp(clip_text, text)) {
         free(text);
         return 0;
     }
@@ -155,15 +156,19 @@ static unsigned long clip_store_locked(char *text, int origin) {
     return clip_seq;
 }
 
-unsigned long hv_share_set_clipboard(const char *text) {
+static unsigned long clip_from_device(const char *text, int force) {
     if (!text || !*text || !hv_share_clip_valid(text, strlen(text))) return 0;
     char *copy = strdup(text);
     if (!copy) return 0;
     pthread_mutex_lock(&clip_mu);
-    unsigned long seq = clip_store_locked(copy, HV_SHARE_CLIP_FROM_DEVICE);
+    unsigned long seq = clip_store_locked(copy, HV_SHARE_CLIP_FROM_DEVICE, force);
     pthread_mutex_unlock(&clip_mu);
     return seq;
 }
+
+unsigned long hv_share_set_clipboard(const char *text) { return clip_from_device(text, 0); }
+
+unsigned long hv_share_push_clipboard(const char *text) { return clip_from_device(text, 1); }
 
 char *hv_share_take_clipboard(void) {
     pthread_mutex_lock(&clip_mu);
@@ -187,6 +192,13 @@ void hv_share_set_clipboard_listener(hv_share_clip_fn fn, void *opaque) {
     clip_listener = fn;
     clip_listener_opaque = opaque;
     pthread_mutex_unlock(&clip_mu);
+}
+
+unsigned long hv_share_clipboard_agent_has(void) {
+    pthread_mutex_lock(&clip_mu);
+    unsigned long seq = clip_agent_has;
+    pthread_mutex_unlock(&clip_mu);
+    return seq;
 }
 
 long hv_share_clipboard_agent_seen(void) {
@@ -790,6 +802,7 @@ static int clipboard_get(Conn *c, Request *r) {
     pthread_mutex_lock(&clip_mu);
     clip_agent_seen = agent_seen = time(NULL);
     if (since_s) {
+        if (since <= clip_seq) clip_agent_has = since; /* not a number from before the app restarted */
         clip_waiters++;
         while (clip_seq == since && pthread_cond_timedwait(&clip_cond, &clip_mu, &until) != ETIMEDOUT) {}
         clip_waiters--;
@@ -857,7 +870,7 @@ static int clipboard_put(Conn *c, Request *r) {
     int counted = agent[0] && agent_seq;
     int overtaken = counted && !strcmp(agent, clip_agent_id) && agent_seq <= clip_agent_seq;
     if (copy && !overtaken) {
-        changed = clip_store_locked(copy, HV_SHARE_CLIP_FROM_GUEST);
+        changed = clip_store_locked(copy, HV_SHARE_CLIP_FROM_GUEST, 0);
         copy = NULL;
     }
     if (counted && !overtaken) {

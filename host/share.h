@@ -17,6 +17,9 @@ int hv_share_start(const char *folder, const char *socket_path, const char *agen
 /* The device's clipboard, for the guest to pick up. Returns the slot's new sequence number, or 0 if
    nothing changed: empty, not UTF-8, larger than HV_SHARE_CLIP_MAX, or the text the slot has already. */
 unsigned long hv_share_set_clipboard(const char *text);
+/* The same, but always a change, even with the slot's own text: the person sent it on purpose, and
+   Windows may have copied something that is not text since. */
+unsigned long hv_share_push_clipboard(const char *text);
 /* What the guest last copied, once: a malloc'd string, or NULL if nothing is new. */
 char *hv_share_take_clipboard(void);
 /* The slot as it is (malloc'd, or NULL when empty), its sequence number and HV_SHARE_CLIP_FROM_*. */
@@ -26,6 +29,9 @@ typedef void (*hv_share_clip_fn)(unsigned long seq, void *opaque);
 void hv_share_set_clipboard_listener(hv_share_clip_fn fn, void *opaque);
 /* Seconds since the guest's clipboard helper was last heard from: 0 while it waits for news, -1 never. */
 long hv_share_clipboard_agent_seen(void);
+/* The sequence number the helper last asked ?since= for. It asks again only once it has put what it got
+   on the guest's clipboard, so a value >= what hv_share_push_clipboard returned means Ctrl+V can go. */
+unsigned long hv_share_clipboard_agent_has(void);
 /* 1 if len bytes at text are UTF-8 without NUL and at most HV_SHARE_CLIP_MAX long. */
 int hv_share_clip_valid(const char *text, size_t len);
 /* Seconds since any helper in the guest was last heard from, or -1 if it never has been. */

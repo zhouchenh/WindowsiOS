@@ -239,6 +239,7 @@ int main(void) {
     CHECK(p.reply.status == 200 && p.reply.seq == 2 && !strcmp(p.reply.body, "next"), "long poll: %d %lu", p.reply.status, p.reply.seq);
     CHECK(p.took < 2.0, "long poll answered at once (%.2f s)", p.took);
     free_reply(&p.reply);
+    CHECK(hv_share_clipboard_agent_has() == 1, "the helper had 1: %lu", hv_share_clipboard_agent_has());
 
     /* With nothing new it waits as long as asked, then says what there is. */
     double t0 = now_s();
@@ -252,6 +253,7 @@ int main(void) {
     r = request("GET", "/.henge/clipboard?since=99", NULL, 0);
     CHECK(r.status == 200 && r.seq == 2 && now_s() - t0 < 1, "stale since");
     free_reply(&r);
+    CHECK(hv_share_clipboard_agent_has() == 2, "a stale since= is not taken as had: %lu", hv_share_clipboard_agent_has());
 
     /* The guest copies: the app hears of it, once. */
     r = put_text("/.henge/clipboard?agent=a1&n=1", "from windows \xf0\x9f\x98\x80");
@@ -277,29 +279,35 @@ int main(void) {
     CHECK(r.status == 204 && r.seq == 3 && heard(NULL) == 1, "same text from the guest: seq %lu heard %d", r.seq, heard(NULL));
     free_reply(&r);
     CHECK(hv_share_set_clipboard("from windows \xf0\x9f\x98\x80") == 0, "the device sending the guest's text back");
+    /* ...unless the person sends it on purpose. */
+    CHECK(hv_share_push_clipboard("from windows \xf0\x9f\x98\x80") == 4, "a push is always a change");
+    now = hv_share_get_clipboard(&seq, &origin);
+    CHECK(seq == 4 && origin == HV_SHARE_CLIP_FROM_DEVICE, "pushed: %lu %d", seq, origin);
+    free(now);
+    CHECK(hv_share_push_clipboard("\xc0\xaf") == 0 && hv_share_push_clipboard("") == 0, "a push is still checked");
 
     /* A PUT overtaken by a newer one from the same helper is dropped; another helper's is not. */
     r = put_text("/.henge/clipboard?agent=a1&n=5", "five");
-    CHECK(r.seq == 4, "n=5: %lu", r.seq);
+    CHECK(r.seq == 5, "n=5: %lu", r.seq);
     free_reply(&r);
     r = put_text("/.henge/clipboard?agent=a1&n=4", "four");
-    CHECK(r.status == 204 && r.seq == 4, "n=4 dropped: %lu", r.seq);
+    CHECK(r.status == 204 && r.seq == 5, "n=4 dropped: %lu", r.seq);
     free_reply(&r);
     r = put_text("/.henge/clipboard?agent=b2&n=1", "other helper");
-    CHECK(r.seq == 5, "a restarted helper: %lu", r.seq);
+    CHECK(r.seq == 6, "a restarted helper: %lu", r.seq);
     free_reply(&r);
     r = put_text("/.henge/clipboard", "no count");
-    CHECK(r.seq == 6, "without agent/n: %lu", r.seq);
+    CHECK(r.seq == 7, "without agent/n: %lu", r.seq);
     free_reply(&r);
     CHECK(heard(NULL) == 4, "heard %d", heard(NULL));
 
     /* Empty is no change; a byte order mark is dropped. */
     r = put_text("/.henge/clipboard", "");
-    CHECK(r.status == 204 && r.seq == 6, "empty put");
+    CHECK(r.status == 204 && r.seq == 7, "empty put");
     free_reply(&r);
     r = put_text("/.henge/clipboard", "\xef\xbb\xbf" "bom");
     now = hv_share_get_clipboard(NULL, NULL);
-    CHECK(r.seq == 7 && now && !strcmp(now, "bom"), "bom");
+    CHECK(r.seq == 8 && now && !strcmp(now, "bom"), "bom");
     free(now);
     free_reply(&r);
 
@@ -322,7 +330,7 @@ int main(void) {
     CHECK(r.status == 413, "too large: %d", r.status);
     free_reply(&r);
     r = request("PUT", "/.henge/clipboard", big, HV_SHARE_CLIP_MAX);
-    CHECK(r.status == 204 && r.seq == 8, "exactly the cap: %d %lu", r.status, r.seq);
+    CHECK(r.status == 204 && r.seq == 9, "exactly the cap: %d %lu", r.status, r.seq);
     free_reply(&r);
     {
         int fd = dial();
@@ -342,7 +350,7 @@ int main(void) {
     }
     free(big);
     now = hv_share_get_clipboard(&seq, NULL);
-    CHECK(seq == 8 && now && strlen(now) == HV_SHARE_CLIP_MAX, "slot unchanged by refused PUTs: %lu", seq);
+    CHECK(seq == 9 && now && strlen(now) == HV_SHARE_CLIP_MAX, "slot unchanged by refused PUTs: %lu", seq);
     free(now);
 
     /* Malformed requests: answered or dropped, and the server carries on. */
@@ -354,7 +362,7 @@ int main(void) {
         free_reply(&r);
     }
     r = request("GET", "/.henge/clipboard", NULL, 0);
-    CHECK(r.status == 200 && r.seq == 8, "still serving: %d %lu", r.status, r.seq);
+    CHECK(r.status == 200 && r.seq == 9, "still serving: %d %lu", r.status, r.seq);
     free_reply(&r);
     r = request("DELETE", "/.henge/clipboard", NULL, 0);
     CHECK(r.status == 404, "other methods: %d", r.status);
