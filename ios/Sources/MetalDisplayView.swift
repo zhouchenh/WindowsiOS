@@ -124,6 +124,8 @@ final class MetalCanvasUIView: UIView, UITextInput {
         inputAssistantItem.trailingBarButtonGroups = []
         NotificationCenter.default.addObserver(self, selector: #selector(releaseAllKeys),
                                                name: UIApplication.willResignActiveNotification, object: nil)
+        NotificationCenter.default.addObserver(self, selector: #selector(displayWillReshape),
+                                               name: .WinIOSDisplayWillReshape, object: nil)
         configureInput()
         // Pointer movement and its scroll wheel.
         let hover = UIHoverGestureRecognizer(target: self, action: #selector(handleHover(_:)))
@@ -233,6 +235,7 @@ final class MetalCanvasUIView: UIView, UITextInput {
     }
 
     override func touchesBegan(_ touches: Set<UITouch>, with event: UIEvent?) {
+        WinIOSBridge.shared.noteUserInput() // the display goes back to its full frame rate now
         // An attached mouse or trackpad clicking: absolute position, the button it pressed.
         let pointerTouches = touches.filter { $0.type == .indirectPointer }
         if let t = pointerTouches.first {
@@ -507,6 +510,23 @@ final class MetalCanvasUIView: UIView, UITextInput {
     private func cancelLongPress() {
         longPressWork?.cancel()
         longPressWork = nil
+    }
+
+    /// Windows is about to take a new size (posted once per reshape, after the bridge lifted what it had
+    /// sent down): the gesture in progress ends here as if cancelled, so a drag, a held button, a long
+    /// press or a pinch's Ctrl does not carry over onto the new layout. Fingers still down do nothing
+    /// more until they lift; the next touch starts afresh.
+    @objc private func displayWillReshape() {
+        cancelLongPress()
+        endPinch()
+        if dragging {
+            dragging = false
+            PointerController.shared.setHeldButton(1, down: false)
+        }
+        if !fingers.isEmpty { consumed = true }
+        keysDown.removeAll() // lifted by the bridge; a key still pressed sends its own key-up later
+        PointerController.shared.forgetHeldButtons()
+        WinIOSBridge.shared.releaseAllInputForReshape()
     }
 
     @objc private func handleHover(_ gr: UIHoverGestureRecognizer) {

@@ -79,11 +79,27 @@ final class TrackpadGlassUIView: UIView {
             scrollPan.allowedScrollTypesMask = .all
         }
         addGestureRecognizer(scrollPan)
+
+        NotificationCenter.default.addObserver(self, selector: #selector(displayWillReshape),
+                                               name: .WinIOSDisplayWillReshape, object: nil)
+    }
+
+    /// Windows is about to take a new size and the bridge lifted every button: a held corner or a
+    /// tap-drag in progress ends here (the finger does nothing more until it lifts).
+    @objc private func displayWillReshape() {
+        if heldCornerTouch != nil || heldCornerButton != 0 {
+            heldCornerTouch = nil
+            heldCornerButton = 0
+            onCornerClickState?(0)
+        }
+        tapDragActive = false
+        PointerController.shared.forgetHeldButtons()
     }
 
     // Invisible bottom-left (hold-drag) & bottom-right (right-click) zones of the trackpad
     override func touchesBegan(_ touches: Set<UITouch>, with event: UIEvent?) {
         super.touchesBegan(touches, with: event)
+        WinIOSBridge.shared.noteUserInput() // the display goes back to its full frame rate now
         guard heldCornerTouch == nil, bounds.height > 20, bounds.width > 40 else { return }
         for t in touches {
             let p = t.location(in: self)
@@ -496,6 +512,10 @@ struct LaptopDeckView: View {
                 dragLocked = false
                 PointerController.shared.setHeldButton(1, down: false)
             }
+        }
+        // Windows takes a new size: the bridge lifted every button, so F9's drag lock is off too.
+        .onReceive(NotificationCenter.default.publisher(for: .WinIOSDisplayWillReshape)) { _ in
+            dragLocked = false
         }
     }
 

@@ -37,6 +37,10 @@ final class PointerController {
         WinIOSBridge.shared.sendTabletNormalizedX(cursorX, y: cursorY, buttons: heldButtons | extraButtons, wheel: 0)
     }
 
+    /// The bridge lifted every button before Windows took a new size (releaseAllInputForReshape): none is
+    /// held any more, so the next move does not press one again.
+    func forgetHeldButtons() { heldButtons = 0 }
+
     func setHeldButton(_ mask: UInt8, down: Bool) {
         if down {
             heldButtons |= mask
