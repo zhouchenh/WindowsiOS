@@ -240,6 +240,7 @@ final class DisplaySettings: ObservableObject {
         surface = s
         load(s)
         push()
+        WinIOSBridge.shared.displaySurfaceDidChange()
     }
 
     private func push() {

@@ -54,6 +54,7 @@ NSNotificationName const WinIOSDisplayWillReshapeNotification = @"WinIOSDisplayW
     CGFloat _viewNativeScale;
     NSInteger _displayPreset, _displaySharpness;
     BOOL _displayImmersive, _immersiveKeeps;
+    BOOL _surfaceMoved; /* the app moved to another screen (posture, cover): its canvas is new, see replanDisplay */
     WinIOSDisplayPlan _committedPlan; /* sent to Windows (or to be sent at start) */
     CGSize _committedViewPts;
     WinIOSDisplayPlan _pendingPlan;
@@ -448,6 +449,7 @@ static BOOL winios_plans_equal(WinIOSDisplayPlan a, WinIOSDisplayPlan b) {
 - (void)setDisplayImmersive:(BOOL)on {
     if (on == _displayImmersive) return;
     _displayImmersive = on;
+    _surfaceMoved = NO; /* a new immersive (or none): the screen it starts on is where the mode is kept */
     fprintf(stderr, "display: immersive %s (%s)\n", on ? "on" : "off", _immersiveKeeps ? "keeps the resolution" : "full panel");
     [self replanDisplay:@"immersive"];
 }
@@ -457,6 +459,15 @@ static BOOL winios_plans_equal(WinIOSDisplayPlan a, WinIOSDisplayPlan b) {
     if (keep == _immersiveKeeps) return;
     _immersiveKeeps = keep;
     if (_displayImmersive) [self replanDisplay:@"immersive"];
+}
+
+- (void)displaySurfaceDidChange {
+    if (![NSThread isMainThread]) {
+        dispatch_async(dispatch_get_main_queue(), ^{ [self displaySurfaceDidChange]; });
+        return;
+    }
+    _surfaceMoved = YES;
+    [self replanDisplay:@"surface"];
 }
 
 - (void)updateDisplayViewSize:(CGSize)size {
@@ -496,8 +507,10 @@ static BOOL winios_plans_equal(WinIOSDisplayPlan a, WinIOSDisplayPlan b) {
     os_unfair_lock_unlock(&_metricsLock);
     WinIOSDisplayPlan plan = [self planForView:pts preset:_displayPreset sharpness:_displaySharpness];
     if (!plan.modeWidth) return;
-    if (_displayImmersive && _immersiveKeeps && _committedPlan.modeWidth && !plan.legacy) {
-        /* immersive, keeping the resolution: no re-mode; the presenter fits the picture to the panel */
+    if (_displayImmersive && _immersiveKeeps && _committedPlan.modeWidth && !plan.legacy && !_surfaceMoved) {
+        /* immersive, keeping the resolution: no re-mode; the presenter fits the picture to the panel. Not after
+           the app moved to another screen (folded into the laptop posture, say): the canvas there is that
+           screen's own windowed size (or its whole area), and Windows takes it once, kept from then on. */
         if (_hasPending) [self dropPendingPlan];
         return;
     }
@@ -575,6 +588,7 @@ static BOOL winios_plans_equal(WinIOSDisplayPlan a, WinIOSDisplayPlan b) {
     WinIOSDisplayPlan plan = _pendingPlan, old = _committedPlan;
     _hasPending = NO;
     _reshapeAnnounced = NO;
+    _surfaceMoved = NO;
     _committedPlan = plan;
     _committedViewPts = _pendingViewPts;
     os_unfair_lock_lock(&_metricsLock);

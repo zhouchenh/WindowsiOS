@@ -100,6 +100,9 @@ extern NSNotificationName const WinIOSDisplayWillReshapeNotification;
 /// (no re-mode, the picture is shown 1:1 or scaled), otherwise it re-modes to the full panel.
 @property (nonatomic) BOOL displayImmersive;
 @property (nonatomic) BOOL immersiveKeepsResolution;
+/// The app moved to another screen (inner, laptop lid, cover). Immersive keeping the resolution keeps the
+/// mode it has on one screen; on the next screen the canvas is a new size, which Windows then takes once.
+- (void)displaySurfaceDidChange;
 /// HV_DISPLAY_LEGACY=1 (Documents/env.txt): the former sizing, drawable at UIScreen.scale.
 @property (nonatomic, readonly) BOOL displayLegacy;
 /// The plan for the current view with another preset / sharpness (for the pickers' readouts).
