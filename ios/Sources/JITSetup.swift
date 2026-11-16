@@ -113,10 +113,17 @@ final class JITSetup: ObservableObject {
             becameLive(turnedOnHere: true)
             return .live
         }
+        let detail = WinIOSBridge.shared.jitStatusText
+        if detail.hasPrefix("Failed") {
+            // The debugger answered, but the region it gave did not work out (winios_jit.c says why).
+            fail(L("调试器已连接，但 JIT 内存没能准备好：", "A debugger is attached, but the JIT memory could not be set up: ")
+                 + detail + L("。请彻底关闭 Apple VM 再打开，然后重试。", ". Close Apple VM completely, open it again and retry."))
+            return .failed
+        }
         // Attached, but nothing answered the JIT script's traps.
         fail(L("调试器已连接，但没有运行 Apple VM 的 JIT 脚本，所以没能开启 JIT。从 StikDebug 的应用列表里直接打开 Apple VM，或在某些容器 App 里运行时会这样。请彻底关闭 Apple VM，从主屏幕打开，再点“用 StikDebug 开启”。",
                "A debugger is attached but did not run Apple VM's JIT script, so JIT could not be turned on. This happens when Apple VM is opened from StikDebug's app list, or inside some container apps. Close Apple VM completely, open it from the Home Screen and tap Enable with StikDebug.")
-             + "\n(" + WinIOSBridge.shared.jitStatusText + ")")
+             + "\n(" + detail + ")")
         return .failed
     }
 
