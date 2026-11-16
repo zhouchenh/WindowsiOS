@@ -20,6 +20,10 @@ void hv_dns_proxy_stop(void);
 void hv_dns_proxy_set_nameserver6(const uint8_t *addr16);
 /* A frame the guest sent: 1 if it was a DNS query this took (its answer comes through send), 0 to pass it on. */
 int hv_dns_proxy_take(const uint8_t *frame, uint32_t len, HvDnsSend send);
+/* A frame libslirp sends the guest: if it is a Router Advertisement without a DNS server (RDNSS) option, and the
+   proxy is on with an IPv6 name server, writes the advertisement with one naming that server to out and returns its
+   length. 0: send the frame as it is. */
+uint32_t hv_dns_proxy_announce(const uint8_t *frame, uint32_t len, uint8_t *out, uint32_t cap);
 void hv_dns_proxy_stats(uint64_t *answered, uint64_t *handed_back, uint64_t *timed_out);
 
 #endif

@@ -236,6 +236,55 @@ static int one(const uint8_t *f, uint32_t len, unsigned max) {
     return taken;
 }
 
+/* A Router Advertisement as libslirp sends it (source link-layer address and prefix options), with an RDNSS
+   option for `rdnss` if not NULL. */
+static uint32_t build_ra(uint8_t *f, const uint8_t *rdnss) {
+    static const uint8_t dst_mac[6] = {0x33, 0x33, 0, 0, 0, 1}, src_mac[6] = {0x52, 0x56, 0, 0, 0, 2};
+    memset(f, 0, 14 + 40 + 16 + 8 + 32 + 24);
+    memcpy(f, dst_mac, 6), memcpy(f + 6, src_mac, 6);
+    f[12] = 0x86, f[13] = 0xdd;
+    uint8_t *ip = f + 14, *icmp = ip + 40;
+    ip[0] = 0x60, ip[6] = 58, ip[7] = 255;
+    ip[8] = 0xfe, ip[9] = 0x80, ip[23] = 2;                 /* from fe80::2 */
+    ip[24] = 0xff, ip[25] = 0x02, ip[39] = 1;               /* to ff02::1 */
+    icmp[0] = 134, icmp[4] = 64, icmp[6] = 0x07, icmp[7] = 0x08; /* hop limit 64, router lifetime 1800 s */
+    uint32_t n = 16;
+    icmp[n] = 1, icmp[n + 1] = 1, memcpy(icmp + n + 2, src_mac, 6), n += 8;
+    icmp[n] = 3, icmp[n + 1] = 4, icmp[n + 2] = 64, icmp[n + 3] = 0xc0; /* prefix, /64, on-link + autonomous */
+    icmp[n + 7] = 0x80, icmp[n + 11] = 0x40;
+    memcpy(icmp + n + 16, NS6, 8), n += 32;
+    if (rdnss) {
+        icmp[n] = 25, icmp[n + 1] = 3, icmp[n + 7] = 0xb0;
+        memcpy(icmp + n + 8, rdnss, 16), n += 24;
+    }
+    ip[4] = (uint8_t)(n >> 8), ip[5] = (uint8_t)n;
+    uint32_t sum = sum16(sum16(0, ip + 8, 32) + n + 58, icmp, n);
+    icmp[2] = (uint8_t)(~sum >> 8), icmp[3] = (uint8_t)~sum;
+    return 14 + 40 + n;
+}
+
+/* Announces f (copied to a buffer of exactly len bytes) into a buffer of exactly cap bytes; checks what comes out. */
+static uint32_t announce(const uint8_t *f, uint32_t len, uint32_t cap) {
+    uint8_t *in = malloc(len ? len : 1), *out = malloc(cap ? cap : 1);
+    if (!in || !out) exit(1);
+    memcpy(in, f, len);
+    uint32_t n = hv_dns_proxy_announce(in, len, out, cap);
+    if (n) {
+        check("announced RA within its buffer", n <= cap && n == len + 24);
+        const uint8_t *ip = out + 14, *icmp = ip + 40;
+        uint32_t plen = rd16(ip + 4);
+        check("announced RA payload length", plen == n - 54);
+        check("announced RA keeps the rest", !memcmp(out, in, 14 + 4) && !memcmp(out + 20, in + 20, 34 + 2) &&
+                                              !memcmp(out + 58, in + 58, len - 58));
+        check("announced RA checksum", sum16(sum16(0, ip + 8, 32) + plen + 58, icmp, plen) == 0xffff);
+        const uint8_t *o = out + len;
+        check("announced RDNSS option", o[0] == 25 && o[1] == 3 && rd16(o + 2) == 0 && !memcmp(o + 8, NS6, 16));
+        check("announced RDNSS lifetime", rd16(o + 4) == 0 && rd16(o + 6) == 1200);
+    }
+    free(in), free(out);
+    return n;
+}
+
 static uint64_t rng = 0x9e3779b97f4a7c15ull;
 static uint32_t rnd(void) {
     rng ^= rng << 13, rng ^= rng >> 7, rng ^= rng << 17;
@@ -414,6 +463,64 @@ int main(void) {
         len = build6(f, ab, sizeof ab, 28, 0, 0, 0, 0);
         ip[0] = 0x40;
         check("IPv6 frame with version 4 left", !take(f, len));
+    }
+
+    /* Router Advertisements: one without an RDNSS option gets one naming the IPv6 name server; one with an RDNSS
+       already, or anything else, stays as it is. */
+    {
+        uint32_t len = build_ra(f, NULL);
+        check("RA without RDNSS announced", announce(f, len, len + 24) == len + 24);
+        check("RA announced into a larger buffer", announce(f, len, 2000) == len + 24);
+        check("RA not announced into a buffer too small", !announce(f, len, len + 23));
+        check("RA cut short not announced", !announce(f, len - 1, len + 24));
+        check("RA with Ethernet padding not announced", !announce(f, len + 1, len + 25));
+        uint8_t other[16];
+        memcpy(other, NS6, 16), other[15] = 9;
+        len = build_ra(f, other);
+        check("RA with an RDNSS left", !announce(f, len, len + 24));
+        len = build_ra(f, NULL);
+        f[14 + 40] = 133;
+        check("Router Solicitation left", !announce(f, len, len + 24));
+        len = build_ra(f, NULL);
+        f[14 + 6] = 17;
+        check("UDP left", !announce(f, len, len + 24));
+        len = build_ra(f, NULL);
+        f[14 + 40 + 16 + 1] = 0;
+        check("RA with a zero-length option left", !announce(f, len, len + 24));
+        len = build_ra(f, NULL);
+        f[14 + 40 + 16 + 8 + 1] = 5;
+        check("RA with an option past its end left", !announce(f, len, len + 24));
+        len = build_ra(f, NULL);
+        f[12] = 0x08, f[13] = 0;
+        check("RA as IPv4 left", !announce(f, len, len + 24));
+        hv_dns_proxy_set_nameserver6(NULL);
+        len = build_ra(f, NULL);
+        check("RA without an IPv6 name server left", !announce(f, len, len + 24));
+        hv_dns_proxy_set_nameserver6(NS6);
+        /* HV_DNS_PROXY=0: no announcement, and IPv6 queries stay with libslirp too. */
+        setenv("HV_DNS_PROXY", "0", 1);
+        hv_dns_proxy_stop();
+        hv_dns_proxy_start();
+        check("RA left with the proxy off", !announce(f, len, len + 24));
+        check("IPv6 query left with the proxy off", !take(f, build6(f, ab, sizeof ab, 28, 0, 0, 0, 0)));
+        unsetenv("HV_DNS_PROXY");
+        hv_dns_proxy_stop();
+        hv_dns_proxy_start();
+        /* Damaged advertisements, in buffers of exactly their size. */
+        int announced = 0;
+        for (int it = 0; it < 20000; it++) {
+            len = build_ra(f, rnd() % 4 ? NULL : NS6);
+            int damage = (int)(rnd() % 4);
+            for (int d = 0; d < damage; d++) {
+                uint32_t at = rnd() % 4 ? 14 + 40 + rnd() % (len - 54) : rnd() % len;
+                f[at] ^= (uint8_t)(1u << (rnd() % 8));
+            }
+            if (rnd() % 8 == 0) f[18] = (uint8_t)rnd(), f[19] = (uint8_t)rnd();
+            if (rnd() % 6 == 0) len = rnd() % (len + 1);
+            else if (rnd() % 10 == 0) len += rnd() % 64;
+            announced += announce(f, len, rnd() % 2 ? len + 24 : rnd() % (len + 48)) != 0;
+        }
+        check("damaged RAs announced too", announced > 1000);
     }
 
     /* Names at their limits: 63-byte labels up to the 512-byte message, all printable or all escaped (\DDD,

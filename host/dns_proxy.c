@@ -430,6 +430,42 @@ int hv_dns_proxy_take(const uint8_t *p, uint32_t len, HvDnsSend send) {
     return 1;
 }
 
+/* libslirp's Router Advertisements name its IPv6 name server (RDNSS, RFC 8106) only when the host's own resolver
+   configuration lists an IPv6 server (get_dns6_addr, res_ninit on Apple), and they do not set the O flag, so the
+   guest asks no DHCPv6 server either. Where that list has no IPv6 server (IPv4-only networks, or a resolver
+   configuration an iOS app cannot read), the guest would never learn of the IPv6 name server this proxy answers
+   for. While the proxy is on, each advertisement without an RDNSS option gets one, as libslirp's own would be. */
+#define RDNSS_LIFETIME 1200 /* seconds: libslirp's (twice its longest interval between advertisements) */
+
+uint32_t hv_dns_proxy_announce(const uint8_t *p, uint32_t len, uint8_t *out, uint32_t cap) {
+    if (!hv_dns_proxy_on() || !atomic_load(&ns6_set)) return 0;
+    if (len < 14 + 40 + 16 || p[12] != 0x86 || p[13] != 0xdd) return 0;
+    const uint8_t *ip = p + 14, *icmp = ip + 40;
+    if ((ip[0] >> 4) != 6 || ip[6] != 58 || icmp[0] != 134 || icmp[1] != 0) return 0; /* ICMPv6 RA */
+    uint32_t plen = rd16(ip + 4);
+    if (plen < 16 || 14 + 40 + plen != len) return 0;
+    for (uint32_t off = 16; off < plen;) { /* the options after the RA's 16 bytes */
+        if (off + 2 > plen) return 0;
+        uint32_t olen = icmp[off + 1] * 8u;
+        if (!olen || off + olen > plen) return 0;
+        if (icmp[off] == 25) return 0; /* has an RDNSS already */
+        off += olen;
+    }
+    if (len + 24 > cap || plen + 24 > 0xffff) return 0;
+    memcpy(out, p, len);
+    uint8_t *oip = out + 14, *oicmp = oip + 40, *o = out + len;
+    o[0] = 25, o[1] = 3, o[2] = o[3] = 0; /* RDNSS, 3 x 8 bytes, reserved */
+    o[4] = (uint8_t)(RDNSS_LIFETIME >> 24), o[5] = (uint8_t)(RDNSS_LIFETIME >> 16);
+    o[6] = (uint8_t)(RDNSS_LIFETIME >> 8), o[7] = (uint8_t)RDNSS_LIFETIME;
+    memcpy(o + 8, nameserver6, 16);
+    plen += 24;
+    wr16(oip + 4, plen);
+    wr16(oicmp + 2, 0);
+    uint32_t s = sum16(0, oip + 8, 32) + (plen >> 16) + (plen & 0xffff) + 58;
+    wr16(oicmp + 2, (uint16_t)~sum16(s, oicmp, plen));
+    return len + 24;
+}
+
 void hv_dns_proxy_stats(uint64_t *n_answered, uint64_t *n_handed_back, uint64_t *n_timed_out) {
     *n_answered = atomic_load(&answered);
     *n_handed_back = atomic_load(&handed_back);
