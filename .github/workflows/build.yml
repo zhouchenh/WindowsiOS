@@ -51,6 +51,12 @@ jobs:
       - name: Core tests (make test-core)
         run: make test-core
 
+      - name: DNS proxy tests, incl. ASan/UBSan fuzz (make test-dns)
+        run: make test-dns
+
+      - name: Guest network over libslirp, IPv4 and IPv6 (make test-net)
+        run: make test-net
+
       - name: Restore iOS dependencies (libffi, glib, libslirp)
         id: ios-deps
         uses: actions/cache@v5
