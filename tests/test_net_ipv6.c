@@ -2,17 +2,20 @@
    same 4.9 line as the iOS build), with a stand-in virtio-net (frames for the guest are collected here) and a
    stand-in system resolver (answers *.test at once). No network is needed.
 
+   libslirp is shown a resolver configuration without IPv6 name servers (resolv_no_ipv6.c), so whatever this
+   Mac's own configuration lists, the advertisements test the case the proxy's announcement exists for: an iPhone
+   on an IPv4-only network, or a configuration the app cannot read.
+
    Each scenario runs in its own process, since net_slirp.c attaches once:
    - default (IPv6 on): a Router Solicitation gets a Router Advertisement for fd2d:7064:6c3f:2::/64 (on-link,
-     autonomous: SLAAC) naming fd2d:7064:6c3f:2::3 as DNS server (RDNSS); neighbour discovery of the host
-     answers; an AAAA query to ::3 is answered through the resolver with a correct UDP checksum; a TCP connection
+     autonomous: SLAAC) naming fd2d:7064:6c3f:2::3 as DNS server (RDNSS, the proxy's announcement, told from
+     libslirp's own by its lifetime); neighbour discovery of the host answers; an AAAA query to ::3 is answered through the resolver with a correct UDP checksum; a TCP connection
      to a closed port is refused at once (RST); TCP and UDP to an address the host cannot route fail at once
      (ICMPv6 unreachable, checked when this Mac has no route for 100::/64, the discard prefix); and IPv4 (ARP,
      DHCP, DNS to 10.0.2.3) still works.
    - HV_IPV6=0: no IPv6 at all (no advertisement, no answers), IPv4 as before.
-   - HV_DNS_PROXY=0: the advertisement names a DNS server only if libslirp has one to forward to (an IPv6 server in
-     this Mac's resolver configuration). With the proxy on it always names one: the proxy's own announcement on a
-     Mac whose resolver lists no IPv6 server, libslirp's otherwise (test_dns_parse covers the announcement itself). */
+   - HV_DNS_PROXY=0: the advertisement names no DNS server (libslirp has no IPv6 one to forward to, and the proxy,
+     being off, announces none). test_dns_parse covers the announcement itself. */
 #include "dns_proxy.h"
 #include "net_slirp.h"
 
@@ -22,7 +25,6 @@
 #include <fcntl.h>
 #include <netinet/in.h>
 #include <pthread.h>
-#include <resolv.h>
 #include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -104,6 +106,10 @@ void DNSServiceRefDeallocate(DNSServiceRef ref) {
     Resolver *r = (Resolver *)ref;
     close(r->pipe[0]), close(r->pipe[1]), free(r);
 }
+
+/* In resolv_no_ipv6.c (a library of its own, as dyld honours interposing only there): how often libslirp has read
+   its name servers through the list without IPv6 ones. */
+int hv_test_getservers_calls(void);
 
 /* ---- the guest ---- */
 
@@ -220,6 +226,10 @@ static int is_dns4_reply(const uint8_t *f, uint32_t len) {
 
 /* ---- IPv6 ---- */
 
+/* The lifetime of the proxy's RDNSS option, in seconds (RDNSS_LIFETIME in dns_proxy.c); libslirp's own differs
+   (2 * NDP_MaxRtrAdvInterval, which it keeps in milliseconds: 1,200,000). */
+#define PROXY_RDNSS_LIFETIME 1200u
+
 static void router_discovery(int v6, int expect_rdnss) {
     uint8_t f[200];
     static const uint8_t all_routers[16] = {0xff, 2, [15] = 2}, mac[6] = {0x33, 0x33, 0, 0, 0, 2};
@@ -245,6 +255,7 @@ static void router_discovery(int v6, int expect_rdnss) {
     check("RA router lifetime (a default route)", rd16(ra_icmp + 6) > 0);
     check("RA: no DHCPv6 needed (M and O clear)", (ra_icmp[5] & 0xc0) == 0);
     int prefixes = 0, rdnss = 0, rdnss_ok = 0;
+    uint32_t rdnss_lifetime = 0;
     for (uint32_t off = 16; off + 2 <= plen;) {
         uint32_t olen = ra_icmp[off + 1] * 8u;
         if (!olen || off + olen > plen) {
@@ -260,7 +271,8 @@ static void router_discovery(int v6, int expect_rdnss) {
             check("RA prefix lifetimes", rd16(o + 4) | rd16(o + 6) && (rd16(o + 8) | rd16(o + 10)));
         } else if (o[0] == 25 && olen >= 24) {
             rdnss++;
-            rdnss_ok = !memcmp(o + 8, DNS6, 16) && (rd16(o + 4) | rd16(o + 6));
+            rdnss_ok = !memcmp(o + 8, DNS6, 16);
+            rdnss_lifetime = (uint32_t)rd16(o + 4) << 16 | rd16(o + 6);
         }
         off += olen;
     }
@@ -268,6 +280,7 @@ static void router_discovery(int v6, int expect_rdnss) {
     if (expect_rdnss) {
         check("RA has one RDNSS", rdnss == 1);
         check("RDNSS names fd2d:7064:6c3f:2::3", rdnss_ok);
+        check("RDNSS is the proxy's announcement (its lifetime)", rdnss_lifetime == PROXY_RDNSS_LIFETIME);
     } else {
         check("RA names no DNS server it cannot answer for", rdnss == 0);
     }
@@ -445,19 +458,6 @@ static void ipv4(void) {
     if (r) check("IPv4 DNS answer carries the resolver's A", !memcmp(r + len - 4, a, 4) && rd16(r + 42 + 6) == 1);
 }
 
-/* Whether this Mac's resolver configuration lists an IPv6 name server, as libslirp reads it (get_dns6_addr):
-   then libslirp's own advertisements carry an RDNSS option; otherwise only the DNS proxy's announcement does. */
-static int host_lists_ipv6_dns(void) {
-    struct __res_state st;
-    memset(&st, 0, sizeof st);
-    if (res_ninit(&st) != 0) return 0;
-    union res_sockaddr_union servers[16];
-    int n = res_getservers(&st, servers, 16), found = 0;
-    for (int i = 0; i < n; i++) found |= servers[i].sin6.sin6_family == AF_INET6;
-    res_ndestroy(&st);
-    return found;
-}
-
 enum { IPV6_ON, IPV6_OFF, PROXY_OFF };
 static const char *const scenario_names[] = {"IPv6 on", "HV_IPV6=0", "HV_DNS_PROXY=0"};
 
@@ -474,23 +474,24 @@ static int scenario(int which) {
     if (which == PROXY_OFF) setenv("HV_DNS_PROXY", "0", 1);
     else unsetenv("HV_DNS_PROXY");
     unsetenv("HV_NET_FWD");
-    int host_v6_dns = host_lists_ipv6_dns();
     if (hv_net_attach(NULL, &net) != 0) {
         fprintf(stderr, "FAIL: hv_net_attach\n");
         return 1;
     }
     if (which == PROXY_OFF) {
-        /* Without the proxy, the advertisement names a DNS server only when libslirp can forward to one (and no
-           query is sent here: libslirp would send it to this Mac's real name server). */
-        router_discovery(v6, host_v6_dns);
+        /* Without the proxy, nothing names a DNS server (and no query is sent here: libslirp would send it to this
+           Mac's real name server). */
+        router_discovery(v6, 0);
     } else {
-        if (v6 && !host_v6_dns) printf("net: this Mac lists no IPv6 name server: the RDNSS comes from the proxy\n");
         router_discovery(v6, 1);
         neighbour_discovery(v6);
         dns6(v6);
         fail_fast(v6);
         ipv4();
     }
+    /* Else the advertisements would show this Mac's own resolver configuration, not the case tested here. */
+    if (v6) check("libslirp read its name servers through the interposed res_getservers",
+                  hv_test_getservers_calls() > 0);
     if (!v6) {
         uint32_t len;
         usleep(200 * 1000);
