@@ -86,6 +86,9 @@ uint64_t hv_fb_metal_frames(HvFbDisplay *fb);
 /* Hold the last good frame: frames of another size are not shown until one of w x h arrives, or ms have
    passed (then the newest frame is shown letterboxed). w == 0 (or ms == 0) ends a hold. */
 void hv_fb_metal_hold_for_size(uint32_t w, uint32_t h, uint32_t ms);
+/* Called (on the presenter's thread) when a hold ends by itself: a frame of its size came, or its deadline
+   passed, frame or no frame. Not for hv_fb_metal_hold_for_size's own clearing. */
+void hv_fb_metal_set_hold_end_handler(void (*fn)(void *opaque), void *opaque);
 /* Touch, key or pointer input: the display link goes back to its full rate at once (idle throttling). */
 void hv_fb_metal_note_input(void);
 /* 1: the former placement (aspect fit, linear filtering) for HV_DISPLAY_LEGACY; 0: whole-pixel placement,

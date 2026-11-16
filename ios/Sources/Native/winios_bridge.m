@@ -74,10 +74,18 @@ NSNotificationName const WinIOSDisplayWillReshapeNotification = @"WinIOSDisplayW
     uint8_t _keysDown[32];
 }
 - (void)handleVMExitWithReason:(NSString *)reason;
+- (void)postDisplayStateChanged;
 - (void)updateUnpackProgress:(double)frac;
 - (void)startDiagTimer;
 - (void)stopDiagTimer;
 @end
+
+/* The presenter's hold ended by itself (fb_metal.m): the canvas recomputes its gravity (MetalDisplayView
+   reads presenterStats().holding) on the display state notification. */
+static void hold_end_trampoline(void *opaque) {
+    (void)opaque;
+    [s_shared_bridge postDisplayStateChanged];
+}
 
 static void vm_exit_trampoline(int reason) {
     NSString *r = [NSString stringWithUTF8String:hv_winvm_reason_name(reason)];
@@ -1324,6 +1332,7 @@ static NSString *winios_unpack_resource(NSString *name, NSString *dst) {
 
     /* display sizing: env.txt is loaded now (HV_DISPLAY_LEGACY), so plan again from the view's size */
     hv_fb_metal_set_legacy_fit(self.displayLegacy);
+    hv_fb_metal_set_hold_end_handler(hold_end_trampoline, NULL);
     [self replanDisplay:@"start"];
     if (_hasPending) [self commitPendingPlan:@"start"];
     uint32_t gpuW = _committedPlan.modeWidth, gpuH = _committedPlan.modeHeight;

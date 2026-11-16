@@ -43,6 +43,29 @@ static _Atomic int g_legacy_fit;
 static os_unfair_lock g_stats_lock = OS_UNFAIR_LOCK_INIT;
 static HvFbMetalStats g_stats;
 
+static void (*_Atomic g_hold_end_fn)(void *);
+static void *_Atomic g_hold_end_opaque;
+
+void hv_fb_metal_set_hold_end_handler(void (*fn)(void *opaque), void *opaque) {
+    atomic_store(&g_hold_end_opaque, opaque);
+    atomic_store(&g_hold_end_fn, fn);
+}
+
+/* The hold whose deadline is until ended (a frame of its size came, or the deadline passed): cleared, once,
+   and the handler told, so what follows the hold (the layer's gravity, the idle frame rate) is recomputed. */
+static void fb_hold_end(uint64_t until) {
+    if (!atomic_compare_exchange_strong(&g_hold_until, &until, 0)) return; /* a newer hold, or already ended */
+    void (*fn)(void *) = atomic_load(&g_hold_end_fn);
+    if (fn) fn(atomic_load(&g_hold_end_opaque));
+}
+
+/* A hold past its deadline ends even when no frame comes to end it (a static desktop, a guest that did not
+   follow the new mode): fb_hold_blocks only runs for a changed frame. */
+static void fb_hold_expire(void) {
+    uint64_t until = atomic_load(&g_hold_until);
+    if (until && mach_absolute_time() >= until) fb_hold_end(until);
+}
+
 void hv_fb_metal_hold_for_size(uint32_t w, uint32_t h, uint32_t ms) {
     atomic_store(&g_hold_until, 0);
     if (!w || !h || !ms) return;
@@ -57,6 +80,7 @@ void hv_fb_metal_set_legacy_fit(int legacy) { atomic_store(&g_legacy_fit, legacy
 
 void hv_fb_metal_get_stats(HvFbMetalStats *out) {
     if (!out) return;
+    fb_hold_expire();
     os_unfair_lock_lock(&g_stats_lock);
     *out = g_stats;
     os_unfair_lock_unlock(&g_stats_lock);
@@ -69,7 +93,7 @@ static int fb_hold_blocks(uint32_t w, uint32_t h) {
     uint64_t until = atomic_load(&g_hold_until);
     if (!until) return 0;
     if ((w == atomic_load(&g_hold_w) && h == atomic_load(&g_hold_h)) || mach_absolute_time() >= until) {
-        atomic_store(&g_hold_until, 0);
+        fb_hold_end(until);
         return 0;
     }
     os_unfair_lock_lock(&g_stats_lock);
@@ -389,6 +413,7 @@ static int fb_idle_allowed(void) {
 - (void)onLink:(CADisplayLink *)l {
     /* a changed setting: the link follows it here, on its own thread */
     int fps = atomic_load(&g_target_fps);
+    fb_hold_expire();
     uint64_t now = mach_absolute_time();
     uint64_t quiet = fb_ns_to_mach(1500ull * 1000000ull);
     int idle = fb_idle_allowed() && atomic_load(&g_hold_until) == 0 && now - lastPresentMach > quiet &&
