@@ -823,7 +823,8 @@ struct LaptopDeckView: View {
             break // drawn as a menu (keyboardRowView)
         case .keyboardToggle:
             withAnimation(.snappy(duration: 0.2)) {
-                vm.deckLayout = vm.deckLayout == .trackpad ? .split : .trackpad
+                // Trackpad only goes back to both; from both or keyboard only the keyboard goes away.
+                vm.deckLayout = vm.deckLayout == .split ? .trackpad : .split
             }
         }
     }

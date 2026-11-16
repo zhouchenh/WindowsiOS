@@ -19,11 +19,12 @@ Built-in JIT ships two third-party components inside this app:
    StikJIT 1.9.0 (commit 32287268fa5824f9edce4cb359f5833ce0cf7b00),
    https://github.com/StikDebug/StikJIT
    Licence: Mozilla Public License 2.0, see LICENSE-StikJIT-MPL-2.0.txt.
-   Modified by us with stikjit-high-address.patch (in this folder and in the Apple VM
-   repository as ios/patches/stikjit-high-address.patch; taken from Henge,
-   https://github.com/Leviidev/Henge, ci/stikjit-high-address.patch). The source code of
+   Modified by us with two patches, applied in this order (each in this folder and in the
+   Apple VM repository under ios/patches/): stikjit-high-address.patch (taken from Henge,
+   https://github.com/Leviidev/Henge, ci/stikjit-high-address.patch) and
+   stikjit-ipv6-address.patch (ours: the device address may be IPv6). The source code of
    StikJIT is available at the address above; scripts/build_jit_deps.sh in the Apple VM
-   repository rebuilds the framework from it with the patch. The JIT scripts StikJIT bundles
+   repository rebuilds the framework from it with the patches. The JIT scripts StikJIT bundles
    (universal.js, legacy.js: StikDebug's, under their own licences, not StikJIT's MPL-2.0) are
    removed from the framework in this app; they are never used.
    StikJIT contains idevice by Jackson Coxson (https://github.com/jkcoxson/idevice), MIT

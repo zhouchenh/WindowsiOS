@@ -2,7 +2,9 @@
 //
 // Built-in JIT: a debugger shipped inside the app (PlugIns/WinJITHelper.appex, which runs StikJIT)
 // attaches to the app over LocalDevVPN and runs henge-jit.js, so JIT turns on with no StikDebug app
-// and no computer. Developer Mode, one pairing and LocalDevVPN are still needed (docs/builtin-jit.md).
+// and no computer. Developer Mode, one pairing and LocalDevVPN are still needed (docs/builtin-jit.md),
+// or instead of LocalDevVPN the user's own VPN when its server routes an address back to this device
+// (JITConnectionMode).
 //
 // Ported from Henge (Leviidev/Henge, GPL-2.0-or-later) at 7b55730: ios/Henge/JIT/JITBuiltIn.swift (the
 // helper launcher), JITSetup.swift (JITMethod, the pairing-file store, RemotePairingPortDiscovery) and
@@ -37,6 +39,82 @@ enum JITMethod: String, CaseIterable, Identifiable {
 
     static var stored: JITMethod {
         UserDefaults.standard.string(forKey: defaultsKey).flatMap(JITMethod.init(rawValue:)) ?? .automatic
+    }
+}
+
+/// How the built-in helper reaches this device's RemotePairing service, which it only answers over a
+/// network interface, never loopback. iOS runs one VPN at a time, so LocalDevVPN and the user's own VPN
+/// exclude each other (docs/builtin-jit.md, "Using your own VPN instead of LocalDevVPN").
+enum JITConnectionMode: String, CaseIterable, Identifiable {
+    /// LocalDevVPN's tunnel, which routes 10.7.0.1 back to this device.
+    case localDevVPN
+    /// The user's own VPN, whose server routes an address back to this device (a "reflector"):
+    /// JITSetup.vpnDeviceAddress.
+    case ownVPN
+
+    var id: String { rawValue }
+
+    var title: String {
+        switch self {
+        case .localDevVPN: return "LocalDevVPN"
+        case .ownVPN: return L("我的 VPN", "My VPN")
+        }
+    }
+
+    static let defaultsKey = "winios.jit.connection"
+    /// The device address for .ownVPN, as typed.
+    static let addressKey = "winios.jit.vpnDeviceAddress"
+
+    static var stored: JITConnectionMode {
+        UserDefaults.standard.string(forKey: defaultsKey).flatMap(JITConnectionMode.init(rawValue:)) ?? .localDevVPN
+    }
+}
+
+/// The user's own VPN, as far as this device can see it: a tunnel interface that is up with an address
+/// that is not link-local, and is not LocalDevVPN's.
+enum OwnVPN {
+    /// utun* (WireGuard, most VPN apps) with an IPv4 address or an IPv6 one outside fe80::/10, or
+    /// ipsec* (IKEv2) with an IPv4 address or a unique local IPv6 one: with Wi-Fi Calling or VoLTE
+    /// iOS brings up ipsec interfaces with a carrier's global IPv6 address and no VPN at all. A utun
+    /// with an address in 10.7.0.0/16 is LocalDevVPN (LocalDevVPN.isConnected), which routes only its
+    /// own network, so it does not count, whatever other addresses it has.
+    static var isConnected: Bool {
+        var list: UnsafeMutablePointer<ifaddrs>?
+        guard getifaddrs(&list) == 0, let first = list else { return false }
+        defer { freeifaddrs(list) }
+        let interfaces = Array(sequence(first: first, next: { $0.pointee.ifa_next }))
+        var localDevVPN = Set<String>()
+        for p in interfaces {
+            let ifa = p.pointee
+            guard let sa = ifa.ifa_addr, Int32(sa.pointee.sa_family) == AF_INET else { continue }
+            let ip = sa.withMemoryRebound(to: sockaddr_in.self, capacity: 1) {
+                UInt32(bigEndian: $0.pointee.sin_addr.s_addr)
+            }
+            let name = String(cString: ifa.ifa_name)
+            if ip >> 16 == 0x0a07, name.hasPrefix("utun") { localDevVPN.insert(name) }
+        }
+        for p in interfaces {
+            let ifa = p.pointee
+            guard (ifa.ifa_flags & UInt32(IFF_UP)) != 0, let sa = ifa.ifa_addr else { continue }
+            let name = String(cString: ifa.ifa_name)
+            let utun = name.hasPrefix("utun")
+            guard utun || name.hasPrefix("ipsec"), !localDevVPN.contains(name) else { continue }
+            switch Int32(sa.pointee.sa_family) {
+            case AF_INET:
+                let ip = sa.withMemoryRebound(to: sockaddr_in.self, capacity: 1) {
+                    UInt32(bigEndian: $0.pointee.sin_addr.s_addr)
+                }
+                if ip != 0 && ip >> 16 != 0xa9fe { return true }   // not 169.254/16
+            case AF_INET6:
+                let bytes = sa.withMemoryRebound(to: sockaddr_in6.self, capacity: 1) { $0.pointee.sin6_addr.__u6_addr.__u6_addr8 }
+                let linkLocal = bytes.0 == 0xfe && bytes.1 & 0xc0 == 0x80
+                let uniqueLocal = bytes.0 & 0xfe == 0xfc
+                if utun ? !linkLocal : uniqueLocal { return true }
+            default:
+                break
+            }
+        }
+        return false
     }
 }
 
@@ -501,8 +579,15 @@ enum JITConnectionProblem: Equatable {
         }
     }
 
-    /// What to tell the user for this problem on this network.
-    func advice(_ situation: JITNetworkSituation) -> String {
+    /// What to tell the user for this problem on this network. The cellular advice is LocalDevVPN's: with
+    /// the user's own VPN the device address is routed into its tunnel like any other.
+    func advice(_ situation: JITNetworkSituation, connection: JITConnectionMode = .localDevVPN) -> String {
+        if connection == .ownVPN {
+            return self == .pairing
+                ? L("本机断开了连接，通常是因为它不再接受 Apple VM 的配对。请重新配对，并确认你的 VPN 已连接。",
+                    "This device closed the connection, which usually means it no longer accepts Apple VM's pairing. Pair again, and check that your VPN is connected.")
+                : JITOwnVPNAdvice.text(for: .cannotConnect)
+        }
         if self == .pairing {
             return L("本机断开了连接，通常是因为它不再接受 Apple VM 的配对。请重新配对，并确认 LocalDevVPN 已连接。",
                      "This device closed the connection, which usually means it no longer accepts Apple VM's pairing. Pair again, and check that LocalDevVPN is connected.")
@@ -518,18 +603,43 @@ enum JITConnectionProblem: Equatable {
 
 /// On cellular, iOS tends to send the first connection to 10.7.0.1 out over the mobile network
 /// instead of through LocalDevVPN, and later ones go through. So an unreachable error on cellular is
-/// retried: at most 3 attempts in all, 4 seconds apart.
+/// retried: at most 3 attempts in all, 4 seconds apart. Not with the user's own VPN, which has no such quirk.
 enum JITRetryPolicy {
     static let maxAttempts = 3
 
     /// Seconds to wait before the next attempt, or nil to give up.
-    static func retryDelay(situation: JITNetworkSituation, problem: JITConnectionProblem, attempt: Int) -> TimeInterval? {
-        guard situation == .cellularOnly, problem == .unreachable, attempt < maxAttempts else { return nil }
+    static func retryDelay(situation: JITNetworkSituation, problem: JITConnectionProblem, attempt: Int,
+                           connection: JITConnectionMode = .localDevVPN) -> TimeInterval? {
+        guard connection == .localDevVPN, situation == .cellularOnly, problem == .unreachable,
+              attempt < maxAttempts else { return nil }
         return 4
     }
 
     static func statusText(nextAttempt: Int) -> String {
         L("正在通过 LocalDevVPN 重试（第 \(nextAttempt)/\(maxAttempts) 次）…",
           "Retrying over LocalDevVPN (\(nextAttempt) of \(maxAttempts))…")
+    }
+}
+
+/// What to tell the user when the helper checked the device address of their own VPN
+/// (WinJITRequest.ConnectionCheck): before Prepare and Enable, and for Test connection.
+enum JITOwnVPNAdvice {
+    static func text(for check: WinJITRequest.ConnectionCheck) -> String {
+        switch check {
+        case .cannotConnect:
+            return L("通过你的 VPN 连不上本机。请确认 VPN 已连接，地址填的是 VPN 服务器转回本机的那个（反射地址），并且服务器上的反射规则在生效，然后重试。",
+                     "Apple VM couldn't connect to this device through your VPN. Check that the VPN is connected, that the address is the one its server routes back to this device (the reflector address), and that the reflector is running on the server, then try again.")
+        case .noAnswer:
+            return L("通过你的 VPN 连上了，但本机的 RemotePairing 服务没有回应（连接被关闭、没有回音，或回应的是别的服务）。iOS 可能不在 VPN 的接口上回应它，或者这个端口是别的服务。请改用 LocalDevVPN。",
+                     "Connected through your VPN, but this device's RemotePairing service did not answer (the connection was closed, nothing came back, or another service replied). iOS may not answer it on the VPN's interface, or that port is another service. Use LocalDevVPN instead.")
+        case .remotePairingFailed:
+            return L("通过你的 VPN 连上了，RemotePairing 也回应了，但会话没有建立（详情见下）。如果是隧道端口连不上，请让反射规则对这个地址的所有端口生效；如果配对被拒绝，请重新配对。",
+                     "Connected through your VPN and RemotePairing answered, but the session failed (details below). If its tunnel port could not be reached, have the reflector forward every port of that address; if the pairing was refused, pair again.")
+        case .connected:
+            return L("通过你的 VPN，本机的 RemotePairing 有回应。配对后再测试一次，可以确认会话能建立。",
+                     "This device's RemotePairing answers through your VPN. Test again once paired to check that a session works.")
+        case .ok:
+            return L("通过你的 VPN 连接正常：RemotePairing 有回应。", "Works through your VPN: RemotePairing answered.")
+        }
     }
 }

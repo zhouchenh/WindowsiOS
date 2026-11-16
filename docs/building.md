@@ -54,7 +54,7 @@ make -j8 ios-lib                    # build/ios/libwinvm.a (the engine for the a
 `build_ios_deps.sh` downloads libffi 3.5.0, glib 2.83.0 and libslirp 4.9.1, cross-compiles them for
 arm64 iOS 17.0 and takes a few minutes. It only needs to run again when the script changes; its
 logs are in `work/ios_deps_build/*.log`. At the end it runs `scripts/build_jit_deps.sh`, which builds
-Built-in JIT's StikJIT.xcframework (StikJIT 1.9.0 with `ios/patches/stikjit-high-address.patch`) and
+Built-in JIT's StikJIT.xcframework (StikJIT 1.9.0 with `ios/patches/stikjit-high-address.patch` and `stikjit-ipv6-address.patch`) and
 `libhusk_rppairing.a` (Rust) from pinned commits; run that one alone when only it changed
 (logs in `work/jit_deps/`). See [builtin-jit.md](builtin-jit.md).
 
