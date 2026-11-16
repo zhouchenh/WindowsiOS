@@ -38,11 +38,10 @@ final class ChromeModel: ObservableObject {
     /// The surface on screen now (the session view keeps it current).
     @Published private(set) var surface: ChromeSurface = .studio
     /// Immersive: Windows takes the whole screen (one resolution change); off: Windows keeps the
-    /// size it had with the controls, shown as large as fits (no resolution change).
-    @Published var immersiveTakesWholeScreen: Bool =
-        (UserDefaults.standard.object(forKey: "winios.chrome.immersiveRemodes") as? Bool) ?? true {
-        didSet { UserDefaults.standard.set(immersiveTakesWholeScreen, forKey: "winios.chrome.immersiveRemodes") }
-    }
+    /// size it had with the controls, shown as large as fits (no resolution change). One setting with
+    /// the display's "In immersive full screen" (DisplaySettings.immersiveSizing), which the bridge's
+    /// reshape filter also follows.
+    var immersiveTakesWholeScreen: Bool { DisplaySettings.shared.immersiveSizing == .fullPanel }
     /// The floating keyboard button sits in the bottom-left corner instead of the bottom-right.
     @Published var keyboardButtonOnLeft: Bool = UserDefaults.standard.bool(forKey: "winios.chrome.fabLeft") {
         didSet { UserDefaults.standard.set(keyboardButtonOnLeft, forKey: "winios.chrome.fabLeft") }
@@ -78,6 +77,11 @@ final class ChromeModel: ObservableObject {
             map[s] = UserDefaults.standard.bool(forKey: "winios.chrome.immersive." + s.rawValue)
         }
         immersiveBySurface = map
+        // The former chrome switch (winios.chrome.immersiveRemodes) off becomes the display's "keep size".
+        if let old = UserDefaults.standard.object(forKey: "winios.chrome.immersiveRemodes") as? Bool {
+            if !old { DisplaySettings.shared.immersiveSizing = .keepSize }
+            UserDefaults.standard.removeObject(forKey: "winios.chrome.immersiveRemodes")
+        }
         watchKeyboard()
         gestures.onFourFingerTap = { [weak self] in self?.gestureToggle("four-finger tap") }
         gestures.onEdgeSwipe = { [weak self] in

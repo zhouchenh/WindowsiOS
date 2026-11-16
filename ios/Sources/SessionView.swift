@@ -611,6 +611,9 @@ private enum SettingsPage: String, CaseIterable, Identifiable {
 private struct SettingsSheet: View {
     @ObservedObject var vm: VMViewModel
     @ObservedObject private var chrome = ChromeModel.shared
+    @ObservedObject private var display = DisplaySettings.shared
+    @AppStorage("winios.keyboard.autoShow") private var keyboardAutoShow = true
+    @AppStorage("winios.keyboard.follow") private var keyboardFollow = true
     @Environment(\.dismiss) private var dismiss
     @Environment(\.horizontalSizeClass) private var horizontalSizeClass
     @State private var page: SettingsPage? = nil
@@ -678,23 +681,22 @@ private struct SettingsSheet: View {
                         set: { vm.setGPU3D($0) }
                     ))
                 }
-                Picker(L("刷新率", "Refresh rate"), selection: $vm.frameRate) {
-                    ForEach(VMViewModel.frameRateChoices, id: \.self) { hz in
-                        Text("\(hz) Hz").tag(hz)
-                    }
+                // Frame rate and Sharpness (the former HiDPI switch) are per screen in the Display section
+                // above; the switch stays only for the former sizing, which has no Sharpness.
+                if display.legacy {
+                    Toggle(L("高分辨率（HiDPI）", "High resolution (HiDPI)"), isOn: Binding(
+                        get: { vm.hiDPIDisplay },
+                        set: { _ in vm.toggleHiDPIDisplay() }
+                    ))
                 }
-                Toggle(L("高分辨率（HiDPI）", "High resolution (HiDPI)"), isOn: Binding(
-                    get: { vm.hiDPIDisplay },
-                    set: { _ in vm.toggleHiDPIDisplay() }
-                ))
             } header: {
                 Text(L("图形", "Graphics"))
             } footer: {
                 Text(vm.isLinux
-                     ? L("Arch Linux 的 GPU 加速始终开启：OpenGL 走 virgl，Vulkan 走 Venus（驱动随系统装好）。高分辨率在下次启动时生效。刷新率是全局设置，虚拟机下次启动时生效。",
-                         "GPU acceleration is always on for Arch Linux: OpenGL through virgl, Vulkan through Venus (the drivers come with the system). High resolution applies at the next start. The refresh rate is global and applies when the machine next starts.")
-                     : L("3D 需要先在 Windows 里装好 3D 驱动（运行 WINKIT 盘里的 START.bat）。如果开启后黑屏，在这里关掉再重启 App。这两项在下次启动 Windows 时生效。刷新率只影响设备上的画面刷新：Windows 的显卡驱动只支持 60 Hz，Windows 里始终是 60 Hz。",
-                         "3D needs the 3D driver installed in Windows first (run START.bat on the WINKIT disk). If the screen stays black after turning it on, turn it off here and restart the app. Both apply the next time Windows starts. The refresh rate only changes how often the device draws the screen: the Windows display driver only takes 60 Hz, so Windows itself stays at 60 Hz."))
+                     ? L("Arch Linux 的 GPU 加速始终开启：OpenGL 走 virgl，Vulkan 走 Venus（驱动随系统装好）。高分辨率在下次启动时生效。",
+                         "GPU acceleration is always on for Arch Linux: OpenGL through virgl, Vulkan through Venus (the drivers come with the system). High resolution applies at the next start.")
+                     : L("3D 需要先在 Windows 里装好 3D 驱动（运行 WINKIT 盘里的 START.bat）。如果开启后黑屏，在这里关掉再重启 App。在下次启动 Windows 时生效。",
+                         "3D needs the 3D driver installed in Windows first (run START.bat on the WINKIT disk). If the screen stays black after turning it on, turn it off here and restart the app. Applies the next time Windows starts."))
             }
 
             Section {
@@ -704,12 +706,11 @@ private struct SettingsSheet: View {
                         set: { on in chrome.setImmersive(on, for: s, reason: "Settings") }
                     ))
                 }
-                Toggle(L("沉浸时 Windows 占满整个屏幕", "Windows takes the whole screen"), isOn: $chrome.immersiveTakesWholeScreen)
             } header: {
                 Text(L("沉浸全屏", "Immersive"))
             } footer: {
-                Text(L("沉浸全屏时没有工具栏、状态栏和侧边栏，Windows 铺满屏幕。四指轻点（或三指轻点），或从左右边缘向内轻扫，控制按钮就回来。每种姿态分别记住。占满整个屏幕：最清晰，切换时 Windows 改一次分辨率；关掉：Windows 保持原来的分辨率，放大显示，不闪。",
-                       "Immersive hides the toolbar, the status bar and the side bar: Windows fills the screen. Tap with four fingers (or three), or swipe in from the left or right edge, to bring the controls back. Remembered for each posture. Whole screen: sharpest, Windows changes resolution once; off: Windows keeps its resolution and is drawn larger, with no flash."))
+                Text(L("沉浸全屏时没有工具栏、状态栏和侧边栏，Windows 铺满屏幕。四指轻点（或三指轻点），或从左右边缘向内轻扫，控制按钮就回来。每种姿态分别记住。上面“沉浸全屏时”选改成整块屏幕：最清晰，切换时 Windows 改一次分辨率；选保持分辨率：放大显示，不闪。",
+                       "Immersive hides the toolbar, the status bar and the side bar: Windows fills the screen. Tap with four fingers (or three), or swipe in from the left or right edge, to bring the controls back. Remembered for each posture. \"In immersive full screen\" above: the whole panel is sharpest, Windows changes resolution once; keeping the resolution draws Windows larger, with no flash."))
             }
         }
     }
@@ -744,13 +745,15 @@ private struct SettingsSheet: View {
                     Text(L("右下角", "Bottom right")).tag(false)
                     Text(L("左下角", "Bottom left")).tag(true)
                 }
+                Toggle(L("在文本框里自动弹出键盘", "Keyboard comes up in text boxes"), isOn: $keyboardAutoShow)
+                Toggle(L("画面跟随光标", "Follow the cursor"), isOn: $keyboardFollow)
                 LabeledContent(L("外接键盘", "Hardware keyboard"),
                                value: vm.hardwareKeyboard ? L("已连接", "Connected") : L("未连接", "Not connected"))
             } header: {
                 Text(L("键盘", "Keyboard"))
             } footer: {
-                Text(L("也可以直接把键盘按钮拖到另一侧。连着外接键盘时不显示。",
-                       "You can also drag the keyboard button to the other side. Hidden while a hardware keyboard is attached."))
+                Text(L("也可以直接把键盘按钮拖到另一侧。连着外接键盘时不显示。自动弹出和跟随光标需要 WinKit 的焦点助手（运行 WINKIT 盘里的 START.bat）：Windows 里的文本框得到焦点时弹出 iPhone 键盘；键盘挡住光标时画面上移，不再缩小。",
+                       "You can also drag the keyboard button to the other side. Hidden while a hardware keyboard is attached. Coming up by itself and following the cursor need WinKit's focus agent (run START.bat from the WINKIT drive): the iPhone keyboard comes up when a text box in Windows gets the focus, and the picture moves up instead of shrinking when the keyboard would cover the cursor."))
             }
 
             if !vm.isLinux { ClipboardSettingsSection() } // clipboard hook
@@ -833,7 +836,12 @@ private struct SettingsSheet: View {
                 if vm.supportsLaptopPosture {
                     LabeledContent(L("铰链", "Hinge"), value: hingeText)
                 }
+                TimelineView(.periodic(from: .now, by: 2)) { _ in
+                    LabeledContent(L("键盘", "Keyboard"), value: KeyboardDiagnostics.shared.statusLine)
+                }
             }
+
+            DisplayStatusSection() // what the display does and costs: DisplaySettings.swift
 
             // What iOS reported for the chrome, to check the layout on a device (also in winvm.log, "chrome:").
             Section {
