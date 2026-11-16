@@ -1,5 +1,7 @@
 # Shows Windows only on the VirtIO GPU 3D display and sets it to the size the iPad asks for.
 #   irm http://10.0.2.4/setres.ps1 | iex            (size from http://10.0.2.4/res.txt, e.g. "1386x956")
+#   res.txt may carry Windows' scale too ("2576x1812@250", the app's display sizing): only the size is
+#   used here; WinKit's setres.ps1 and its helper (winkit/WinKitDisplay.cs) also set the scale.
 $ErrorActionPreference = 'Continue'
 $src = @'
 using System;
@@ -63,7 +65,9 @@ public static class Res {
 $out = @("setres $(Get-Date -Format s)")
 $want = '1280x960'
 try { $want = (Invoke-RestMethod 'http://10.0.2.4/res.txt').Trim() } catch {}
-$w, $h = $want -split 'x'
+$w = 1280; $h = 960
+if ($want -match '^(\d+)x(\d+)(@\d+)?$') { $w = [int]$Matches[1]; $h = [int]$Matches[2] }
+else { $out += "res.txt: '$want' is not WxH or WxH@scale; using ${w}x${h}" }
 try {
     & "$env:SystemRoot\System32\DisplaySwitch.exe" /internal
     Start-Sleep 4
