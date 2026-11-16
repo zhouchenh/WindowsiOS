@@ -173,7 +173,9 @@ file that cannot be read is renamed to `port_forwards.json.bad` and the list sta
 for this (on the WINKIT drive and in `C:\WinKit`; `winkit/README.md` explains them in Chinese):
 `REMOTE-DESKTOP.bat` (`enable_rdp.ps1`: the Remote Desktop host, which only Pro, Enterprise and
 Education have, with Network Level Authentication, and TCP and UDP 3389 open; `-Uninstall` puts
-the previous setting back) and `SSH-SETUP.bat` (`ssh_setup.ps1`: an OpenSSH server with key login
+the previous setting back; Windows refuses Remote Desktop sign-ins to an account with a blank
+password, so the script checks for one and asks the person to set a password, never setting one
+itself) and `SSH-SETUP.bat` (`ssh_setup.ps1`: an OpenSSH server with key login
 only and TCP 22 open; `uninstall_ssh.ps1` removes it). The firewall rules allow every profile and
 every remote address, since clients through a forward keep their own address, which Windows would
 not count as its local subnet.

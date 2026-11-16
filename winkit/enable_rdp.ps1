@@ -3,6 +3,7 @@
 # every network profile and from any address: the app's network is private to the phone, and connections from
 # the phone's Wi-Fi or VPN arrive with the client's own address. Network Level Authentication stays on.
 # Only Windows Pro, Enterprise and Education can accept Remote Desktop; on Home it explains the alternatives.
+# An account with a blank password cannot sign in over Remote Desktop: it says so (it never sets a password).
 # Safe to run again. Needs administrator rights: run it through REMOTE-DESKTOP.bat.
 #   powershell -ExecutionPolicy Bypass -File enable_rdp.ps1              turn it on
 #   powershell -ExecutionPolicy Bypass -File enable_rdp.ps1 -Uninstall   undo: back to how it was, rules removed
@@ -94,6 +95,27 @@ try {
     if ($ms.UserName) { $who = "MicrosoftAccount\$($ms.UserName)" }
 } catch {}
 
+# Windows refuses Remote Desktop sign-ins (and every other network sign-in) for an account with a blank
+# password. A Microsoft account always has one; a local account may not (images made without a password).
+# The test: a network logon with an empty password fails with 1327 (account restriction: blank password) or
+# succeeds when the password is blank, and fails with 1326 (wrong password) when there is one. Nothing is
+# changed: the person sets a password themselves.
+$blank = $false
+if ($who -notlike 'MicrosoftAccount\*') {
+    try {
+        Add-Type -Namespace WinKit -Name BlankCheck -MemberDefinition @'
+[DllImport("advapi32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+public static extern bool LogonUser(string user, string domain, string password, int type, int provider, out IntPtr token);
+[DllImport("kernel32.dll")] public static extern bool CloseHandle(IntPtr h);
+'@ -ErrorAction Stop
+        $tok = [IntPtr]::Zero
+        $ok = [WinKit.BlankCheck]::LogonUser($env:USERNAME, '.', '', 3, 0, [ref]$tok)  # LOGON32_LOGON_NETWORK
+        $err = [Runtime.InteropServices.Marshal]::GetLastWin32Error()
+        if ($ok) { [void][WinKit.BlankCheck]::CloseHandle($tok); $blank = $true }
+        elseif ($err -eq 1327) { $blank = $true }
+    } catch {}
+}
+
 Write-Host ''
 Write-Host "Remote Desktop is on (port $port, TCP and UDP), with the firewall open for it." -ForegroundColor Green
 Write-Host ''
@@ -102,6 +124,12 @@ Write-Host '  "This iPhone only": a Remote Desktop app on the same iPhone connec
 Write-Host '  "Local network" or "VPN": other devices connect to the address the app shows.'
 Write-Host "Sign in as: $who"
 Write-Host 'The account needs a password (a PIN is not enough). For a Microsoft account, use its password.'
+if ($blank) {
+    Write-Host ''
+    Write-Host "This account ($env:USERNAME) has no password, and Windows refuses Remote Desktop sign-ins without one." -ForegroundColor Yellow
+    Write-Host 'Set a password first: press Ctrl+Alt+Del (the app: Shortcuts > Ctrl + Alt + Del) > Change a password,' -ForegroundColor Yellow
+    Write-Host 'or Settings > Accounts > Sign-in options > Password. WinKit does not set one for you.' -ForegroundColor Yellow
+}
 Write-Host 'Connections only work while the app is open in the foreground on the iPhone.'
 Write-Host 'To undo: run enable_rdp.ps1 -Uninstall as administrator.'
 exit 0

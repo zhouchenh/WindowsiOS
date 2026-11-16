@@ -11,7 +11,8 @@
 1. **装 App，导入 Windows 镜像**，用 StikDebug 开 JIT，进 Windows 桌面。
 2. **双击运行**：文件资源管理器 → **WINKIT** 盘 → 双击 `START.bat` → 权限提示点“是”。
    它会依次：装网络驱动、装 3D 驱动、通知 App 打开 3D、询问是否做后台精简（按 `y` 执行，直接回车跳过；不会关闭透明和动画效果）、
-   装登录链接桥 WinIOS Browser（见下文“登录链接用 Safari 打开”，会打开“设置”让你点一下“设为默认值”）。
+   装登录链接桥 WinIOS Browser（见下文“登录链接用 Safari 打开”，会打开“设置”让你点一下“设为默认值”），
+   再装（或更新）后台小助手、键盘焦点助手和剪贴板小助手（见下文）。以后有新版 WinKit，再双击一次 `START.bat` 就全部更新。
 3. **彻底关掉 App 再打开**（上滑划掉），用 StikDebug 再开一次 JIT。
    Windows 登录后一分钟内会**自动**把分辨率调成贴合屏幕、只保留一个桌面，不用再操作。
 4. 验证：运行 `dxdiag`，“显示”页应为 **Red Hat VirtIO GPU 3D controller**，Feature Levels 到 **11_0**。
@@ -20,7 +21,10 @@
 
 **改用户名**：按教程做出的镜像，账户名是原项目的默认值 Ammaar。`START.bat` 最后会问一次要不要改；以后想改，双击 `C:\WinKit`（或 WINKIT 盘）里的 `RENAME-USER.bat`，输入新名字即可，重新登录后生效。个人文件夹仍是原来的 `C:\Users\旧名字`，属正常现象。
 
-**后台小助手**：`START.bat` 会装一个开机隐藏运行的小助手，App 顶部工具栏里的“Claude Code”一键安装靠它自动运行脚本。也可以单独安装：在 Windows 里运行 WINKIT 盘上的 `cli_setup.ps1`（右键 → 使用 PowerShell 运行，不需要管理员）。
+**后台小助手**：`START.bat` 会装一个开机隐藏运行的小助手，App 顶部工具栏里的“Claude Code”一键安装靠它自动运行脚本；
+它也负责**显示**：App 里“设置 → 显示”的显示大小、清晰度，以及折叠、展开、沉浸全屏时的画面大小，都由它实时改成 Windows 的分辨率和缩放（`WinKitDisplay.cs`，不用注销）。
+同一步还装**键盘焦点助手**（`FocusAgent.cs`）：Windows 里的文本框得到焦点时 iPhone 键盘自动弹出，键盘挡住光标时画面上移；中文、带音调的字母和表情也能直接输入。
+App 的“设置 → 输入 → 键盘”里可以关掉自动弹出和跟随光标。也可以单独安装：在 Windows 里运行 WINKIT 盘上的 `cli_setup.ps1`（右键 → 使用 PowerShell 运行，不需要管理员）；`cli_setup.ps1 -Remove` 卸载这两个助手。
 
 ## 登录链接用 Safari 打开（OAuth 桥）
 
@@ -58,6 +62,7 @@ Windows 这边要先把服务打开、把防火墙放行：
    它会打开远程桌面（保留网络级身份验证），并在防火墙里放行 TCP 和 UDP 3389。**只有专业版、企业版、教育版能被远程桌面连接**；
    家庭版会提示改用 SSH、升级到专业版，或者在 Windows 里装一个自带服务器的远程控制软件（例如 VNC 服务器）再自定义转发它的端口。
    然后在 App 里：设置 → 端口转发 → 添加端口转发 → 远程桌面。登录用 Windows 账户的**密码**（PIN 不行；微软账户用它的密码）。
+   **没有密码的本地账户**不能用远程桌面登录（Windows 的规定），脚本会提示：先自己设一个密码（Ctrl+Alt+Del → 更改密码，或“设置 → 账户 → 登录选项 → 密码”）；WinKit 不会替你设。
 2. **SSH**：先把公钥（每行一个 OpenSSH 公钥）放进 App 文件夹的 `Shared/ssh_authorized_keys.txt`，再双击 `SSH-SETUP.bat`，权限提示点“是”。
    它会装好 OpenSSH 服务器（只允许密钥登录）、设成开机启动，并放行 TCP 22。
    然后在 App 里添加“SSH”转发（iPhone 上 2222 → Windows 里 22），从其他设备运行 `ssh -p 2222 用户名@App 显示的地址`。

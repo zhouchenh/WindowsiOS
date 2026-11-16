@@ -1,6 +1,10 @@
 # WinKit: completes a fresh Windows 11 ARM64 in WindowsiOS without a Mac.
 #   network driver -> 3D driver -> switches host 3D on -> (after the app restarts) fits the screen by itself.
-#   Also installs WinIOS Browser (oauth_setup.ps1), so that sign-in links open in Safari on the iPhone.
+#   Also installs WinIOS Browser (oauth_setup.ps1), so that sign-in links open in Safari on the iPhone, and
+#   the helpers that run in the signed-in session: the display helper (Windows' size and scale follow the
+#   app, WinKitDisplay.cs) and the keyboard focus agent (FocusAgent.cs), both from cli_setup.ps1, and the
+#   clipboard helper (clipboard_setup.ps1). Running it again updates all of them.
+#   Optional, on their own: SSH-SETUP.bat (OpenSSH server), REMOTE-DESKTOP.bat (Remote Desktop host).
 # Run through START.bat. -Finish is what the logon task runs after the restart.
 param([switch]$Finish)
 $ErrorActionPreference = 'Continue'
@@ -88,9 +92,13 @@ Write-Host '  Installs WinIOS Browser: links that Windows apps open (e.g. "Sign 
 Write-Host '  the iPhone, with its saved passwords, passkeys and Face ID, and the sign-in comes back to Windows.'
 try { & (Join-Path $home3d 'oauth_setup.ps1') } catch { Write-Host "  skipped: $($_.Exception.Message)" -ForegroundColor Yellow }
 
-# The background helper the app's toolbar uses (Claude Code); also removes the old command-line mode's logon hook.
-try { & (Join-Path $home3d 'cli_setup.ps1') | Out-Null } catch {}
-Say 'Clipboard shared with the iPhone'; try { & (Join-Path $home3d 'clipboard_setup.ps1') } catch { Write-Host "  skipped: $($_.Exception.Message)" -ForegroundColor Yellow }  # clipboard hook
+Say 'Helpers: display size and scale, keyboard focus, clipboard'
+# The background helper (the app's toolbar jobs, e.g. Claude Code, and the display: Windows' mode and scale
+# follow the app live) and the keyboard focus agent (the iPhone keyboard comes up in text boxes, Chinese and
+# emoji typing). Also removes the old command-line mode's logon hook. Installs or updates; no restart needed.
+try { & (Join-Path $home3d 'cli_setup.ps1') | Out-Null } catch { Write-Host "  helper skipped: $($_.Exception.Message)" -ForegroundColor Yellow }
+# What is copied in Windows appears on the iPhone, and the app's paste button sends the iPhone's to Windows.
+try { & (Join-Path $home3d 'clipboard_setup.ps1') } catch { Write-Host "  clipboard skipped: $($_.Exception.Message)" -ForegroundColor Yellow }
 
 Say 'Optional: user name'
 Write-Host '  The image signs in as the account it was made with. You can give it your own name'
@@ -107,3 +115,5 @@ Write-Host 'BEFORE closing the app: shut Windows down from Start > Power once. T
 Write-Host '(user name); swiping the app away without it can lose them.' 
 Write-Host 'Check with dxdiag: Display > "Red Hat VirtIO GPU 3D controller", Feature Levels 11_0.'
 Write-Host 'If the screen ever stays black: delete gpu3d.on from the app''s Shared folder in the Files app and restart the app.'
+Write-Host 'Optional: SSH-SETUP.bat (SSH server, key login) and REMOTE-DESKTOP.bat (Remote Desktop) in C:\WinKit, then'
+Write-Host 'Settings > Port forwarding in the app to reach Windows from other devices.'
