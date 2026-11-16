@@ -3,7 +3,7 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 UDID="${1:-00008160-000E05D036C0000A}"
-BUNDLE_ID="${2:-me.ammaar.windowsios}"
+BUNDLE_ID="${2:-com.applevm.duo}"
 LAUNCH_JSON="$ROOT/work/duo_launch.json"
 
 mkdir -p "$ROOT/work"
