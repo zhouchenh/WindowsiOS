@@ -302,27 +302,34 @@ namespace WinKit
             curCaret = caret;
             if (!classify) return;
 
-            string kind = null;
+            // UI Automation knows most controls; window classes know the old ones and the consoles (whose
+            // UI Automation view says little); either one saying "text" wins, "secure" wins over both.
+            string uiaKind = null;
             int[] elem = new int[0];
-            string source = "";
             if (useUia)
             {
                 Uia.Result r = Uia.Classify(600);
                 if (r != null)
                 {
-                    kind = r.Kind;
+                    uiaKind = r.Kind;
                     elem = r.Rect;
-                    source = "uia";
                 }
             }
-            if (kind == null && haveGui && gi.hwndFocus != IntPtr.Zero)
+            string classKind = null;
+            if (haveGui && gi.hwndFocus != IntPtr.Zero)
             {
-                kind = ClassifyByClass(gi.hwndFocus);
-                if (kind != null) source = "class";
+                classKind = ClassifyByClass(gi.hwndFocus);
                 RECT wr;
-                if (GetWindowRect(gi.hwndFocus, out wr)) elem = new int[] { wr.Left, wr.Top, wr.Right - wr.Left, wr.Bottom - wr.Top };
+                if (elem.Length != 4 && GetWindowRect(gi.hwndFocus, out wr))
+                    elem = new int[] { wr.Left, wr.Top, wr.Right - wr.Left, wr.Bottom - wr.Top };
             }
-            if (kind == null)
+            if (classKind == null && fg != IntPtr.Zero) classKind = ClassifyByClass(fg) == "text" ? "text" : null;
+            string kind, source;
+            if (uiaKind == "secure" || classKind == "secure") { kind = "secure"; source = uiaKind == "secure" ? "uia" : "class"; }
+            else if (uiaKind == "text") { kind = "text"; source = "uia"; }
+            else if (classKind == "text") { kind = "text"; source = "class"; }
+            else if (uiaKind != null || classKind != null) { kind = "none"; source = uiaKind != null ? "uia" : "class"; }
+            else
             {
                 kind = caret.Length == 4 ? "text" : "none"; // a blinking caret means a place to type
                 source = "caret";
@@ -462,13 +469,19 @@ namespace WinKit
         }
 
         // Sends the state when it differs from the last one sent (always, when force). True if sent.
+        static readonly object SendGate = new object();
+
         static bool Send(string ev, bool force)
         {
-            seq++;
-            string body = Json(ev);
-            string cmp = body.Substring(body.IndexOf(",\"kind\"", StringComparison.Ordinal));
-            if (!force && cmp == lastSent) return false;
-            lastSent = cmp;
+            string body;
+            lock (SendGate) // the worker and the typing thread ("typefail") both report
+            {
+                seq++;
+                body = Json(ev);
+                string cmp = body.Substring(body.IndexOf(",\"kind\"", StringComparison.Ordinal));
+                if (!force && cmp == lastSent) return false;
+                lastSent = cmp;
+            }
             string reply = Put(Url, body, 3000);
             if (!string.IsNullOrEmpty(reply)) TypeText(reply);
             return true;
@@ -666,8 +679,8 @@ namespace WinKit
                 if (cur.IsEnabled)
                 {
                     if (ct == ControlType.Edit) text = !readOnly;
-                    else if (ct == ControlType.Document) text = hasValue && !readOnly;
-                    else text = hasText && hasValue && !readOnly && cur.IsKeyboardFocusable;
+                    else if (ct == ControlType.Document) text = hasValue && !readOnly; // a web page: only if editable
+                    else text = hasText && !readOnly && cur.IsKeyboardFocusable; // e.g. a terminal
                 }
                 r.Kind = text ? "text" : "none";
                 return r;
