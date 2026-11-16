@@ -60,8 +60,12 @@ $(B)/test_mmu: tests/test_mmu.c $(ENGINE)
 # Guest DNS proxy against a stand-in resolver (no network needed).
 $(B)/test_dns_lifecycle: tests/test_dns_lifecycle.c $(B)/dns_proxy.o
 	$(CC) $(CFLAGS) $^ -o $@
-test-dns: $(B)/test_dns_lifecycle
+# Its parser and reply builder against malformed and oversized frames, under the address and UB sanitizers.
+$(B)/test_dns_parse: tests/test_dns_parse.c host/dns_proxy.c host/dns_proxy.h | $(B)
+	$(CC) $(CFLAGS) -fsanitize=address,undefined -fno-sanitize-recover=all tests/test_dns_parse.c host/dns_proxy.c -o $@
+test-dns: $(B)/test_dns_lifecycle $(B)/test_dns_parse
 	$(B)/test_dns_lifecycle
+	$(B)/test_dns_parse
 
 $(B)/hvsparse: tools/hvsparse_main.c host/hvsparse.c host/hvsparse.h | $(B)
 	$(CC) $(CFLAGS) tools/hvsparse_main.c host/hvsparse.c -o $@
