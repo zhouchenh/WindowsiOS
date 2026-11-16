@@ -48,4 +48,8 @@ _hv_classify_cases:
     xpaci x2                    // pac
     pacga x3, x4, x5            // pac
     udf #0                      // undefined
+    cfinv                       // copy (FEAT_FlagM: only NZCV)
+    .inst 0xd500403f            // copy: xaflag (FEAT_FlagM2)
+    .inst 0xd500405f            // copy: axflag (FEAT_FlagM2)
+    msr pan, #1                 // sysreg (MSR immediate next to them)
 _hv_classify_cases_end:
