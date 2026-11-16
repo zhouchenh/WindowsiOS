@@ -1,7 +1,9 @@
 #include "harness.h"
 
 #include <mach/mach_time.h>
+#include <pthread.h>
 #include <stdlib.h>
+#include <unistd.h>
 
 DECLARE_PROGRAM(p_svc);
 DECLARE_PROGRAM(p_brk_undef);
@@ -47,9 +49,76 @@ static int run(const TestProgram *p, HvCpu *cpu, uint64_t x9) {
 
 #define ADDR(sym) ((uint64_t)(uintptr_t)(sym))
 
+/* HV_SYNC_WAIT: a thread waiting for a CPU's acknowledgement (hv_cpu_sync) sleeps until the CPU acknowledges while
+   running, or parks (park(): the host pausing the machine, CPU_OFF, WFI, the flush barrier and leaving the dispatcher
+   all go through it). The CPU, on its own thread, is in the machine's tick with its TLB live while the request comes
+   in (kicked, at the stop PC); then (mode 0) it leaves the dispatcher without doing the request, parking, or (mode 1)
+   does the request from the tick and stays live a while longer. The sleep's timeout is made 2 s, so a wake that never
+   comes shows (any later acknowledgement or park would also end the wait: none comes before the CPU stops). */
+static HvMachine sm;
+static HvCpu scpu;
+static int s_in_tick, s_mode;
+
+static uint64_t s_tick(HvMachine *mm, HvCpu *cpu) {
+    (void)mm;
+    if (!__atomic_load_n(&s_in_tick, __ATOMIC_ACQUIRE)) {
+        __atomic_store_n(&s_in_tick, 1, __ATOMIC_RELEASE);
+        usleep(50000);
+        if (s_mode == 1) {
+            hv_cpu_process_requests(cpu);
+            usleep(600000);
+        }
+        cpu->x[0] = 7;
+    }
+    return 0;
+}
+
+static void *s_run(void *arg) {
+    (void)arg;
+    return (void *)(intptr_t)hv_run(&scpu);
+}
+
+static void test_sync_wait(void) {
+    if (hv_machine_init(&sm, 1 << 20) != 0) return;
+    uint32_t *code = aligned_alloc(16384, 16384);
+    code[0] = 0xd503201f;             /* (the stop) */
+    hv_machine_add_ram(&sm, ADDR(code), 16384, code, 1);
+    sm.tick = s_tick;
+    uint32_t saved_us = hv_sync_wait_us;
+    hv_sync_wait_us = 2000000;
+    for (int mode = 0; mode < 2; mode++) {
+        hv_cpu_reset(&scpu, &sm);
+        scpu.pc = ADDR(code);
+        sm.stop_pc = ADDR(code);
+        scpu.exit_req = 1; /* kicked: the dispatcher ticks before it looks at the PC */
+        __atomic_store_n(&s_in_tick, 0, __ATOMIC_RELEASE);
+        s_mode = mode;
+        pthread_attr_t at;
+        pthread_attr_init(&at);
+        pthread_attr_setstacksize(&at, 16u << 20);
+        pthread_t th;
+        pthread_create(&th, &at, s_run, NULL);
+        while (!__atomic_load_n(&s_in_tick, __ATOMIC_ACQUIRE)) usleep(100);
+        uint64_t seq = hv_cpu_post(&scpu, 0);
+        uint64_t t0 = mach_absolute_time();
+        hv_cpu_sync(NULL, &scpu, seq);
+        double ms = (mach_absolute_time() - t0) / 24000.0;
+        void *r;
+        pthread_join(th, &r);
+        const char *what = mode ? "acknowledged by a running CPU" : "the CPU parked";
+        printf("sync wait (HV_SYNC_WAIT=%d), %s: %.1f ms\n", hv_knob[HV_K_SYNCWAIT], what, ms);
+        check("sync wait", what, ms > 20 && ms < 400, 1);
+        check("sync wait", "the CPU ran on", (intptr_t)r == HV_EXIT_HALT && scpu.x[0] == 7, 1);
+    }
+    hv_sync_wait_us = saved_us;
+}
+
 int main(void) {
     setvbuf(stdout, NULL, _IONBF, 0);
     hv_machine_init(&m, 4 << 20);
+    printf("knobs:");
+    for (int k = HV_K_FASTICACHE; k < HV_K_COUNT; k++) printf(" %s=%d", hv_knob_name(k), hv_knob[k]);
+    printf("\n");
     stack = aligned_alloc(16384, 65536);
     hv_machine_add_ram(&m, ADDR(exc_programs_begin), exc_programs_finish - exc_programs_begin,
                        (void *)exc_programs_begin, 1);
@@ -169,6 +238,50 @@ int main(void) {
         TestProgram copy = {p->name, NULL, code, code + ((const char *)p->end - (const char *)p->start)};
         if (!run(&copy, &c, 0)) check(p->name, "1 then 2 after patching", c.x[1], 3);
     }
+
+    /* Code that other pages' exits are chained into changes (HV_XCHAIN_PAGES lists those exits per page): every such
+       exit must go back to its stub, or it keeps jumping into the old translation. 4 KB pages of a writable copy:
+       page 0 and page 2 branch into page 1, which sets x0 and goes on to page 3 (the stop). At a guest PA other than
+       the host address: an exit to another page is chained only where the page's host addend is not 0. */
+    {
+        uint32_t *xc = aligned_alloc(16384, 16384);
+        const uint64_t XPA = 0x50000000ull;
+        hv_machine_add_ram(&m, XPA, 16384, xc, 0);
+        const uint32_t P = 1024; /* words per 4 KB page */
+        #define MOVZ(rd, imm) (0xd2800000u | (uint32_t)(imm) << 5 | (rd))
+        #define B_TO(from, to) (0x14000000u | ((uint32_t)((int32_t)(to) - (int32_t)(from)) & 0x3ffffff))
+        memset(xc, 0, 16384);
+        xc[0] = MOVZ(0, 0), xc[1] = B_TO(1, P);                  /* page 0 -> page 1 */
+        xc[2 * P] = MOVZ(1, 5), xc[2 * P + 1] = B_TO(2 * P + 1, P); /* page 2 -> page 1 */
+        xc[P] = MOVZ(0, 1), xc[P + 1] = B_TO(P + 1, 3 * P);       /* page 1: x0 = n, -> page 3 */
+        const uint32_t *g = (const uint32_t *)(uintptr_t)XPA; /* guest addresses (the MMU is off) */
+        TestProgram from0 = {"xchain0", NULL, g, g + 3 * P}, from2 = {"xchain2", NULL, g + 2 * P, g + 3 * P};
+        uint64_t chained_before = m.stats.chained;
+        /* One CPU throughout (no reset between runs): an exit to another page is chained once that page is in the
+           TLB, from the second run on. */
+        if (run(&from0, &c, 0)) failures++;
+        for (uint32_t n = 1; n <= 4; n++) {
+            if (n == 3) hv_flush_blocks(&m); /* every chain and list starts over, slots from 0 again */
+            if (n > 1) {
+                uint32_t insn = MOVZ(0, n);
+                hv_phys_write(&m, XPA + 4 * P, &insn, 4); /* as a device or another CPU would: page 1 is code */
+            }
+            for (int round = 0; round < 2; round++) /* the second round runs through the chains the first made */
+                for (int from = 0; from < 2; from++) {
+                    const TestProgram *p = from ? &from2 : &from0;
+                    c.x[0] = 0;
+                    c.pc = (uint64_t)(uintptr_t)p->start;
+                    m.stop_pc = (uint64_t)(uintptr_t)p->end;
+                    int r = hv_run(&c);
+                    check("xchain", from ? "page 2 into page 1" : "page 0 into page 1", r == HV_EXIT_HALT ? c.x[0] : ~0ull, n);
+                }
+        }
+        check("xchain", "cross-page exits chained (and chained again after each change)", m.stats.chained - chained_before, 8);
+        #undef MOVZ
+        #undef B_TO
+    }
+
+    test_sync_wait();
 
     printf("%d checks, %d failures\n", checks, failures);
     return failures != 0;

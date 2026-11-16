@@ -92,7 +92,7 @@ typedef struct {
     uint32_t pool_at;    /* where the literal pool is, in the cold part */
     uint32_t flags;
     int slow_mem;
-    uint64_t page;       /* guest VA of the 16 KB page the block is in */
+    uint64_t page;       /* guest VA of the (4 KB) page the block is in */
     int no_ijc;          /* indirect branches always go to the dispatcher (breakpoints, tests' stop PC) */
     HvMachine *m;
     uint64_t cur_pc;     /* guest PC of the instruction being translated (or whose out-of-line exit is) */
@@ -316,7 +316,7 @@ static void put_exit(Emit *e, uint64_t target) {
     put(e, BR_X(1));
 }
 
-/* A direct branch to target. Within the block's own 16 KB page the exit is
+/* A direct branch to target. Within the block's own (4 KB) page the exit is
    chainable: it jumps to the block whose entry the dispatcher stored in this
    exit's slot (plain data, so chaining never rewrites code), as long as nobody
    has asked the CPU to leave. The hit path touches only the free scratch
@@ -2206,9 +2206,12 @@ int hv_translate_place(HvMachine *m, HvBlock *b) {
         hv_jit_write(&m->jit, dst, e->hot, e->nhot * 4);
         hv_jit_write(&m->jit, cold, e->cold, e->pool_at * 4);
         hv_jit_write(&m->jit, cold + e->pool_at, e->pool, e->npool * 8);
-        hv_jit_finish(&m->jit, cold, e->ncold);
+        if (!hv_knob[HV_K_FASTICACHE]) hv_jit_finish(&m->jit, cold, e->ncold);
     }
-    hv_jit_finish(&m->jit, dst, e->nhot);
+    if (hv_knob[HV_K_FASTICACHE]) /* HV_FAST_ICACHE (Henge a47f5e1): one wait for both parts */
+        hv_jit_finish2(&m->jit, dst, e->nhot, e->flat ? NULL : cold, e->flat ? 0 : e->ncold);
+    else
+        hv_jit_finish(&m->jit, dst, e->nhot);
     b->code = dst;
     for (uint32_t k = 0; k < e->nsite; k++) {
         m->slot_site[e->site[k].slot] = (e->site[k].cold ? cold : dst) + e->site[k].at;

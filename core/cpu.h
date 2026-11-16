@@ -135,6 +135,11 @@ typedef struct HvCpu {
 #define HV_KERNEL_FILLS 4096
     uint16_t kernel_fills[HV_KERNEL_FILLS];
     uint32_t nkernel_fills;
+    /* ASIDs given a user id (asid_cid) since the user half was last started over, so that (HV_TLB_LOGFLUSH) clears
+       just these and a code change (HV_IJC_PAGES) knows every live user id. More than HV_ASID_LOG: not all known. */
+#define HV_ASID_LOG 512
+    uint16_t asid_log[HV_ASID_LOG];
+    uint32_t nasid_log;
 #define HV_KTTBR_SLOTS 64
     struct { uint64_t ttbr1; uint16_t kgen; } kttbr_map[HV_KTTBR_SLOTS];
     uint32_t kttbr_next, kttbr_count;
@@ -146,6 +151,10 @@ typedef struct HvCpu {
        are cleared. */
     uint16_t asid_cid[65536];
     uint16_t cid_asid[65536]; /* --stats: the ASID a user id was given to (to tell live tags from dead ones) */
+    /* HV_IJC_TTBKEY (Henge 94ca6a9): the TTBR0 base asid_cid[ASID] was given under. An ASID back with another base
+       gets a fresh id, as the TLB stashes are keyed by ASID and base too (hv_mmu_ukey). With TCR.A1 the ASID comes
+       from TTBR1 and the base still from TTBR0. ASID 0 keeps its own guard (asid0_ttbr0). */
+    uint64_t asid_base[65536];
     uint32_t next_cid, kernel_gen;
 
     /* Generic timer: physical and virtual. The counter is host time scaled to 24 MHz. */
@@ -260,6 +269,10 @@ _Static_assert(offsetof(HvCpu, spsel) == HV_CPU_SPSEL, "HvCpu layout");
 _Static_assert(offsetof(HvCpu, sp_el1) == HV_CPU_SP_EL1, "HvCpu layout");
 _Static_assert(offsetof(HvCpu, ijc_tab) == HV_CPU_IJC_TAB, "HvCpu layout");
 _Static_assert(HV_IJC_TABLES == 16, "ijc_tab has one pointer per table");
+_Static_assert(HV_TLB_SIZE * 4 <= 65536, "TLB codes (user_fills, kernel_fills, stash slots) are 16 bits");
+_Static_assert(HV_TLB_PAGE_BITS == 12, "the Windows core's TLB, its logs, filters and the ports from Henge (16 KB) assume 4 KB pages");
+_Static_assert(HV_ASID_LOG <= 65536 && sizeof(((HvCpu *)0)->asid_base) / sizeof(uint64_t) == 65536, "every 16-bit ASID");
+_Static_assert(offsetof(HvCpu, asid_base) > HV_CPU_RET_TAB, "asid_base is C-only, past what translated code addresses");
 _Static_assert(sizeof(HvTlbEntry) == 32, "TLB entries are indexed with lsl #5");
 
 /* Why the last block returned to the dispatcher. */

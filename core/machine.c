@@ -19,12 +19,25 @@ extern void hv_xjump_thunk(void);
 static int init_rest(HvMachine *m);
 
 int hv_knob[HV_K_COUNT];
-static const char *const hv_knob_names[HV_K_COUNT] = {"HV_NO_RAS", "HV_SUPERBLOCKS", "HV_GROUPS", "HV_WFI_SPIN", "HV_FLUSH", "HV_K1", "HV_K2", "HV_K3", "HV_TLBT", "HV_JIT_CAP", "HV_RECHECK"};
+static const char *const hv_knob_names[] = {"HV_NO_RAS", "HV_SUPERBLOCKS", "HV_GROUPS", "HV_WFI_SPIN", "HV_FLUSH", "HV_K1", "HV_K2", "HV_K3", "HV_TLBT", "HV_JIT_CAP", "HV_RECHECK",
+                                            "HV_FAST_ICACHE", "HV_IJC_TTBKEY", "HV_TLB_LOGFLUSH", "HV_IJC_PAGES", "HV_XCHAIN_PAGES",
+                                            "HV_STASH_VA", "HV_WALK_LOG", "HV_SYNC_WAIT"};
+_Static_assert(sizeof hv_knob_names / sizeof hv_knob_names[0] == HV_K_COUNT, "a name for every knob");
 
 static void knobs_init(void) {
     for (int i = 0; i < HV_K_COUNT; i++)
         hv_knob[i] = getenv(hv_knob_names[i]) ? atoi(getenv(hv_knob_names[i])) : 0;
     if (getenv("HV_NO_RAS") && !*getenv("HV_NO_RAS")) hv_knob[HV_K_NO_RAS] = 1;
+}
+
+const char *hv_knob_name(int k) {
+    return k >= 0 && k < HV_K_COUNT ? hv_knob_names[k] : "?";
+}
+
+/* A knob from its environment variable, or def when that is unset. */
+static void knob_env(int k, int def) {
+    const char *v = getenv(hv_knob_names[k]);
+    hv_knob[k] = v ? atoi(v) : def;
 }
 
 int hv_knob_set(HvMachine *m, const char *name, int value) {
@@ -58,6 +71,31 @@ static int init_rest(HvMachine *m) {
     /* 4 KB pages expose stack accesses in the last 15 bytes of every page (500K+/s on Windows):
        exact OOL recheck avoids trapping to C on every stack push/pop at page top. */
     hv_knob[HV_K_RECHECK] = getenv("HV_RECHECK") ? atoi(getenv("HV_RECHECK")) : 1;
+    /* Henge a47f5e1: chaining rewrites one B as another B and drops just that instruction-cache line, without waiting
+       for every CPU; a placed block's hot and cold parts share one wait (host/jit_region.c). */
+    knob_env(HV_K_FASTICACHE, 1); /* on unless its variable says 0 */
+    /* Henge 94ca6a9 (its first part): a process's id in the branch cache (asid_cid) also goes with the table base its
+       ASID had, so an ASID back with another TTBR0 base, with no TLBI by ASID in between, starts with no cached targets. */
+    knob_env(HV_K_IJCTTBKEY, 1); /* on unless its variable says 0 */
+    /* Henge 061b250 (its first part): a whole-TLB flush clears the entries logged since the last one (user_fills,
+       kernel_fills) instead of all four tables, and a user branch-cache reset the ASIDs given ids since the last one
+       (asid_log) instead of all 64K. The large-page filters are still cleared whole. */
+    knob_env(HV_K_LOGFLUSH, 1); /* on unless its variable says 0 */
+    /* Henge b537dbb: a code change drops the cached branch targets into its page (under every live user id and
+       kernel salt) instead of every CPU's whole branch cache. */
+    knob_env(HV_K_IJCPAGES, 1); /* on unless its variable says 0 */
+    /* Henge 7131022: exits chained into another page are listed per target page (HvRam.xhead), so a code change
+       unchains just those instead of scanning every cross-page chain under the translation lock. */
+    knob_env(HV_K_XCHAINPAGES, 1); /* on unless its variable says 0 */
+    /* Henge 5d4e092 and ba9392e: a TLBI of one page (here or from another CPU) drops only that 4 KB page from the
+       stashed TLB entries of switched-out processes (all of the ASID's when the page may be part of a large one), and
+       a process switch puts stashed entries back with one fence. */
+    knob_env(HV_K_STASHVA, 1); /* on unless its variable says 0 */
+    /* Henge aaba70b, 1ed86bd, 17e9ed9: another CPU's TLBI of a page done from here lets through walks of pages far
+       enough from it (hv_walks_elsewhere) instead of counting every walk meanwhile as a race to wait for. */
+    knob_env(HV_K_WALKLOG, 1); /* on unless its variable says 0 */
+    /* Henge 061b250 (its second part): a CPU waiting for TLBI acknowledgements sleeps on a ulock instead of yielding. */
+    knob_env(HV_K_SYNCWAIT, 1); /* on unless its variable says 0 */
     /* As many blocks as the region holds (a block is at least ~160 bytes of
        code), so the region filling, not this table, is what flushes; two
        chainable exits each at most. Untouched entries cost nothing. */
@@ -76,7 +114,10 @@ static int init_rest(HvMachine *m) {
     m->slot_xa = calloc(m->max_slots, sizeof *m->slot_xa);
     m->slot_xpa = calloc(m->max_slots, sizeof *m->slot_xpa);
     m->xchained = calloc(m->max_slots, sizeof *m->xchained);
-    if (!m->slots || !m->slot_site || !m->slot_stub || !m->slot_cond || !m->slot_xa || !m->slot_xpa || !m->xchained) return -1;
+    m->slot_xnext = calloc(m->max_slots, sizeof *m->slot_xnext);
+    if (!m->slots || !m->slot_site || !m->slot_stub || !m->slot_cond || !m->slot_xa || !m->slot_xpa || !m->xchained ||
+        !m->slot_xnext)
+        return -1;
     pthread_mutex_init(&m->big_mu, NULL);
     pthread_cond_init(&m->big_cv, NULL);
     pthread_mutexattr_t ra;
@@ -149,17 +190,30 @@ uint64_t hv_cpu_post(HvCpu *target, uint32_t flags) {
     return post_locked_done(target, p);
 }
 
+uint64_t hv_cpu_post_ijc_page(HvCpu *target, uint64_t v) {
+    HvPerCpu *p = target->pc_state;
+    pthread_mutex_lock(&p->req_mu);
+    if (p->nijc_page < sizeof p->ijc_page / sizeof p->ijc_page[0]) p->ijc_page[p->nijc_page++] = v;
+    else p->req_flags |= HV_REQ_IJC_RESET;
+    return post_locked_done(target, p);
+}
+
+static void ack_wake(HvPerCpu *p);
+
 void hv_cpu_process_requests(HvCpu *cpu) {
     HvPerCpu *p = cpu->pc_state;
     uint64_t seq = __atomic_load_n(&p->req_seq, __ATOMIC_ACQUIRE);
     if (seq == __atomic_load_n(&p->ack_seq, __ATOMIC_RELAXED)) return;
     static __thread struct { uint32_t op1, crn, crm, op2; uint64_t xt; } q[64];
+    static __thread uint64_t pages[sizeof p->ijc_page / sizeof p->ijc_page[0]];
     pthread_mutex_lock(&p->req_mu);
     seq = p->req_seq;
-    uint32_t flags = p->req_flags, n = p->nreq;
+    uint32_t flags = p->req_flags, n = p->nreq, npages = p->nijc_page;
     memcpy(q, p->req, n * sizeof q[0]);
+    memcpy(pages, p->ijc_page, npages * sizeof pages[0]);
     p->req_flags = 0;
     p->nreq = 0;
+    p->nijc_page = 0;
     pthread_mutex_unlock(&p->req_mu);
     if (flags & HV_REQ_TLB_ALL) {
         hv_tlb_flush(cpu);
@@ -169,20 +223,60 @@ void hv_cpu_process_requests(HvCpu *cpu) {
     if (flags & HV_REQ_IJC_RESET) {
         hv_ijc_reset(cpu, 0);
         hv_ijc_reset(cpu, 1);
+    } else if (!(flags & HV_REQ_TLB_ALL)) { /* a whole flush dropped the branch cache already */
+        for (uint32_t i = 0; i < npages; i++) hv_ijc_drop_code_page(cpu, pages[i]);
     }
-    __atomic_store_n(&p->ack_seq, seq, __ATOMIC_RELEASE);
+    /* Sequentially consistent (an STLR either way on arm64): ack_wake's load of ack_waiters must not come first. */
+    __atomic_store_n(&p->ack_seq, seq, __ATOMIC_SEQ_CST);
+    ack_wake(p);
+}
+
+/* HV_SYNC_WAIT (Henge 061b250): a CPU waiting for another's acknowledgement sleeps (after a short spin) instead of
+   spinning and yielding, so a host core is free for the CPU it waits on: the phone has two fast cores for four guest
+   CPUs, the display and the GPU. The kernel's compare-and-wait on the low 32 bits of ack_seq; woken when ack_seq
+   moves (hv_cpu_process_requests) or the CPU stops using its TLB (park(), which a CPU paused by the host, off, in
+   WFI or at the flush barrier goes through, and hv_cpu_sync's own), and in any case after hv_sync_wait_us. */
+extern int __ulock_wait(uint32_t operation, void *addr, uint64_t value, uint32_t timeout_us);
+extern int __ulock_wake(uint32_t operation, void *addr, uint64_t wake_value);
+#define HV_UL_COMPARE_AND_WAIT 1u
+#define HV_ULF_WAKE_ALL 0x100u
+#define HV_ULF_NO_ERRNO 0x1000000u
+uint32_t hv_sync_wait_us = 100;
+_Static_assert(sizeof(((HvPerCpu *)0)->ack_seq) == 8 && __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__, "the ulock word is ack_seq's low half");
+
+/* Wake whoever sleeps on p's ack_seq (it moved, or p stopped using its TLB). */
+static void ack_wake(HvPerCpu *p) {
+    if (__atomic_load_n(&p->ack_waiters, __ATOMIC_SEQ_CST))
+        __ulock_wake(HV_UL_COMPARE_AND_WAIT | HV_ULF_WAKE_ALL | HV_ULF_NO_ERRNO, &p->ack_seq, 0);
+}
+
+void hv_cpu_ack_wake(HvCpu *cpu) {
+    if (cpu->pc_state) ack_wake(cpu->pc_state);
 }
 
 void hv_cpu_sync(HvCpu *self, HvCpu *target, uint64_t seq) {
     HvPerCpu *t = target->pc_state, *s = self ? self->pc_state : NULL;
     HvMachine *mm = target->m;
     uint64_t t0 = mm->stats_interval ? mach_absolute_time() : 0;
-    if (s) __atomic_store_n(&s->tlb_live, 0, __ATOMIC_SEQ_CST); /* others need not wait for this one meanwhile */
+    if (s) {
+        __atomic_store_n(&s->tlb_live, 0, __ATOMIC_SEQ_CST); /* others need not wait for this one meanwhile */
+        ack_wake(s);
+    }
+    int sleep = hv_knob[HV_K_SYNCWAIT];
     for (uint32_t spins = 0;; spins++) {
-        if (__atomic_load_n(&t->ack_seq, __ATOMIC_ACQUIRE) >= seq) break;
+        uint64_t ack = __atomic_load_n(&t->ack_seq, __ATOMIC_ACQUIRE);
+        if (ack >= seq) break;
         if (!__atomic_load_n(&t->tlb_live, __ATOMIC_SEQ_CST)) break; /* parked: it does the work before it runs again */
         if (self) hv_cpu_process_requests(self);
-        if (spins > 200) sched_yield();
+        if (sleep && spins >= 64) {
+            __atomic_add_fetch(&t->ack_waiters, 1, __ATOMIC_SEQ_CST);
+            /* Asleep until ack_seq's low word moves, a wake, or the timeout (a missed wake costs no more than that). */
+            if (__atomic_load_n(&t->ack_seq, __ATOMIC_SEQ_CST) == ack && __atomic_load_n(&t->tlb_live, __ATOMIC_SEQ_CST))
+                __ulock_wait(HV_UL_COMPARE_AND_WAIT | HV_ULF_NO_ERRNO, &t->ack_seq, (uint32_t)ack, hv_sync_wait_us);
+            __atomic_sub_fetch(&t->ack_waiters, 1, __ATOMIC_SEQ_CST);
+        } else if (spins > 200) {
+            sched_yield();
+        }
     }
     if (s) {
         __atomic_store_n(&s->tlb_live, 1, __ATOMIC_SEQ_CST);
@@ -261,6 +355,9 @@ void hv_machine_free(HvMachine *m) {
     for (int i = 0; i < m->nram; i++) {
         free(m->ram[i].code_pages);
         free(m->ram[i].page_gen);
+        free(m->ram[i].whint);
+        free(m->ram[i].ijc_va);
+        free(m->ram[i].xhead);
     }
     free(m->blocks);
     for (int i = 0; i < HV_MAX_CPUS; i++) {
@@ -279,6 +376,7 @@ void hv_machine_free(HvMachine *m) {
     free(m->slot_xa);
     free(m->slot_xpa);
     free(m->xchained);
+    free(m->slot_xnext);
 }
 
 int hv_machine_add_ram(HvMachine *m, uint64_t pa, uint64_t size, void *host, int readonly) {
@@ -296,7 +394,10 @@ int hv_machine_add_ram(HvMachine *m, uint64_t pa, uint64_t size, void *host, int
     if (!m->main_ram || size > m->main_ram->size) m->main_ram = r;
     r->page_gen = calloc(pages, sizeof *r->page_gen);
     r->whint = calloc(pages * HV_MAX_CPUS, sizeof *r->whint);
-    return r->code_pages && r->page_gen && r->whint ? 0 : -1;
+    r->npages = pages;
+    r->ijc_va = calloc(pages, sizeof *r->ijc_va);
+    r->xhead = calloc(pages, sizeof *r->xhead);
+    return r->code_pages && r->page_gen && r->whint && r->ijc_va && r->xhead ? 0 : -1;
 }
 
 /* While the CPUs run (a device BAR backed by host memory, e.g. the virtio-gpu hostmem window):
@@ -316,7 +417,10 @@ int hv_machine_add_ram_live(HvMachine *m, uint64_t pa, uint64_t size, void *host
     r->code_pages = calloc((size_t)1 << r->pages_log2, 1);
     r->page_gen = calloc(pages, sizeof *r->page_gen);
     r->whint = calloc(pages * HV_MAX_CPUS, sizeof *r->whint);
-    if (!r->code_pages || !r->page_gen || !r->whint) return -1;
+    r->npages = pages;
+    r->ijc_va = calloc(pages, sizeof *r->ijc_va); /* hv_invalidate_code reads these for any page that held code */
+    r->xhead = calloc(pages, sizeof *r->xhead);
+    if (!r->code_pages || !r->page_gen || !r->whint || !r->ijc_va || !r->xhead) return -1;
     __atomic_store_n(&m->nram, n + 1, __ATOMIC_RELEASE);
     return n;
 }
@@ -349,6 +453,18 @@ uint32_t *hv_smc_counts;
 uint64_t *hv_smc_last;
 uint64_t hv_smc_pages, hv_smc_cpu, hv_smc_dma;
 
+/* A chained exit into another page goes back to its stub (under the translation lock). */
+static void unchain(HvMachine *m, uint32_t idx) {
+    m->slot_xpa[idx] = 0;
+    __atomic_store_n(&m->slots[idx], 0, __ATOMIC_RELEASE);
+    uint32_t *site = m->slot_site[idx];
+    if (site) {
+        uint32_t insn = 0x14000000u | (uint32_t)((m->slot_stub[idx] - site) & 0x3ffffff); /* back to its stub */
+        hv_jit_write(&m->jit, site, &insn, 4);
+        hv_jit_finish(&m->jit, site, 1); /* the full wait: the old target must not run any more */
+    }
+}
+
 void hv_invalidate_code(HvMachine *m, uint64_t pa) {
     HvRam *r = hv_ram_lookup(m, pa);
     if (!r) return;
@@ -371,6 +487,18 @@ void hv_invalidate_code(HvMachine *m, uint64_t pa) {
        (whose next chain finds the new translation). Under the translation lock,
        as chaining them is: one that saw the old generation is done by now. */
     pthread_mutex_lock(&m->tr_mu);
+    /* HV_XCHAIN_PAGES (Henge 7131022): the exits chained into this page are on its own list. Whatever the knob
+       says now, both kinds of record are looked at: a knob changed at run time leaves the other kind until the
+       flush it asks for, and an empty one costs nothing. */
+    if (r->xhead) {
+        for (uint32_t k = r->xhead[pg]; k;) {
+            uint32_t idx = k - 1;
+            k = m->slot_xnext[idx];
+            m->slot_xnext[idx] = 0;
+            unchain(m, idx);
+        }
+        r->xhead[pg] = 0;
+    }
     uint64_t tpa = (r->pa + (pg << HV_TLB_PAGE_BITS)) | 1;
     for (uint32_t k = 0; k < m->nxchained;) {
         uint32_t idx = m->xchained[k];
@@ -378,20 +506,20 @@ void hv_invalidate_code(HvMachine *m, uint64_t pa) {
             k++;
             continue;
         }
-        m->slot_xpa[idx] = 0;
-        __atomic_store_n(&m->slots[idx], 0, __ATOMIC_RELEASE);
-        uint32_t *site = m->slot_site[idx];
-        if (site) {
-            uint32_t insn = 0x14000000u | (uint32_t)((m->slot_stub[idx] - site) & 0x3ffffff); /* back to its stub */
-            hv_jit_write(&m->jit, site, &insn, 4);
-            hv_jit_finish(&m->jit, site, 1);
-        }
+        unchain(m, idx);
         m->xchained[k] = m->xchained[--m->nxchained];
     }
     pthread_mutex_unlock(&m->tr_mu);
-    /* The indirect-branch cache may lead into the stale blocks: start it over,
-       here at once and on the other CPUs before they next leave a block (their
-       cache lookups and chained exits check exit_req first). */
+    /* The indirect-branch cache may lead into the stale blocks: drop those entries (or, without HV_IJC_PAGES, the
+       whole cache), here at once and on the other CPUs before they next leave a block (their cache lookups and
+       chained exits check exit_req first). Which entries (Henge b537dbb): the page's blocks were cached under one VA
+       page (ijc_va, read after the generation went up; a fill notes its page before checking the generation, see
+       hv_ijc_fill_checked), so only that page's, under every id that is still live; under none, only the return
+       predictions go; under several, all. */
+    uint64_t v = r->ijc_va ? __atomic_exchange_n(&r->ijc_va[pg], 0, __ATOMIC_SEQ_CST) : ~0ull;
+    if (!hv_knob[HV_K_IJCPAGES]) v = ~0ull;
+    if (m->stats_interval) m->stats.code_ijc[!v ? 0 : v == ~0ull ? 2 : 1]++;
+    if (!v) v = 1;
     for (int i = 0; i < m->ncpus; i++) {
         HvCpu *c = m->cpus[i];
         if (!c) continue;
@@ -399,10 +527,16 @@ void hv_invalidate_code(HvMachine *m, uint64_t pa) {
            or no CPU running yet) it is a request, or a running CPU could read a
            half-written entry and jump into the wrong code. */
         if (c == hv_self) {
-            hv_ijc_reset(c, 0);
-            hv_ijc_reset(c, 1);
-        } else {
+            if (v == ~0ull) {
+                hv_ijc_reset(c, 0);
+                hv_ijc_reset(c, 1);
+            } else {
+                hv_ijc_drop_code_page(c, v);
+            }
+        } else if (v == ~0ull) {
             hv_cpu_post(c, HV_REQ_IJC_RESET);
+        } else {
+            hv_cpu_post_ijc_page(c, v);
         }
     }
     m->stats.reset_why[4]++;
@@ -538,5 +672,6 @@ void hv_cpu_reset_index(HvCpu *cpu, HvMachine *m, uint32_t index) {
     cpu->excl_addr = ~0ull;
     /* Architectural reset value has the MMU and caches off; RES1 bits set. */
     cpu->sctlr_el1 = 0x30d00800;
+    cpu->nkernel_fills = HV_KERNEL_FILLS + 1; /* the TLB is all zeros, not logged: make every entry invalid */
     hv_tlb_flush(cpu);
 }

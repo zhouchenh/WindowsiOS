@@ -14,7 +14,7 @@ typedef struct HvRam {
     uint64_t pa, size;
     uint8_t *host;
     int readonly;
-    uint8_t *code_pages; /* one byte per 16 KB page: a translated block came from here (2^pages_log2 of them) */
+    uint8_t *code_pages; /* one byte per (4 KB) TLB page: a translated block came from here (2^pages_log2 of them) */
     uint32_t pages_log2;
     uint32_t *page_gen;  /* per page: bumped to invalidate the blocks translated from it */
     /* Per page and CPU: up to three TLB entries (slot << 2 | table, plus 1;
@@ -22,6 +22,13 @@ typedef struct HvRam {
        were more. When the page becomes code only those are dropped, not a whole
        TLB scanned. */
     uint64_t *whint;
+    /* Per page: the VA page (| 2) its blocks have been cached as branch targets under since its code last changed;
+       0 none, ~0 more than one. So a code change drops just those cached targets (HV_IJC_PAGES, hv_invalidate_code). */
+    uint64_t *ijc_va;
+    /* HV_XCHAIN_PAGES, per page: the exits from other pages chained into it (a slot + 1, 0 none), listed through
+       HvMachine.slot_xnext, so its code changing unchains just those. */
+    uint32_t *xhead;
+    size_t npages;      /* pages of HV_TLB_PAGE_BITS: what page_gen, whint and ijc_va are per */
     /* Optional, per 4 KB page: where that page lives in host memory (NULL: host + offset as usual).
        A device window whose pages come from separate host allocations (virtio-gpu hostmem blobs,
        mapped at 4 KB offsets while host pages are 16 KB). Read through hv_ram_host(). */
@@ -101,7 +108,9 @@ typedef struct HvStats {
     uint64_t kind_insns[16], kind_words[16]; /* --stats: inline words by instruction kind (HvInsnKind), as translated */
     uint64_t posted_kind[4];
     uint64_t race_kind[3];    /* remote drops that raced: walk under way, cache fill under way, either during the drop */  /* TLBIs other CPUs had to do themselves: a page or small range that raced, a big range, the rest (ASID, all) */
+    uint64_t race_other_page; /* HV_WALK_LOG: remote drops not counted as raced, the walks meanwhile being elsewhere */
     uint64_t range_spared;    /* big user-range TLBIs that needed no cached targets dropped */
+    uint64_t code_ijc[3];     /* code changes: no cached target into the page, its VA page's targets dropped, all dropped (HV_IJC_PAGES) */
     uint64_t kernel_ranges;   /* big kernel-range TLBIs, dropped by range rather than with everything */
     uint64_t tlb_range_flushes; /* and that dropped only the TLB entries in the range */     /* of hv_ijc_resolve's lookups, ones that walked for the target page */   /* hv_ijc_resolve could not: chaining off/odd target, filters full, no TLB entry, block not made yet */   /* the same for hv_ijc_resolve's fills */
     uint64_t fill_kind[4];    /* ijc fills into an empty slot, over another live salt, over the same salt, over a dead salt */
@@ -187,12 +196,16 @@ typedef struct HvPerCpu {
     uint32_t req_flags;          /* HV_REQ_* */
     uint32_t nreq;
     struct { uint32_t op1, crn, crm, op2; uint64_t xt; } req[64]; /* TLBIs to apply */
+    uint32_t nijc_page;
+    uint64_t ijc_page[16];       /* code changed: cached targets to forget (hv_ijc_drop_code_page), queued as req */
     uint64_t req_seq, ack_seq;
     /* active: inside the dispatcher loop (0 while parked: WFI, powered off, at a
        flush barrier). tlb_live: active and not itself waiting for acks, i.e. it
        may be using TLB entries right now. */
     int active, tlb_live;
+    uint32_t ack_waiters;        /* CPUs asleep in hv_cpu_sync waiting for ack_seq to move (HV_SYNC_WAIT) */
     uint32_t walk_seq;           /* odd while it walks page tables and fills its TLB (see hv_tlbi_drop_remote_va) */
+    uint64_t walk_page[8];       /* the page walk k (walk_seq 2k -> 2k+1) fills, at [k % 8]; ~0: a process switch (HV_WALK_LOG) */
     uint32_t ijc_seq;            /* odd while it checks a block's mapping in its TLB and caches it (hv_ijc_fill_checked) */
     HvTlbStash stash[HV_STASHES];
     uint64_t stash_clock;
@@ -250,9 +263,13 @@ typedef struct HvMachine {
     /* Exits to another page (see put_branch_exit): the host addend the target
        page's TLB entry must hold for the exit to go straight to the chained
        block (0: a same-page exit), and once chained, the target's physical page
-       (| 1) so that invalidating its code can unchain it. xchained lists them. */
+       (| 1) so that invalidating its code can unchain it. xchained lists them; with HV_XCHAIN_PAGES each
+       target page lists its own instead, from HvRam.xhead through slot_xnext (slot + 1, 0 at the end), a slot on
+       one list at a time until the page's code changes or a flush empties them all (xlist_used: one was made). */
     uint64_t *slot_xa, *slot_xpa;
     uint32_t *xchained, nxchained;
+    uint32_t *slot_xnext;
+    int xlist_used;
     uint32_t nslots;
     HvCpu *cpu;              /* CPU 0: the one that polls devices */
     HvCpu *cpus[HV_MAX_CPUS]; /* every CPU, so device and invalidation code can ask them to leave */
@@ -309,10 +326,14 @@ void hv_ret_clear(HvCpu *cpu);
 int hv_ic_ivau_drops(void);
 /* Settings that say how to translate or wait, to compare ways of doing it in one running guest
    ("knob NAME VALUE" in HV_INPUT_FILE; a new way starts from an empty code cache). Each starts
-   from the environment variable named in hv_knob_names. */
-enum { HV_K_NO_RAS, HV_K_SUPERBLOCKS, HV_K_GROUPS, HV_K_WFI_SPIN, HV_K_FLUSH, HV_K_TEST1, HV_K_TEST2, HV_K_TEST3, HV_K_TLBT, HV_K_JITCAP, HV_K_RECHECK, HV_K_COUNT };
+   from the environment variable named in hv_knob_names. The ports of Henge's core work (HV_FAST_ICACHE and the
+   ones after it) are read in init_rest with their defaults, so the Mac tool and the tests can set them too
+   (Documents/env.txt on iOS): 0 turns one off. */
+enum { HV_K_NO_RAS, HV_K_SUPERBLOCKS, HV_K_GROUPS, HV_K_WFI_SPIN, HV_K_FLUSH, HV_K_TEST1, HV_K_TEST2, HV_K_TEST3, HV_K_TLBT, HV_K_JITCAP, HV_K_RECHECK,
+       HV_K_FASTICACHE, HV_K_IJCTTBKEY, HV_K_LOGFLUSH, HV_K_IJCPAGES, HV_K_XCHAINPAGES, HV_K_STASHVA, HV_K_WALKLOG, HV_K_SYNCWAIT, HV_K_COUNT };
 extern int hv_knob[HV_K_COUNT];
 int hv_knob_set(HvMachine *m, const char *name, int value);
+const char *hv_knob_name(int k); /* its environment variable */
 /* Debugging (HV_WATCH): which pages keep losing their translations. */
 extern uint32_t *hv_smc_counts;
 extern uint64_t *hv_smc_last;
@@ -336,10 +357,19 @@ void hv_dev_unlock(HvMachine *m);
 /* Ask another CPU to apply a TLBI (or HV_REQ_* work); returns the sequence to wait for. */
 uint64_t hv_cpu_post_tlbi(HvCpu *target, uint32_t op1, uint32_t crn, uint32_t crm, uint32_t op2, uint64_t xt);
 uint64_t hv_cpu_post(HvCpu *target, uint32_t flags);
+/* Code changed in a page whose blocks were cached as branch targets at VA page v (| 2), or v = 1: only the return
+   predictions. Too many queued: the whole branch cache instead. */
+uint64_t hv_cpu_post_ijc_page(HvCpu *target, uint64_t v);
+/* On cpu's own thread: code changed in a page cached as branch targets at VA page v (| 2), or v = 1 (none):
+   forget the return predictions and those targets, under every live id (mmu.c). */
+void hv_ijc_drop_code_page(HvCpu *cpu, uint64_t v);
 /* Wait until target has done everything up to seq (or is parked, and will before it runs). */
 void hv_cpu_sync(HvCpu *self, HvCpu *target, uint64_t seq);
 /* The owner: do what other CPUs asked. */
 void hv_cpu_process_requests(HvCpu *cpu);
+/* cpu stopped using its TLB (parked): wake CPUs asleep waiting for its acknowledgement (HV_SYNC_WAIT). */
+void hv_cpu_ack_wake(HvCpu *cpu);
+extern uint32_t hv_sync_wait_us; /* HV_SYNC_WAIT: longest sleep before looking again (tests make it long) */
 void hv_big_lock(HvMachine *m);
 void hv_big_unlock(HvMachine *m);
 /* Let a waiting CPU run (the lock is held again on return). */

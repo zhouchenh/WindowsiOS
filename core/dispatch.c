@@ -20,7 +20,10 @@ void hv_flush_blocks(HvMachine *m) {
     if ((hv_knob[HV_K_TLBT] != 0) != hv_tlb_tmajor) {
         hv_tlb_tmajor = hv_knob[HV_K_TLBT] != 0;
         for (int i = 0; i < m->ncpus; i++)
-            if (m->cpus[i]) hv_tlb_flush(m->cpus[i]);
+            if (m->cpus[i]) {
+                m->cpus[i]->nkernel_fills = HV_KERNEL_FILLS + 1; /* the logs hold slots of the old layout: clear it all */
+                hv_tlb_flush(m->cpus[i]);
+            }
     }
     m->stats.block_flushes++;
     __atomic_add_fetch(&m->jit_gen, 1, __ATOMIC_SEQ_CST);
@@ -35,6 +38,9 @@ void hv_flush_blocks(HvMachine *m) {
     m->nblocks = 0;
     m->nslots = 0;
     m->nxchained = 0;
+    if (m->xlist_used) /* slots restart from 0: no page's list may name one */
+        for (int i = 0; i < m->nram; i++)
+            if (m->ram[i].xhead) memset(m->ram[i].xhead, 0, m->ram[i].npages * sizeof *m->ram[i].xhead);
     hv_jit_reset(&m->jit);
     m->jit.limit = hv_knob[HV_K_JITCAP] > 0 ? ((size_t)hv_knob[HV_K_JITCAP] << 20) / sizeof(uint32_t) : 0; /* MB of it to use (testing) */
     /* HV_JIT_POISON: nothing old is left to run, so a stale pointer faults where it is used. */
@@ -55,6 +61,7 @@ static void park(HvCpu *cpu) {
     HvPerCpu *p = cpu->pc_state;
     __atomic_store_n(&p->tlb_live, 0, __ATOMIC_SEQ_CST);
     __atomic_store_n(&p->active, 0, __ATOMIC_SEQ_CST);
+    hv_cpu_ack_wake(cpu); /* a CPU asleep waiting for this one's acknowledgement need not wait any more (HV_SYNC_WAIT) */
 }
 
 static void unpark(HvCpu *cpu) {
@@ -632,6 +639,8 @@ static void print_stats(HvCpu *cpu, int force) {
         mach_port_deallocate(mach_task_self(), self);
         fprintf(stderr, "  cache drops/s: full %.0f, ASID %.0f, user VA %.0f, kernel VA %.0f, code %.0f (whole user half %.0f, filter full %.0f, big user range %.0f)\n", RATE(reset_why[0]),
                 RATE(reset_why[1]), RATE(reset_why[2]), RATE(reset_why[3]), RATE(reset_why[4]), RATE(reset_why[5]), RATE(reset_why[6]), RATE(reset_why[7]));
+        fprintf(stderr, "  code changes/s: no cached target into the page %.0f, that VA page's targets dropped %.0f, all dropped %.0f\n",
+                RATE(code_ijc[0]), RATE(code_ijc[1]), RATE(code_ijc[2]));
         { /* block hash health: chain lengths and how much of it is stale */
             uint64_t used = 0, stale = 0, maxlen = 0, sumsq = 0;
             uint32_t worst = 0;
@@ -667,7 +676,8 @@ static void print_stats(HvCpu *cpu, int force) {
                 RATE(tlb_range_flushes), RATE(range_spared), RATE(kernel_ranges));
         fprintf(stderr, "  TLBIs left to other CPUs/s: raced %.0f, every address space's cached targets %.0f, big range %.0f, ASID or all %.0f\n",
                 RATE(posted_kind[0]), RATE(posted_kind[3]), RATE(posted_kind[1]), RATE(posted_kind[2]));
-        fprintf(stderr, "  remote drop races/s: walking %.0f, filling %.0f, during %.0f\n", RATE(race_kind[0]), RATE(race_kind[1]), RATE(race_kind[2]));
+        fprintf(stderr, "  remote drop races/s: walking %.0f, filling %.0f, during %.0f; walks elsewhere let through %.0f\n", RATE(race_kind[0]),
+                RATE(race_kind[1]), RATE(race_kind[2]), RATE(race_other_page));
         {
             static const char *kn[16] = {"copy", "pcrel", "branch", "branch-reg", "eret", "literal", "memory", "prefetch",
                                          "exception", "sysreg", "sys", "barrier", "wait", "pac", "undef", "?"};
@@ -737,10 +747,20 @@ static void print_stats(HvCpu *cpu, int force) {
 }
 
 /* Fill the slot of the chainable exit a block just left through, so it jumps
-   straight to b next time. Chains never need undoing: both blocks are in the
-   same 16 KB page, so when that page's code is invalidated the stale blocks are
-   only reachable from each other, and the exit_req check before every chained
-   jump gets a block that just wrote its own page back to the dispatcher. */
+   straight to b next time. Chains in a page never need undoing: both blocks are
+   in the same (4 KB) page, so when that page's code is invalidated the stale blocks
+   are only reachable from each other, and the exit_req check before every chained
+   jump gets a block that just wrote its own page back to the dispatcher. Exits
+   from another page are recorded so hv_invalidate_code can unchain them. */
+/* A stub's B just became a B to the chained block. HV_FAST_ICACHE (Henge a47f5e1): drop the line without waiting for
+   every CPU, as Arm lets a CPU run a B while it changes into another B; one that still runs the old one goes to the
+   stub, which follows the slot (stored first). The conditional branch below, and unchaining (hv_invalidate_code),
+   whose old target must not run any more, keep the full wait. */
+static void finish_chain_site(HvMachine *m, uint32_t *site) {
+    if (hv_knob[HV_K_FASTICACHE]) hv_jit_finish_branch(&m->jit, site);
+    else hv_jit_finish(&m->jit, site, 1);
+}
+
 static void chain(HvMachine *m, uint64_t *slot, HvBlock *b) {
     uint32_t idx = (uint32_t)(slot - m->slots);
     if (m->gen_checks && (b->jit_gen != m->jit_gen || (m->slot_site[idx] && (uint64_t)(m->slot_site[idx] - m->jit.base) >= m->jit.used)))
@@ -758,14 +778,20 @@ static void chain(HvMachine *m, uint64_t *slot, HvBlock *b) {
             return;
         }
         m->slot_xpa[idx] = page_pa | 1;
-        m->xchained[m->nxchained++] = idx;
+        if (hv_knob[HV_K_XCHAINPAGES] && b->ram->xhead) { /* on the target page's list (hv_invalidate_code) */
+            m->slot_xnext[idx] = b->ram->xhead[b->pg];
+            b->ram->xhead[b->pg] = idx + 1;
+            m->xlist_used = 1;
+        } else {
+            m->xchained[m->nxchained++] = idx;
+        }
         __atomic_store_n(slot, (uint64_t)(uintptr_t)b->code, __ATOMIC_RELEASE);
         uint32_t *site = m->slot_site[idx];
         int64_t off = site ? b->code - site : 0;
         if (site && off >= -(1 << 25) && off < (1 << 25)) {
             uint32_t insn = 0x14000000u | (uint32_t)(off & 0x3ffffff);
             hv_jit_write(&m->jit, site, &insn, 4);
-            hv_jit_finish(&m->jit, site, 1);
+            finish_chain_site(m, site);
         }
         m->stats.chained++;
         if (m->stats_interval) m->stats.xchained++;
@@ -779,7 +805,7 @@ static void chain(HvMachine *m, uint64_t *slot, HvBlock *b) {
     if (site && off >= -(1 << 25) && off < (1 << 25)) {
         uint32_t insn = 0x14000000u | (uint32_t)(off & 0x3ffffff);
         hv_jit_write(&m->jit, site, &insn, 4);
-        hv_jit_finish(&m->jit, site, 1);
+        finish_chain_site(m, site);
     }
     uint32_t *cond = m->slot_cond[idx];
     if (cond) { /* the conditional branch to that stub, too */

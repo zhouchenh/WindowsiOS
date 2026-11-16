@@ -65,6 +65,7 @@ void hv_ijc_drop_asid(HvCpu *cpu, uint16_t asid);
 /* TTBR0 changed: use the new address space's user entries. */
 void hv_ijc_switch(HvCpu *cpu);
 void hv_tlb_flush_va_asid(HvCpu *cpu, uint64_t va, int asid); /* asid -1: every address space */
+void hv_tlb_flush_va_page(HvCpu *cpu, uint64_t va, int asid); /* a TLBI of one page: stashes may lose just it */
 void hv_ijc_drop_va(HvCpu *cpu, uint64_t va, int asid);
 /* Translated code's TLB miss: walk and fill without the full helper (see mmu.c). */
 int hv_tlb_refill(HvCpu *cpu, uint64_t va, uint32_t flags);
@@ -78,12 +79,14 @@ void *hv_ijc_resolve(HvCpu *cpu, uint64_t va, uint32_t flags);
 /* asid -1: all. 1: done; 0: raced the target's own page walk or cache fill
    (try again); -1: the target has to do it itself. */
 int hv_tlbi_drop_remote_va(HvCpu *target, uint64_t va, int asid);       /* just the cached branch targets in the page */
+/* Whether target's page walks while its walk_seq went from s1 to s2 cannot have refilled the npages from va (mmu.c). */
+int hv_walks_elsewhere(HvCpu *target, uint32_t s1, uint32_t s2, uint64_t va, uint64_t npages);
 void hv_ijc_drop_range(HvCpu *cpu, uint64_t va, uint64_t len, int asid);
 void hv_ucode_add(HvCpu *cpu, uint64_t va); /* a user target was cached in this page (current address space) */
 void hv_tlb_protect_code(HvCpu *cpu, const uint8_t *host_page);
 void hv_tlb_protect_code_page(HvCpu *cpu, struct HvRam *ram, uint64_t pg); /* the same, through the page's write hints */
 
-/* Translates for a C access of `len` bytes that stays inside one 16 KB page,
+/* Translates for a C access of `len` bytes that stays inside one (4 KB) TLB page,
    filling the TLB when the page is ordinary RAM. Returns 0 and sets *pa, or the
    fault status code. */
 uint32_t hv_mmu_access(HvCpu *cpu, uint64_t va, HvAccess acc, int el, uint64_t *pa);
