@@ -76,8 +76,13 @@ $(B)/libresolv_no_ipv6.dylib: tests/resolv_no_ipv6.c | $(B)
 $(B)/test_net_ipv6: tests/test_net_ipv6.c host/net_slirp.c host/dns_proxy.c host/*.h $(B)/libresolv_no_ipv6.dylib | $(B)
 	$(CC) $(CFLAGS) $(SLIRP_CFLAGS) tests/test_net_ipv6.c host/net_slirp.c host/dns_proxy.c \
 	      $(B)/libresolv_no_ipv6.dylib -Wl,-rpath,@executable_path $(SLIRP_LIBS) -lresolv -o $@
-test-net: $(B)/test_net_ipv6
+# Port forwards (TCP and UDP, IPv4 and IPv6, loopback / local network / VPN, add, edit, remove, port in use, the saved
+# list) through libslirp to a stand-in guest that echoes: no network needed.
+$(B)/test_net_fwd: tests/test_net_fwd.c host/net_slirp.c host/dns_proxy.c host/*.h | $(B)
+	$(CC) $(CFLAGS) $(SLIRP_CFLAGS) tests/test_net_fwd.c host/net_slirp.c host/dns_proxy.c $(SLIRP_LIBS) -lresolv -o $@
+test-net: $(B)/test_net_ipv6 $(B)/test_net_fwd
 	$(B)/test_net_ipv6
+	$(B)/test_net_fwd
 
 $(B)/hvsparse: tools/hvsparse_main.c host/hvsparse.c host/hvsparse.h | $(B)
 	$(CC) $(CFLAGS) tools/hvsparse_main.c host/hvsparse.c -o $@
