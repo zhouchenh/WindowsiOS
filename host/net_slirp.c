@@ -32,6 +32,7 @@
 #include <netinet/tcp.h>
 #include <poll.h>
 #include <pthread.h>
+#include <stdatomic.h>
 #include <libslirp.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -246,6 +247,17 @@ static const SlirpCb callbacks = {
 #define FWD_PERIOD_MS 3000
 #define UDP_PEERS 32
 #define UDP_IDLE_MS 120000
+#define BRIDGE_PUMPS 64 /* TCP connections one IPv6 relay carries at once; more are refused */
+
+/* How many connections of one relay are being pumped; shared by the relay and its pump threads, which
+   may outlive it (refs). */
+typedef struct PumpCount {
+    _Atomic int live, refs;
+} PumpCount;
+
+static void pumps_release(PumpCount *pc) {
+    if (pc && atomic_fetch_sub(&pc->refs, 1) == 1) free(pc);
+}
 
 typedef struct Bridge {
     int udp;
@@ -253,6 +265,8 @@ typedef struct Bridge {
     int stop[2];
     struct sockaddr_in target; /* libslirp's IPv4 listener */
     pthread_t thread;
+    _Atomic int dead; /* the socket broke: the network thread opens the forward again (fwd_reconcile) */
+    PumpCount *pumps;
 } Bridge;
 
 typedef struct Applied { /* what is open for a rule: network thread only */
@@ -628,7 +642,13 @@ static void no_sigpipe(int fd) {
 typedef struct Pump {
     int a;
     struct sockaddr_in target;
+    PumpCount *pumps;
 } Pump;
+
+static void pump_done(Pump *p) {
+    atomic_fetch_sub(&p->pumps->live, 1);
+    pumps_release(p->pumps);
+}
 
 /* One TCP connection: connect to the IPv4 listener, then copy both ways until both sides are done. */
 static void *pump_thread(void *arg) {
@@ -637,11 +657,13 @@ static void *pump_thread(void *arg) {
     int b = socket(AF_INET, SOCK_STREAM, 0);
     if (b < 0) {
         close(p.a);
+        pump_done(&p);
         return NULL;
     }
     no_sigpipe(b);
     if (connect(b, (struct sockaddr *)&p.target, sizeof p.target) != 0) {
         close(p.a), close(b);
+        pump_done(&p);
         return NULL;
     }
     int one = 1;
@@ -679,36 +701,54 @@ static void *pump_thread(void *arg) {
         if (bad) break;
     }
     close(p.a), close(b);
+    pump_done(&p);
     return NULL;
 }
 
 static void *tcp_bridge_thread(void *arg) {
     Bridge *br = arg;
-    int dead = 0; /* the socket broke (iOS reclaims a suspended app's listeners): wait for hv_net_fwd_reopen */
+    int dead = 0;    /* the socket broke (iOS reclaims a suspended app's listeners): the network thread reopens it */
+    int backoff = 0; /* out of descriptors or memory for now: the waiting connections stay queued meanwhile */
     for (;;) {
-        struct pollfd fds[2] = {{dead ? -1 : br->fd, POLLIN, 0}, {br->stop[0], POLLIN, 0}};
-        if (poll(fds, 2, -1) < 0) {
+        struct pollfd fds[2] = {{dead || backoff ? -1 : br->fd, POLLIN, 0}, {br->stop[0], POLLIN, 0}};
+        int n = poll(fds, 2, backoff ? 200 : -1);
+        if (n < 0) {
             if (errno == EINTR) continue;
             break;
         }
         if (fds[1].revents) break;
-        if (fds[0].revents & (POLLERR | POLLNVAL)) dead = 1;
+        if (backoff) {
+            backoff = 0;
+            continue;
+        }
+        if (fds[0].revents & (POLLERR | POLLNVAL)) dead = 1, atomic_store(&br->dead, 1);
         if (!(fds[0].revents & POLLIN)) continue;
         int c = accept(br->fd, NULL, NULL);
         if (c < 0) {
-            if (errno != EAGAIN && errno != EINTR && errno != ECONNABORTED) dead = 1;
-            continue;
+            if (errno == EMFILE || errno == ENFILE || errno == ENOBUFS || errno == ENOMEM) backoff = 1;
+            else if (errno == EBADF || errno == EINVAL || errno == ENOTSOCK) dead = 1, atomic_store(&br->dead, 1);
+            continue; /* EAGAIN, EINTR, ECONNABORTED...: the next one */
         }
         no_sigpipe(c);
+        if (atomic_load(&br->pumps->live) >= BRIDGE_PUMPS) { /* a peer opening connection after connection */
+            close(c);
+            continue;
+        }
         Pump *p = malloc(sizeof *p);
         pthread_t t;
         if (!p) {
             close(c);
             continue;
         }
-        p->a = c, p->target = br->target;
-        if (pthread_create(&t, NULL, pump_thread, p) == 0) pthread_detach(t);
-        else free(p), close(c);
+        p->a = c, p->target = br->target, p->pumps = br->pumps;
+        atomic_fetch_add(&br->pumps->live, 1);
+        atomic_fetch_add(&br->pumps->refs, 1);
+        if (pthread_create(&t, NULL, pump_thread, p) == 0) {
+            pthread_detach(t);
+        } else {
+            pump_done(p);
+            free(p), close(c);
+        }
     }
     return NULL;
 }
@@ -734,14 +774,14 @@ static void *udp_bridge_thread(void *arg) {
         if (poll(fds, 2 + UDP_PEERS, 1000) < 0 && errno != EINTR) break;
         if (fds[0].revents) break;
         int64_t now = now_ms();
-        if (fds[1].revents & POLLNVAL) dead = 1;
+        if (fds[1].revents & POLLNVAL) dead = 1, atomic_store(&br->dead, 1);
         if (fds[1].revents & (POLLIN | POLLERR)) {
             struct sockaddr_in6 from;
             socklen_t fl = sizeof from;
             ssize_t n = recvfrom(br->fd, buf, sizeof buf, 0, (struct sockaddr *)&from, &fl);
             if (n < 0 && errno != EAGAIN && errno != EINTR && errno != ECONNREFUSED && errno != EHOSTUNREACH &&
-                errno != ENETUNREACH)
-                dead = 1;
+                errno != ENETUNREACH && errno != ENOBUFS && errno != ENOMEM)
+                dead = 1, atomic_store(&br->dead, 1);
             if (n >= 0 && from.sin6_family == AF_INET6) {
                 int k = -1, oldest = 0;
                 for (int i = 0; i < UDP_PEERS; i++) {
@@ -808,12 +848,15 @@ static Bridge *bridge_start(int udp, const struct in6_addr *a6, int port, struct
     }
     fcntl(fd, F_SETFL, fcntl(fd, F_GETFL) | O_NONBLOCK);
     Bridge *br = calloc(1, sizeof *br);
-    if (!br || pipe(br->stop) != 0) {
+    PumpCount *pc = calloc(1, sizeof *pc);
+    if (!br || !pc || pipe(br->stop) != 0) {
         *err = ENOMEM;
-        free(br);
+        free(br), free(pc);
         close(fd);
         return NULL;
     }
+    atomic_store(&pc->refs, 1);
+    br->pumps = pc;
     br->udp = udp, br->fd = fd;
     br->target.sin_len = sizeof br->target;
     br->target.sin_family = AF_INET;
@@ -822,6 +865,7 @@ static Bridge *bridge_start(int udp, const struct in6_addr *a6, int port, struct
     if (pthread_create(&br->thread, NULL, udp ? udp_bridge_thread : tcp_bridge_thread, br) != 0) {
         *err = EAGAIN;
         close(br->stop[0]), close(br->stop[1]), close(fd);
+        pumps_release(br->pumps);
         free(br);
         return NULL;
     }
@@ -836,7 +880,13 @@ static void bridge_stop(Bridge *br) {
     (void)!write(br->stop[1], &c, 1);
     pthread_join(br->thread, NULL);
     close(br->fd), close(br->stop[0]), close(br->stop[1]);
+    pumps_release(br->pumps);
     free(br);
+}
+
+/* A relay of this forward broke (network thread). */
+static int bridge_dead(const Applied *ap) {
+    return (ap->tcp6 && atomic_load(&ap->tcp6->dead)) || (ap->udp6 && atomic_load(&ap->udp6->dead));
 }
 
 /* ---- the device's interfaces ---- */
@@ -1557,7 +1607,8 @@ static void fwd_reconcile(int periodic) {
             snprintf(o[i].state, sizeof o[i].state, "error");
             snprintf(o[i].code, sizeof o[i].code, "%s", w[i].code);
             snprintf(o[i].msg, sizeof o[i].msg, "%s", w[i].msg);
-        } else if (!s[i].reopen && (same_place(ap, c, &w[i]) || (!ap->on && s[i].errored && !s[i].dirty && !periodic))) {
+        } else if (!s[i].reopen && !bridge_dead(ap) &&
+                   (same_place(ap, c, &w[i]) || (!ap->on && s[i].errored && !s[i].dirty && !periodic))) {
             act[i] = 0; /* as it is (a failed one is tried again on the timer, or when it is changed) */
         } else {
             if (ap->on) fwd_teardown(ap);

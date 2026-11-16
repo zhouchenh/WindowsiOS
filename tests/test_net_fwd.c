@@ -27,6 +27,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/resource.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
@@ -726,6 +727,56 @@ static int scenario_store_priority(void) {
     return failures != 0;
 }
 
+/* The IPv6 relay runs out of descriptors (accept: EMFILE) under a flood of connections: once some are free
+   again it takes connections again, by itself (it used to stop for good, still shown as listening). */
+static int scenario_emfile(void) {
+    char path[512];
+    store_file(path, sizeof path, "emfile.json");
+    unsetenv("HV_NET_FWD");
+    setenv("HV_NET_VPN_IF", "nothing", 1);
+    check("emfile: store", hv_net_fwd_set_store(path) == 0);
+    start_net();
+    int p = free_port();
+    put(rule("flood", HV_FWD_TCP, p, 7, HV_FWD_LOOPBACK));
+    check("emfile: listening", wait_for("flood", "\"state\":\"listening\"", 3000));
+    check("emfile: works over IPv6", tcp_echo("::1", p));
+    struct rlimit old, low;
+    getrlimit(RLIMIT_NOFILE, &old);
+    int probe = dup(0);
+    close(probe);
+    low = old;
+    low.rlim_cur = (rlim_t)probe + 40;
+    setrlimit(RLIMIT_NOFILE, &low);
+    int fds[256], n = 0;
+    struct sockaddr_storage ss;
+    socklen_t sl = make_addr(&ss, "::1", p);
+    for (int64_t end = now_ms() + 3000; n < 256 && now_ms() < end;) { /* until no descriptor is left anywhere */
+        int fd = socket(AF_INET6, SOCK_STREAM, 0);
+        if (fd < 0) {
+            usleep(20 * 1000);
+            continue;
+        }
+        if (connect(fd, (struct sockaddr *)&ss, sl) != 0) {
+            close(fd);
+            usleep(20 * 1000);
+            continue;
+        }
+        fds[n++] = fd;
+    }
+    usleep(500 * 1000); /* the relay meets EMFILE meanwhile */
+    for (int i = 0; i < n; i++) close(fds[i]);
+    setrlimit(RLIMIT_NOFILE, &old);
+    int ok = 0;
+    for (int64_t end = now_ms() + 5000; !ok && now_ms() < end;) {
+        ok = tcp_echo("::1", p);
+        if (!ok) usleep(200 * 1000);
+    }
+    check("emfile: the relay takes connections again", ok);
+    printf("fwd (emfile, %d connections): %d failures\n", n, failures);
+    fflush(stdout);
+    return failures != 0;
+}
+
 static int scenario_bad_store(void) {
     char path[512], moved[600];
     store_file(path, sizeof path, "bad.json");
@@ -784,8 +835,9 @@ int main(void) {
     const char *tmp = getenv("TMPDIR");
     snprintf(dir, sizeof dir, "%s/test_net_fwd.XXXXXX", tmp && *tmp ? tmp : "/tmp");
     if (!mkdtemp(dir)) return 2;
-    int (*scenarios[])(void) = {scenario_rules, scenario_bad_store, scenario_rules_off, scenario_utf8, scenario_store_priority};
-    const char *names[] = {"rules", "damaged store", "HV_NET_FWD_RULES=0", "UTF-8 names", "store priority"};
+    int (*scenarios[])(void) = {scenario_rules, scenario_bad_store, scenario_rules_off, scenario_utf8, scenario_store_priority,
+                                scenario_emfile};
+    const char *names[] = {"rules", "damaged store", "HV_NET_FWD_RULES=0", "UTF-8 names", "store priority", "EMFILE"};
     int bad = 0;
     for (int i = 0; i < (int)(sizeof scenarios / sizeof *scenarios); i++) {
         fflush(stdout);
