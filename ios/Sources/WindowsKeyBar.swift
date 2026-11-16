@@ -25,6 +25,8 @@ final class WindowsKeyState {
 
     private var downKey: UInt8?
     private var downMods: [UInt8] = []
+    /// Which bar key put downKey down (nil: no particular one).
+    private var downOwner: ObjectIdentifier?
     private(set) var keyEventsSent = 0
 
     private var bridge: WinIOSBridge { WinIOSBridge.shared }
@@ -75,15 +77,23 @@ final class WindowsKeyState {
     }
 
     /// The key goes down in Windows (and stays down, repeating, until keyUp). mods: its own modifiers,
-    /// or nil for the active ones.
-    func keyDown(_ usage: UInt8, mods own: [UInt8]? = nil) {
+    /// or nil for the active ones. owner: the bar key holding it, whose keyUp(owner:) lifts it.
+    func keyDown(_ usage: UInt8, mods own: [UInt8]? = nil, owner: ObjectIdentifier? = nil) {
         releaseDownKey()
         let mods = own ?? activeModifiers
         for m in mods { bridge.sendKeyHid(m, down: true) }
         bridge.sendKeyHid(usage, down: true)
         downKey = usage
         downMods = mods
+        downOwner = owner
         keyEventsSent += 1
+    }
+
+    /// The bar key `owner` was let go: lifts the down key only if that key still holds it. Another key held
+    /// meanwhile took the slot (and lifted this one): its finger is still down, so it stays down.
+    func keyUp(owner: ObjectIdentifier) {
+        guard downOwner == owner else { return }
+        keyUp()
     }
 
     func keyUp() {
@@ -93,6 +103,7 @@ final class WindowsKeyState {
         let usedLatches = downMods.contains { latch(of: $0) == .once }
         downKey = nil
         downMods = []
+        downOwner = nil
         if usedLatches { consumeOnce() }
     }
 
@@ -556,7 +567,7 @@ final class WindowsKeyBar: UIView {
                 guard let self else { return }
                 self.holdTimers[id] = nil
                 self.holding.insert(id)
-                self.press(b.key.kind, down: true)
+                self.press(b.key.kind, down: true, owner: id)
             }
         }
     }
@@ -572,9 +583,9 @@ final class WindowsKeyBar: UIView {
         case .modifier(let m):
             if wasHeld { keys.holdModifier(m, down: false) } else { keys.tapModifier(m) }
         case .key(let u):
-            if wasHeld { press(b.key.kind, down: false) } else { keys.tap(u) }
+            if wasHeld { press(b.key.kind, down: false, owner: id) } else { keys.tap(u) }
         case .combo(let mods, let u):
-            if wasHeld { press(b.key.kind, down: false) } else { keys.combo(mods, u) }
+            if wasHeld { press(b.key.kind, down: false, owner: id) } else { keys.combo(mods, u) }
         }
     }
 
@@ -587,15 +598,15 @@ final class WindowsKeyBar: UIView {
         guard wasHeld else { return }
         switch b.key.kind {
         case .modifier(let m): keys.holdModifier(m, down: false)
-        case .key, .combo: press(b.key.kind, down: false)
+        case .key, .combo: press(b.key.kind, down: false, owner: id)
         case .action: break
         }
     }
 
-    private func press(_ kind: BarKey.Kind, down: Bool) {
+    private func press(_ kind: BarKey.Kind, down: Bool, owner: ObjectIdentifier) {
         switch kind {
-        case .key(let u): down ? keys.keyDown(u) : keys.keyUp()
-        case .combo(let mods, let u): down ? keys.keyDown(u, mods: mods) : keys.keyUp()
+        case .key(let u): down ? keys.keyDown(u, owner: owner) : keys.keyUp(owner: owner)
+        case .combo(let mods, let u): down ? keys.keyDown(u, mods: mods, owner: owner) : keys.keyUp(owner: owner)
         default: break
         }
     }
