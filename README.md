@@ -27,8 +27,30 @@ instead.
 off). Addresses, DNS, port forwards, why there is no bridged mode and what to use instead:
 [docs/networking.md](docs/networking.md).
 
-**Clipboard:** text copied in Windows is on the iPhone's clipboard, and the toolbar's paste button
-sends the iPhone's to Windows (WinKit's clipboard helper): [docs/clipboard.md](docs/clipboard.md).
+**On the Duo:**
+
+- **Display:** Windows is sized in the panel's native pixels with its own scale (Settings > Display:
+  Display Size, Sharpness Sharp or Balanced, frame rate, each remembered per screen: inner, laptop
+  lid, cover), applied live by WinKit's helper; the picture is drawn on whole pixels, the last frame
+  is held while Windows takes a new size, and the display idles when nothing changes. Settings >
+  Status shows what was asked, what Windows took and what it costs.
+  [`DisplaySettings.swift`](ios/Sources/DisplaySettings.swift), [`WinKitDisplay.cs`](winkit/WinKitDisplay.cs).
+- **Chrome:** standard toolbar items (in the Duo's vertical bar), immersive full screen per posture
+  (four-finger tap or an edge swipe brings the controls back), the fold split for Laptop with a
+  full-bleed lid, and a Settings sidebar. [`SessionChrome.swift`](ios/Sources/SessionChrome.swift).
+- **Keyboard:** a Windows key bar over the iPhone keyboard, the picture pans instead of shrinking
+  when the keyboard comes up, the keyboard comes up in Windows text boxes and follows the cursor
+  (WinKit's focus agent), Chinese, accents and emoji type directly; a pinch zooms the Windows app
+  (Ctrl + wheel), a three-finger double-tap zooms the picture itself, with a mini-map.
+  [`TextInputBridge.swift`](ios/Sources/TextInputBridge.swift), [`FocusAgent.cs`](winkit/FocusAgent.cs).
+- **Port forwarding:** Settings > Network forwards TCP/UDP ports to Windows for this iPhone, the
+  local network or a VPN, saved per machine (`HV_NET_FWD` in `env.txt` still works, `lan:` and
+  `vpn:` forms included); WinKit's `REMOTE-DESKTOP.bat` and `SSH-SETUP.bat` set Windows up for it.
+  [docs/networking.md](docs/networking.md#port-forwards).
+- **Clipboard:** text copied in Windows is on the iPhone's clipboard, and the toolbar's paste button
+  sends the iPhone's to Windows (WinKit's clipboard helper): [docs/clipboard.md](docs/clipboard.md).
+- **WinKit:** one run of `START.bat` in Windows installs or updates all the helpers above:
+  [winkit/README.md](winkit/README.md) (in Chinese).
 
 **Licences and credits:** the source is GPL-2.0-or-later ([`LICENSE`](LICENSE)), from the projects
 above. Built apps may also contain unmodified frameworks from [UTM](https://github.com/utmapp/UTM)'s
