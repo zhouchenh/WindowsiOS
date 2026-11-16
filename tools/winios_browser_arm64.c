@@ -33,6 +33,8 @@ typedef uintptr_t SOCKET;
 #define SO_SNDTIMEO          0x1005
 #define SO_RCVTIMEO          0x1006
 #define SD_SEND              1
+#define SD_BOTH              2
+#define INFINITE             0xFFFFFFFFU
 #define CP_UTF8              65001U
 #define CREATE_NO_WINDOW     0x08000000U
 #define FILE_APPEND_DATA     0x0004U
@@ -52,6 +54,17 @@ typedef struct {
     uint32_t sin_addr;
     uint8_t  sin_zero[8];
 } SockAddrIn;
+
+/* Winsock fd_set / timeval (Windows LLP64: `long` is 32-bit) */
+typedef struct {
+    uint32_t fd_count;
+    SOCKET   fd_array[64];
+} FdSet;
+
+typedef struct {
+    int32_t tv_sec;
+    int32_t tv_usec;
+} TimeVal;
 
 typedef struct {
     int16_t  sin6_family;
@@ -134,6 +147,8 @@ __declspec(dllimport) int    send(SOCKET s, const char *buf, int len, int flags)
 __declspec(dllimport) int    recv(SOCKET s, char *buf, int len, int flags);
 __declspec(dllimport) int    shutdown(SOCKET s, int how);
 __declspec(dllimport) int    closesocket(SOCKET s);
+__declspec(dllimport) int    select(int nfds, FdSet *readfds, FdSet *writefds, FdSet *exceptfds,
+                                    const TimeVal *timeout);
 
 static void mem_zero(void *p, size_t n) {
     uint8_t *b = (uint8_t *)p;
@@ -147,6 +162,10 @@ static size_t str_len(const char *s) {
 }
 
 static volatile uint64_t g_relay_finish_at = 0;
+/* Relay client threads still running; the relay process waits for them before it exits. */
+static volatile int32_t g_relay_active_clients = 0;
+/* Set once this relay has sent /.henge/oauth-done. */
+static volatile int32_t g_oauth_done_sent = 0;
 
 static char to_lower_c(char c) {
     return (c >= 'A' && c <= 'Z') ? (char)(c + 32) : c;
@@ -442,6 +461,45 @@ static DWORD oauth_done_notify_thread(void *arg) {
     return 0;
 }
 
+/* Is `name` a parameter of the query string q[0..qlen) (`name=` at the start or after `&`/`;`)? */
+static int query_has_param(const char *q, size_t qlen, const char *name) {
+    size_t nlen = str_len(name);
+    size_t i = 0;
+    while (i < qlen) {
+        size_t j = 0;
+        while (j < nlen && i + j < qlen && to_lower_c(q[i + j]) == name[j]) j++;
+        if (j == nlen && i + j < qlen && q[i + j] == '=') return 1;
+        while (i < qlen && q[i] != '&' && q[i] != ';') i++;
+        i++;
+    }
+    return 0;
+}
+
+/*
+ * Does this HTTP request line ("GET /path?query HTTP/1.1") look like an OAuth redirect_uri
+ * callback? The query must carry `code` or `error` as a parameter (RFC 6749 4.1.2), and either
+ * `state` too or a path naming a callback/redirect. Ordinary localhost traffic such as
+ * `/api/auth/session` or `?zipcode=` does not count, so it does not close the Safari sheet.
+ */
+static int is_oauth_callback_request_line(const char *line, size_t len) {
+    size_t t = 0;
+    while (t < len && line[t] != ' ') t++;
+    while (t < len && line[t] == ' ') t++;
+    size_t end = t;
+    while (end < len && line[end] != ' ') end++;
+    size_t q = t;
+    while (q < end && line[q] != '?') q++;
+    if (q >= end) return 0;
+    const char *query = line + q + 1;
+    size_t qlen = end - q - 1;
+    if (!query_has_param(query, qlen, "code") && !query_has_param(query, qlen, "error")) return 0;
+    if (query_has_param(query, qlen, "state")) return 1;
+    const char *path = line + t;
+    size_t plen = q - t;
+    return mem_contains_ci(path, plen, "callback") || mem_contains_ci(path, plen, "redirect") ||
+           mem_contains_ci(path, plen, "oauth");
+}
+
 static DWORD pump_stream_thread(void *arg) {
     PumpCtx *ctx = (PumpCtx *)arg;
     char *buf = (char *)HeapAlloc(GetProcessHeap(), 0, 16384);
@@ -454,14 +512,11 @@ static DWORD pump_stream_thread(void *arg) {
         if (first) {
             first = 0;
             size_t line_len = 0;
-            while (line_len < (size_t)n && line_len < 1024 && buf[line_len] != '\r' && buf[line_len] != '\n') {
+            while (line_len < (size_t)n && line_len < 8192 && buf[line_len] != '\r' && buf[line_len] != '\n') {
                 line_len++;
             }
             if (ctx->inspect_request) {
-                if (mem_contains_ci(buf, line_len, "/auth") ||
-                    mem_contains_ci(buf, line_len, "/oauth") ||
-                    mem_contains_ci(buf, line_len, "callback") ||
-                    mem_contains_ci(buf, line_len, "code=")) {
+                if (is_oauth_callback_request_line(buf, line_len)) {
                     *(ctx->is_oauth) = 1;
                 }
             } else if (*(ctx->is_oauth)) {
@@ -540,6 +595,7 @@ static DWORD relay_client_thread(void *arg) {
     if (upstream == INVALID_SOCKET) {
         log_line("relay_upstream_connect_failed", "");
         closesocket(client);
+        __atomic_fetch_sub(&g_relay_active_clients, 1, __ATOMIC_SEQ_CST);
         return 0;
     }
 
@@ -548,11 +604,21 @@ static DWORD relay_client_thread(void *arg) {
     PumpCtx c2u = { client, upstream, &is_oauth, &done_signal, 1 };
     PumpCtx u2c = { upstream, client, &is_oauth, &done_signal, 0 };
 
+    /* The pumps use c2u/u2c, is_oauth and done_signal on this stack and both sockets, so this
+     * thread must not return or close the sockets until both have ended. They end on their own
+     * (peer shutdown, or 30 s without data through SO_RCVTIMEO), so wait without a timeout. If
+     * only one could be started, shut both sockets down so it stops, then wait for it. */
     HANDLE th[2];
     th[0] = CreateThread(NULL, 0, pump_stream_thread, &c2u, 0, NULL);
     th[1] = CreateThread(NULL, 0, pump_stream_thread, &u2c, 0, NULL);
     if (th[0] && th[1]) {
-        WaitForMultipleObjects(2, th, 1, 60000);
+        WaitForMultipleObjects(2, th, 1, INFINITE);
+    } else {
+        shutdown(client, SD_BOTH);
+        shutdown(upstream, SD_BOTH);
+        for (int i = 0; i < 2; i++) {
+            if (th[i]) WaitForMultipleObjects(1, &th[i], 1, INFINITE);
+        }
     }
     if (th[0]) CloseHandle(th[0]);
     if (th[1]) CloseHandle(th[1]);
@@ -560,7 +626,8 @@ static DWORD relay_client_thread(void *arg) {
     closesocket(upstream);
     closesocket(client);
 
-    if (done_signal) {
+    /* Signal the host at most once per relay. */
+    if (done_signal && !__atomic_exchange_n(&g_oauth_done_sent, 1, __ATOMIC_SEQ_CST)) {
         log_line("oauth_callback_done_signaling_host", "");
         g_relay_finish_at = GetTickCount64() + 4000ULL;
         HANDLE nt = CreateThread(NULL, 0, oauth_done_notify_thread, NULL, 0, NULL);
@@ -569,6 +636,7 @@ static DWORD relay_client_thread(void *arg) {
             CloseHandle(nt);
         }
     }
+    __atomic_fetch_sub(&g_relay_active_clients, 1, __ATOMIC_SEQ_CST);
     return 0;
 }
 
@@ -591,13 +659,26 @@ static void run_relay_server(uint16_t port) {
     u32_to_dec(port, pstr);
     log_line("relay_listening_10.0.2.15:", pstr);
 
-    DWORD accept_tmo = 2000;
-    setsockopt(srv, SOL_SOCKET, SO_RCVTIMEO, &accept_tmo, sizeof(accept_tmo));
-
+    /* Winsock's SO_RCVTIMEO does not apply to accept(), so wait for connections with select()
+     * and a short timeout: the idle deadline and the finish time are then really checked, and a
+     * finished relay frees the port for the next sign-in instead of taking its callback. */
     uint64_t deadline = GetTickCount64() + 30ULL * 60ULL * 1000ULL;
-    while (GetTickCount64() < deadline) {
+    for (;;) {
+        uint64_t now = GetTickCount64();
         uint64_t fin = g_relay_finish_at;
-        if (fin != 0 && GetTickCount64() >= fin) break;
+        if (now >= deadline || (fin != 0 && now >= fin)) break;
+
+        FdSet rfds;
+        rfds.fd_count = 1;
+        rfds.fd_array[0] = srv;
+        TimeVal tv = { 0, 250000 };
+        int ready = select(0, &rfds, NULL, NULL, &tv);
+        if (ready < 0) {
+            Sleep(40);
+            continue;
+        }
+        if (ready == 0) continue;
+
         SOCKET cl = accept(srv, NULL, NULL);
         if (cl == INVALID_SOCKET) {
             Sleep(40);
@@ -611,14 +692,23 @@ static void run_relay_server(uint16_t port) {
         }
         rc->client = cl;
         rc->port = port;
+        __atomic_fetch_add(&g_relay_active_clients, 1, __ATOMIC_SEQ_CST);
         HANDLE th = CreateThread(NULL, 0, relay_client_thread, rc, 0, NULL);
         if (th) CloseHandle(th);
         else {
+            __atomic_fetch_sub(&g_relay_active_clients, 1, __ATOMIC_SEQ_CST);
             HeapFree(GetProcessHeap(), 0, rc);
             closesocket(cl);
         }
     }
+    /* Stop listening first so a new relay can take the port, then let the connections already
+     * accepted finish (bounded) instead of cutting them off with ExitProcess. */
     closesocket(srv);
+    uint64_t drain_until = GetTickCount64() + 120000ULL;
+    while (__atomic_load_n(&g_relay_active_clients, __ATOMIC_SEQ_CST) > 0 && GetTickCount64() < drain_until) {
+        Sleep(50);
+    }
+    log_line("relay_exit_port=", pstr);
 }
 
 /* Parse UTF-8 command line into up to 16 arguments */

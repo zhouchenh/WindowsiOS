@@ -129,7 +129,7 @@ GB = $(B)/guest
 GUEST_KERNEL32 = GetCommandLineW GetModuleFileNameW GetTempPathW GetFileAttributesW WideCharToMultiByte \
                  MultiByteToWideChar CreateFileW WriteFile CloseHandle CreateProcessW CreateThread \
                  WaitForMultipleObjects Sleep GetTickCount64 GetProcessHeap HeapAlloc HeapFree ExitProcess
-GUEST_WS2_32 = WSAStartup socket setsockopt bind listen accept connect send recv shutdown closesocket
+GUEST_WS2_32 = WSAStartup socket setsockopt bind listen accept connect send recv shutdown closesocket select
 
 $(GB)/kernel32.lib: Makefile | $(GB)
 	{ echo 'LIBRARY kernel32.dll'; echo 'EXPORTS'; for f in $(GUEST_KERNEL32); do echo "$$f"; done; } > $(GB)/kernel32.def
