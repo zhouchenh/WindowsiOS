@@ -3,12 +3,14 @@
 // %LOCALAPPDATA%\WinKit\WinKitClipboard.exe and starts it at every logon in the user's own session.
 //
 // Windows -> iPhone: a hidden message-only window gets WM_CLIPBOARDUPDATE (AddClipboardFormatListener, no
-//   polling); the text is PUT to http://10.0.2.4/.henge/clipboard?agent=ID&n=K, K counting up.
+//   polling); the text is PUT to http://10.0.2.4/.henge/clipboard?agent=ID&n=K&force=1, K counting up
+//   (force: a new copy here is news even when it is the text the iPhone sent last).
 // iPhone -> Windows: GET /.henge/clipboard?since=N waits in the app (up to 25 s) until the iPhone's
 //   clipboard changes; the text goes on Windows' clipboard, and only then is the next ?since= asked for,
 //   which tells the app that Ctrl+V may follow.
-// Loops: what this helper wrote itself is known by the clipboard's sequence number and its text, and is
-//   not sent back. Text that password managers mark as private (ExcludeClipboardContentFromMonitorProcessing,
+// Loops: what this helper wrote itself is known by the clipboard's sequence number, and is not sent
+//   back; nor is the same text put there again by another program right after (a clipboard manager).
+//   Text that password managers mark as private (ExcludeClipboardContentFromMonitorProcessing,
 //   CanIncludeInClipboardHistory = 0) is not sent at all. Text only, up to 1 MB of UTF-8.
 using System;
 using System.IO;
@@ -52,7 +54,12 @@ namespace WinKit
 
         // Touched only on the window's thread.
         static uint ownSequence;   // the clipboard's sequence number right after this helper wrote it
-        static string lastText;    // what was last sent or received (newlines as \n)
+        static string ownText;     // what it wrote (newlines as \n), and when (Environment.TickCount)
+        static int ownTick;
+        static string queuedText;  // what was last queued for the app, and when: one copy can take
+        static int queuedTick;     //   several WM_CLIPBOARDUPDATEs, which are sent once
+        const int EchoMs = 1500;
+        const int BurstMs = 1000;
 
         // From the receiving thread to the window's.
         static readonly object fromHostLock = new object();
@@ -141,9 +148,15 @@ namespace WinKit
             string text = ReadClipboardText();
             if (text == null) return;
             text = text.Replace("\r\n", "\n");
-            if (text.Length == 0 || text == lastText) return;
+            if (text.Length == 0) return;
+            // Only a moment-long guard by text: the person may copy here, later, the very text the iPhone
+            // sent or that went to the iPhone before, to have it there again.
+            int now = Environment.TickCount;
+            if (text == ownText && unchecked(now - ownTick) < EchoMs) return;     // put back by another program
+            if (text == queuedText && unchecked(now - queuedTick) < BurstMs) return; // the same copy again
             if (Encoding.UTF8.GetByteCount(text) > MaxBytes) { Log("not sent: over 1 MB"); return; }
-            lastText = text;
+            queuedText = text;
+            queuedTick = now;
             lock (toHostLock) toHost = text;
             toHostReady.Set();
         }
@@ -210,7 +223,7 @@ namespace WinKit
                 {
                     try
                     {
-                        HttpWebRequest req = NewRequest(Url + "?agent=" + agentId + "&n=" + n, "PUT", 10000);
+                        HttpWebRequest req = NewRequest(Url + "?agent=" + agentId + "&n=" + n + "&force=1", "PUT", 10000);
                         req.ContentType = "text/plain; charset=utf-8";
                         req.ContentLength = body.Length;
                         using (Stream s = req.GetRequestStream()) s.Write(body, 0, body.Length);
@@ -320,7 +333,8 @@ namespace WinKit
             {
                 CloseClipboard();
                 ownSequence = GetClipboardSequenceNumber();
-                lastText = text.Replace("\r\n", "\n");
+                ownText = text.Replace("\r\n", "\n");
+                ownTick = Environment.TickCount;
             }
         }
 

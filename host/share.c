@@ -818,9 +818,11 @@ static int clipboard_get(Conn *c, Request *r) {
 }
 
 /* What the guest copied. ?agent=ID&n=K (the helper's name for itself and its own count of what it sent)
-   let a PUT that a newer one from the same helper overtook be dropped. 204 with X-Henge-Seq when taken or
-   when nothing changed (empty, the same text, or overtaken); 413 past HV_SHARE_CLIP_MAX, and the
-   connection ends; 400 if it is not UTF-8 text. */
+   let a PUT that a newer one from the same helper overtook be dropped. The text the slot holds already is
+   no change only when the guest sent it too (a repeat); the device's text copied in the guest is the
+   guest's copy now, and &force=1 (a new copy in the guest, as the helper knows from the clipboard's own
+   sequence number) is always a change. 204 with X-Henge-Seq when taken or when nothing changed (empty, a
+   repeat, or overtaken); 413 past HV_SHARE_CLIP_MAX, and the connection ends; 400 if it is not UTF-8. */
 static int clipboard_put(Conn *c, Request *r) {
     if (!r->chunked && r->length > HV_SHARE_CLIP_MAX) {
         r->close = 1; /* the body is not read: the connection ends after the answer */
@@ -861,6 +863,8 @@ static int clipboard_put(Conn *c, Request *r) {
     for (size_t i = 0; a && i + 1 < sizeof agent && a[i] && a[i] != '&'; i++) agent[i] = a[i], agent[i + 1] = 0;
     const char *n = query_value(r->query, "n");
     unsigned long agent_seq = n ? strtoul(n, NULL, 10) : 0;
+    const char *f = query_value(r->query, "force");
+    int force = f && *f == '1';
 
     hv_share_clip_fn notify = NULL;
     void *opaque = NULL;
@@ -873,7 +877,7 @@ static int clipboard_put(Conn *c, Request *r) {
     int counted = agent[0] && agent_seq;
     int overtaken = counted && !strcmp(agent, clip_agent_id) && agent_seq <= clip_agent_seq;
     if (copy && !overtaken) {
-        changed = clip_store_locked(copy, HV_SHARE_CLIP_FROM_GUEST, 0);
+        changed = clip_store_locked(copy, HV_SHARE_CLIP_FROM_GUEST, force || clip_origin == HV_SHARE_CLIP_FROM_DEVICE);
         copy = NULL;
     }
     if (counted && !overtaken) {

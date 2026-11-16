@@ -21,17 +21,23 @@ starts at 0 again when the app starts) and where it came from (`host`: the iPhon
   slot is still at `N`. The helper always has one of these waiting, so the iPhone's text reaches Windows
   at once without asking again and again. Any other `N` (one from before the app restarted, say) is
   answered at once.
-- `PUT /.henge/clipboard?agent=ID&n=K`: what Windows copied. `ID` is the helper's name for itself (new
-  each time it starts), `K` its own count of what it sent; a PUT that a newer one from the same helper
-  overtook is dropped. `204` with the slot's `X-Henge-Seq` when taken, and also when nothing changed
-  (empty, overtaken, or the text the slot holds already). `413` over 1 MB (the connection ends), `400`
-  if it is not UTF-8 or has a NUL. A UTF-8 byte order mark is dropped.
+- `PUT /.henge/clipboard?agent=ID&n=K&force=1`: what Windows copied. `ID` is the helper's name for
+  itself (new each time it starts), `K` its own count of what it sent; a PUT that a newer one from the
+  same helper overtook is dropped. The text the slot holds already is no change when it came from the
+  guest too (a repeat); the iPhone's text copied in Windows is Windows' copy now (the person copied it
+  there to have it back on the iPhone, which may hold something else by then), and `force=1`, which the
+  helper sends for every new copy in Windows, is always a change. `204` with the slot's `X-Henge-Seq`
+  when taken, and also when nothing changed (empty, overtaken, or a repeat). `413` over 1 MB (the
+  connection ends), `400` if it is not UTF-8 or has a NUL. A UTF-8 byte order mark is dropped.
 
-Loops cannot form. The slot ignores text it holds already, so text that came from Windows and goes back
-from the iPhone stops there (except when the person sends it with the paste button: then it is a change
-on purpose, `hv_share_push_clipboard`, because Windows may have copied a picture since). The helper
-remembers the clipboard sequence number (`GetClipboardSequenceNumber`) and the text it wrote itself, and
-does not send those back.
+Loops cannot form. The slot ignores the iPhone's text when it holds that text already, so text that
+came from Windows and goes back from the iPhone stops there (except when the person sends it with the
+paste button: then it is a change on purpose, `hv_share_push_clipboard`, because Windows may have copied
+a picture since). The helper remembers the clipboard sequence number (`GetClipboardSequenceNumber`) of
+what it wrote itself and does not send that back, nor the same text put back by another program within
+1.5 s; the app remembers `UIPasteboard.changeCount` after writing, so what came from Windows is not sent
+back either. Text is not compared otherwise: copying in Windows the text the iPhone sent before brings
+it back to the iPhone.
 
 Ctrl+V after sending waits until Windows really has the text: the helper asks for the next `?since=`
 only once it has put the previous text on Windows' clipboard, so the app waits (up to 2.5 s) until the

@@ -274,7 +274,7 @@ int main(void) {
     CHECK(r.status == 200 && !strcmp(r.origin, "guest"), "origin guest: %s", r.origin);
     free_reply(&r);
 
-    /* Loops stop: the same text again (from either side) is no change. */
+    /* Loops stop: the guest's text again from the guest, or sent back by the device, is no change. */
     r = put_text("/.henge/clipboard?agent=a1&n=2", "from windows \xf0\x9f\x98\x80");
     CHECK(r.status == 204 && r.seq == 3 && heard(NULL) == 1, "same text from the guest: seq %lu heard %d", r.seq, heard(NULL));
     free_reply(&r);
@@ -284,31 +284,48 @@ int main(void) {
     now = hv_share_get_clipboard(&seq, &origin);
     CHECK(seq == 4 && origin == HV_SHARE_CLIP_FROM_DEVICE, "pushed: %lu %d", seq, origin);
     free(now);
+
+    /* The device's text copied in the guest is the guest's copy (the person copied it there to get it
+       back on the device, which may hold something else by now), and so is a forced repeat. */
+    r = put_text("/.henge/clipboard?agent=a1&n=3", "from windows \xf0\x9f\x98\x80");
+    CHECK(r.status == 204 && r.seq == 5 && !strcmp(r.origin, "guest"), "the device's text from the guest: %lu %s", r.seq, r.origin);
+    free_reply(&r);
+    CHECK(heard(&hs) == 2 && hs == 5, "told of it: %d %lu", heard(NULL), hs);
+    r = put_text("/.henge/clipboard?agent=a1&n=4", "from windows \xf0\x9f\x98\x80");
+    CHECK(r.seq == 5, "then a repeat again: %lu", r.seq);
+    free_reply(&r);
+    r = put_text("/.henge/clipboard?agent=a1&n=5&force=1", "from windows \xf0\x9f\x98\x80");
+    CHECK(r.seq == 6 && heard(NULL) == 2, "force=1 is a change (still pending, so not told again): %lu", r.seq);
+    free_reply(&r);
+    taken = hv_share_take_clipboard();
+    CHECK(taken && !strcmp(taken, "from windows \xf0\x9f\x98\x80"), "take the guest's copy");
+    free(taken);
+    CHECK(hv_share_push_clipboard("pushed again") == 7, "the device again");
     CHECK(hv_share_push_clipboard("\xc0\xaf") == 0 && hv_share_push_clipboard("") == 0, "a push is still checked");
 
     /* A PUT overtaken by a newer one from the same helper is dropped; another helper's is not. */
-    r = put_text("/.henge/clipboard?agent=a1&n=5", "five");
-    CHECK(r.seq == 5, "n=5: %lu", r.seq);
+    r = put_text("/.henge/clipboard?agent=a1&n=7", "seven");
+    CHECK(r.seq == 8, "n=7: %lu", r.seq);
     free_reply(&r);
-    r = put_text("/.henge/clipboard?agent=a1&n=4", "four");
-    CHECK(r.status == 204 && r.seq == 5, "n=4 dropped: %lu", r.seq);
+    r = put_text("/.henge/clipboard?agent=a1&n=6", "six");
+    CHECK(r.status == 204 && r.seq == 8, "n=6 dropped: %lu", r.seq);
     free_reply(&r);
     r = put_text("/.henge/clipboard?agent=b2&n=1", "other helper");
-    CHECK(r.seq == 6, "a restarted helper: %lu", r.seq);
+    CHECK(r.seq == 9, "a restarted helper: %lu", r.seq);
     free_reply(&r);
     r = put_text("/.henge/clipboard", "no count");
-    CHECK(r.seq == 7, "without agent/n: %lu", r.seq);
+    CHECK(r.seq == 10, "without agent/n: %lu", r.seq);
     free_reply(&r);
-    /* Told once until the app takes it: five was news, the rest came while it still waited. */
-    CHECK(heard(NULL) == 2, "heard %d", heard(NULL));
+    /* Told once until the app takes it: seven was news, the rest came while it still waited. */
+    CHECK(heard(NULL) == 3, "heard %d", heard(NULL));
 
     /* Empty is no change; a byte order mark is dropped. */
     r = put_text("/.henge/clipboard", "");
-    CHECK(r.status == 204 && r.seq == 7, "empty put");
+    CHECK(r.status == 204 && r.seq == 10, "empty put");
     free_reply(&r);
     r = put_text("/.henge/clipboard", "\xef\xbb\xbf" "bom");
     now = hv_share_get_clipboard(NULL, NULL);
-    CHECK(r.seq == 8 && now && !strcmp(now, "bom"), "bom");
+    CHECK(r.seq == 11 && now && !strcmp(now, "bom"), "bom");
     free(now);
     free_reply(&r);
 
@@ -331,7 +348,7 @@ int main(void) {
     CHECK(r.status == 413, "too large: %d", r.status);
     free_reply(&r);
     r = request("PUT", "/.henge/clipboard", big, HV_SHARE_CLIP_MAX);
-    CHECK(r.status == 204 && r.seq == 9, "exactly the cap: %d %lu", r.status, r.seq);
+    CHECK(r.status == 204 && r.seq == 12, "exactly the cap: %d %lu", r.status, r.seq);
     free_reply(&r);
     {
         int fd = dial();
@@ -351,7 +368,7 @@ int main(void) {
     }
     free(big);
     now = hv_share_get_clipboard(&seq, NULL);
-    CHECK(seq == 9 && now && strlen(now) == HV_SHARE_CLIP_MAX, "slot unchanged by refused PUTs: %lu", seq);
+    CHECK(seq == 12 && now && strlen(now) == HV_SHARE_CLIP_MAX, "slot unchanged by refused PUTs: %lu", seq);
     free(now);
 
     /* Malformed requests: answered or dropped, and the server carries on. */
@@ -363,7 +380,7 @@ int main(void) {
         free_reply(&r);
     }
     r = request("GET", "/.henge/clipboard", NULL, 0);
-    CHECK(r.status == 200 && r.seq == 9, "still serving: %d %lu", r.status, r.seq);
+    CHECK(r.status == 200 && r.seq == 12, "still serving: %d %lu", r.status, r.seq);
     free_reply(&r);
     r = request("DELETE", "/.henge/clipboard", NULL, 0);
     CHECK(r.status == 404, "other methods: %d", r.status);
@@ -381,7 +398,7 @@ int main(void) {
         r = put_text("/.henge/clipboard", i % 2 ? t : "flood"); /* each one a change */
         free_reply(&r);
     }
-    CHECK(heard(&hs) == before + 1 && hs == 10, "flood: heard %d more, seq %lu", heard(NULL) - before, hs);
+    CHECK(heard(&hs) == before + 1 && hs == 13, "flood: heard %d more, seq %lu", heard(NULL) - before, hs);
     taken = hv_share_take_clipboard();
     CHECK(taken && !strcmp(taken, "flood 299"), "the newest after the flood: %s", taken ? taken : "(none)");
     free(taken);
