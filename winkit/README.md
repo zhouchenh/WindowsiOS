@@ -58,11 +58,13 @@ Windows 这边要先把服务打开、把防火墙放行：
    它会打开远程桌面（保留网络级身份验证），并在防火墙里放行 TCP 和 UDP 3389。**只有专业版、企业版、教育版能被远程桌面连接**；
    家庭版会提示改用 SSH、升级到专业版，或者在 Windows 里装一个自带服务器的远程控制软件（例如 VNC 服务器）再自定义转发它的端口。
    然后在 App 里：设置 → 端口转发 → 添加端口转发 → 远程桌面。登录用 Windows 账户的**密码**（PIN 不行；微软账户用它的密码）。
-2. **SSH**：双击 `SSH-SERVER.bat`，权限提示点“是”。它会装上 Windows 自带的 OpenSSH 服务器（要联网下载，可能要几分钟）、设成开机启动，并放行 TCP 22。
+2. **SSH**：先把公钥（每行一个 OpenSSH 公钥）放进 App 文件夹的 `Shared/ssh_authorized_keys.txt`，再双击 `SSH-SETUP.bat`，权限提示点“是”。
+   它会装好 OpenSSH 服务器（只允许密钥登录）、设成开机启动，并放行 TCP 22。
    然后在 App 里添加“SSH”转发（iPhone 上 2222 → Windows 里 22），从其他设备运行 `ssh -p 2222 用户名@App 显示的地址`。
 3. **其他服务**（网页服务器、文件共享等）：App 里有常用预设，也可以“自定义”任意端口；Windows 防火墙需要自己放行对应端口。
 
-- **撤销**：管理员运行 `C:\WinKit\enable_rdp.ps1 -Uninstall` 或 `C:\WinKit\enable_ssh.ps1 -Uninstall`，恢复原来的设置、删除防火墙规则（OpenSSH 服务器只有在是 WinKit 装的时才会卸载）。
+- **撤销**：管理员运行 `C:\WinKit\enable_rdp.ps1 -Uninstall`（远程桌面恢复成原来的设置，删除防火墙规则）或 `C:\WinKit\uninstall_ssh.ps1`
+  （停掉并删除 SSH-SETUP 装的 OpenSSH 服务器和它的防火墙规则；`C:\ProgramData\ssh` 里的密钥保留）。
 - **排查**：App 设置里每条转发都显示状态（正在监听哪些地址、端口被占用、没有 VPN 等）；App 文件夹里的 `winvm.log` 里有 `winvm: net: forward` 开头的记录。
   Windows 里的程序也可以用 `http://10.0.2.4/.henge/forwards` 查看所有转发（JSON）。
 

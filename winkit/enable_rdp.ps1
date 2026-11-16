@@ -58,7 +58,7 @@ if ($edition -like 'Core*' -or $caption -match 'Home') {
     Write-Host ''
     Write-Host 'Windows Home cannot accept Remote Desktop connections (it can only connect to other PCs).' -ForegroundColor Yellow
     Write-Host 'Instead you can:'
-    Write-Host '  - Use SSH: double-click SSH-SERVER.bat, then forward SSH in the app (Settings > Port forwarding).'
+    Write-Host '  - Use SSH: double-click SSH-SETUP.bat, then forward SSH in the app (Settings > Port forwarding).'
     Write-Host '  - Upgrade to Windows Pro: Settings > System > Activation > Upgrade your edition of Windows.'
     Write-Host '  - Install a remote-control app inside Windows that runs its own server (for example a VNC server),'
     Write-Host '    and forward its port in the app (Settings > Port forwarding > Custom).'

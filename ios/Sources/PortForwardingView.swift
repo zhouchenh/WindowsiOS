@@ -343,8 +343,8 @@ struct PortForwardingSection: View {
         } header: {
             Text(L("端口转发", "Port forwarding"))
         } footer: {
-            Text(L("把这台\(PortForwardText.device)上的端口转到 Windows 里，例如用其他设备远程桌面或 SSH 连进 Windows。只有 App 在前台时才能连进来：App 到后台后 iOS 会暂停它（Windows 也一起暂停）。在 Windows 里运行 WINKIT 盘上的 REMOTE-DESKTOP.bat 或 SSH-SERVER.bat，打开远程桌面或 SSH 并放行防火墙。",
-                   "Lead a port on this \(PortForwardText.device) to a port in Windows, for example to use Remote Desktop or SSH from another device. Connections only come in while the app is open in the foreground: iOS pauses it, and Windows with it, in the background. In Windows, run REMOTE-DESKTOP.bat or SSH-SERVER.bat on the WINKIT drive to turn on Remote Desktop or SSH and open the firewall."))
+            Text(L("把这台\(PortForwardText.device)上的端口转到 Windows 里，例如用其他设备远程桌面或 SSH 连进 Windows。只有 App 在前台时才能连进来：App 到后台后 iOS 会暂停它（Windows 也一起暂停）。在 Windows 里运行 WINKIT 盘上的 REMOTE-DESKTOP.bat 或 SSH-SETUP.bat，打开远程桌面或 SSH 并放行防火墙。",
+                   "Lead a port on this \(PortForwardText.device) to a port in Windows, for example to use Remote Desktop or SSH from another device. Connections only come in while the app is open in the foreground: iOS pauses it, and Windows with it, in the background. In Windows, run REMOTE-DESKTOP.bat or SSH-SETUP.bat on the WINKIT drive to turn on Remote Desktop or SSH and open the firewall."))
         }
         .onAppear { model.start() }
         .onDisappear { model.stop() }
