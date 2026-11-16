@@ -18,6 +18,10 @@
 #   --tipa              Also write dist/AppleVM-Duo-unsigned.tipa (same archive, other extension).
 #   --out DIR           Output directory (default dist/).
 #
+# With or without 3D, the app also gets the WinKit disk (dist/WinKit/drivers.img, or $WINKIT_IMG,
+# as winkit.img; `make winkit-img` builds it) and the Arch Linux installer (dist/ArchInstaller/*.z,
+# scripts/build_arch_installer.py) when they exist; the summary says which were embedded.
+#
 # Needs ios/deps (scripts/build_ios_deps.sh), Xcode and xcodegen. "Unsigned" means no developer
 # certificate: the app is ad-hoc signed with its entitlements so that re-signing tools (SideStore,
 # AltStore, Sideloadly, LiveContainer, ...) see get-task-allow and keep it.
@@ -91,6 +95,20 @@ APP="$STAGE/Payload/WindowsiOS.app"
 mkdir -p "$STAGE/Payload"
 ditto --norsrc --noextattr "$BUILT" "$APP"
 
+# The WinKit disk and the Arch installer, whether or not the 3D frameworks are embedded
+# (scripts/embed_gpu3d.sh copies the same files again when it runs).
+WK="${WINKIT_IMG:-$ROOT/dist/WinKit/drivers.img}"
+WINKIT=0
+if [ -f "$WK" ]; then cp "$WK" "$APP/winkit.img"; WINKIT=1; fi
+ARCH_FILES="arch-installer.img.z arch-code.fd.z arch-vars.fd.z"
+ARCH_IN=""
+for f in $ARCH_FILES; do
+    if [ -f "$ROOT/dist/ArchInstaller/$f" ]; then cp "$ROOT/dist/ArchInstaller/$f" "$APP/$f"; ARCH_IN="$ARCH_IN $f"; fi
+done
+ARCH_IN="${ARCH_IN# }"
+[ -z "$ARCH_IN" ] || [ "$ARCH_IN" = "$ARCH_FILES" ] ||
+    warn "dist/ArchInstaller is incomplete (has only: $ARCH_IN): the app cannot install Arch Linux by itself"
+
 # Ad-hoc signature carrying the entitlements; scripts/embed_gpu3d.sh reads them back from it.
 codesign --force --sign - --timestamp=none --entitlements "$ENTITLEMENTS" --generate-entitlement-der "$APP"
 
@@ -152,6 +170,8 @@ if [ "$GPU3D" = 1 ]; then
     for f in $NEEDED_FW; do [ -d "$X/Frameworks/$f.framework" ] || fail "Frameworks/$f.framework missing"; done
     [ -d "$X/vulkan" ] || fail "vulkan/ (driver manifests) missing"
 fi
+if [ "$WINKIT" = 1 ]; then cmp -s "$WK" "$X/winkit.img" || fail "winkit.img missing or not $WK"; fi
+for f in $ARCH_IN; do cmp -s "$ROOT/dist/ArchInstaller/$f" "$X/$f" || fail "$f missing or differs from dist/ArchInstaller"; done
 
 if [ "$TIPA" = 1 ]; then cp "$IPA" "$OUT_DIR/$NAME.tipa"; fi
 
@@ -163,4 +183,9 @@ echo "sha256:       $(shasum -a 256 "$IPA" | cut -d' ' -f1)"
 echo "bundle id:    $BID, version $VER, iOS $MINOS+"
 echo "entitlements: $(basename "$ENTITLEMENTS") (ad-hoc signed)"
 if [ "$GPU3D" = 1 ]; then echo "3D:           embedded"; else echo "3D:           not embedded (2D graphics only)"; fi
+if [ "$WINKIT" = 1 ]; then echo "WinKit disk:  embedded ($WK)"
+else echo "WinKit disk:  not embedded (no $WK; make winkit-img builds it)"; fi
+if [ "$ARCH_IN" = "$ARCH_FILES" ]; then echo "Arch Linux:   installer embedded"
+elif [ -n "$ARCH_IN" ]; then echo "Arch Linux:   incomplete installer embedded ($ARCH_IN): cannot install"
+else echo "Arch Linux:   installer not embedded (scripts/build_arch_installer.py builds it)"; fi
 rm -rf "$CHECK"

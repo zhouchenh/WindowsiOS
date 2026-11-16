@@ -82,10 +82,15 @@ scripts/package_ipa.sh
 ```
 
 Or pass any other `UTM.app/Frameworks` directory with `--utm DIR` (or `UTM_FRAMEWORKS=DIR`).
-The frameworks are copied in by `scripts/embed_gpu3d.sh`, which also puts these into the app when
-they exist: `dist/WinKit/drivers.img` (the WinKit disk, see `winkit/`) and
-`dist/ArchInstaller/*.z` (the Arch Linux installer, `scripts/build_arch_installer.py`). Patched
-frameworks in `work/3d/fw-override/` take precedence over UTM's.
+The frameworks are copied in by `scripts/embed_gpu3d.sh`. Patched frameworks in
+`work/3d/fw-override/` take precedence over UTM's.
+
+### WinKit disk and Arch Linux installer (optional)
+
+With or without 3D, `scripts/package_ipa.sh` puts these into the app when they exist, and its
+summary says which it embedded: `dist/WinKit/drivers.img` (the WinKit disk, see `winkit/`; built by
+`make winkit-img`) and `dist/ArchInstaller/*.z` (the Arch Linux installer,
+`scripts/build_arch_installer.py`). Build them before running the script.
 
 ## 4b. Signed build from Xcode (free or paid Apple account)
 
