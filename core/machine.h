@@ -25,7 +25,10 @@ typedef struct HvRam {
     /* Per page: the VA page (| 2) its blocks have been cached as branch targets under since its code last changed;
        0 none, ~0 more than one. So a code change drops just those cached targets (HV_IJC_PAGES, hv_invalidate_code). */
     uint64_t *ijc_va;
-    size_t npages;       /* pages of HV_TLB_PAGE_BITS: what page_gen, whint and ijc_va are per */
+    /* HV_XCHAIN_PAGES, per page: the exits from other pages chained into it (a slot + 1, 0 none), listed through
+       HvMachine.slot_xnext, so its code changing unchains just those. */
+    uint32_t *xhead;
+    size_t npages;      /* pages of HV_TLB_PAGE_BITS: what page_gen, whint and ijc_va are per */
     /* Optional, per 4 KB page: where that page lives in host memory (NULL: host + offset as usual).
        A device window whose pages come from separate host allocations (virtio-gpu hostmem blobs,
        mapped at 4 KB offsets while host pages are 16 KB). Read through hv_ram_host(). */
@@ -257,9 +260,13 @@ typedef struct HvMachine {
     /* Exits to another page (see put_branch_exit): the host addend the target
        page's TLB entry must hold for the exit to go straight to the chained
        block (0: a same-page exit), and once chained, the target's physical page
-       (| 1) so that invalidating its code can unchain it. xchained lists them. */
+       (| 1) so that invalidating its code can unchain it. xchained lists them; with HV_XCHAIN_PAGES each
+       target page lists its own instead, from HvRam.xhead through slot_xnext (slot + 1, 0 at the end), a slot on
+       one list at a time until the page's code changes or a flush empties them all (xlist_used: one was made). */
     uint64_t *slot_xa, *slot_xpa;
     uint32_t *xchained, nxchained;
+    uint32_t *slot_xnext;
+    int xlist_used;
     uint32_t nslots;
     HvCpu *cpu;              /* CPU 0: the one that polls devices */
     HvCpu *cpus[HV_MAX_CPUS]; /* every CPU, so device and invalidation code can ask them to leave */
@@ -320,9 +327,10 @@ int hv_ic_ivau_drops(void);
    ones after it) are read in init_rest with their defaults, so the Mac tool and the tests can set them too
    (Documents/env.txt on iOS): 0 turns one off. */
 enum { HV_K_NO_RAS, HV_K_SUPERBLOCKS, HV_K_GROUPS, HV_K_WFI_SPIN, HV_K_FLUSH, HV_K_TEST1, HV_K_TEST2, HV_K_TEST3, HV_K_TLBT, HV_K_JITCAP, HV_K_RECHECK,
-       HV_K_FASTICACHE, HV_K_IJCTTBKEY, HV_K_LOGFLUSH, HV_K_IJCPAGES, HV_K_COUNT };
+       HV_K_FASTICACHE, HV_K_IJCTTBKEY, HV_K_LOGFLUSH, HV_K_IJCPAGES, HV_K_XCHAINPAGES, HV_K_COUNT };
 extern int hv_knob[HV_K_COUNT];
 int hv_knob_set(HvMachine *m, const char *name, int value);
+const char *hv_knob_name(int k); /* its environment variable */
 /* Debugging (HV_WATCH): which pages keep losing their translations. */
 extern uint32_t *hv_smc_counts;
 extern uint64_t *hv_smc_last;

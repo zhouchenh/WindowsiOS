@@ -357,8 +357,9 @@ int main(void) {
     static HvMachine m;
     static HvCpu cpu, cpu1;
     hv_machine_init(&m, 1 << 20);
-    printf("knobs: HV_IJC_TTBKEY=%d HV_TLB_LOGFLUSH=%d HV_IJC_PAGES=%d\n", hv_knob[HV_K_IJCTTBKEY], hv_knob[HV_K_LOGFLUSH],
-           hv_knob[HV_K_IJCPAGES]);
+    printf("knobs:");
+    for (int k = HV_K_FASTICACHE; k < HV_K_COUNT; k++) printf(" %s=%d", hv_knob_name(k), hv_knob[k]);
+    printf("\n");
     pt = aligned_alloc(65536, PT_SIZE);
     hv_machine_add_ram(&m, PT_PA, PT_SIZE, pt, 0);
     uint8_t *big = aligned_alloc(1u << 21, 4u << 20);

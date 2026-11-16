@@ -20,13 +20,17 @@ static int init_rest(HvMachine *m);
 
 int hv_knob[HV_K_COUNT];
 static const char *const hv_knob_names[] = {"HV_NO_RAS", "HV_SUPERBLOCKS", "HV_GROUPS", "HV_WFI_SPIN", "HV_FLUSH", "HV_K1", "HV_K2", "HV_K3", "HV_TLBT", "HV_JIT_CAP", "HV_RECHECK",
-                                            "HV_FAST_ICACHE", "HV_IJC_TTBKEY", "HV_TLB_LOGFLUSH", "HV_IJC_PAGES"};
+                                            "HV_FAST_ICACHE", "HV_IJC_TTBKEY", "HV_TLB_LOGFLUSH", "HV_IJC_PAGES", "HV_XCHAIN_PAGES"};
 _Static_assert(sizeof hv_knob_names / sizeof hv_knob_names[0] == HV_K_COUNT, "a name for every knob");
 
 static void knobs_init(void) {
     for (int i = 0; i < HV_K_COUNT; i++)
         hv_knob[i] = getenv(hv_knob_names[i]) ? atoi(getenv(hv_knob_names[i])) : 0;
     if (getenv("HV_NO_RAS") && !*getenv("HV_NO_RAS")) hv_knob[HV_K_NO_RAS] = 1;
+}
+
+const char *hv_knob_name(int k) {
+    return k >= 0 && k < HV_K_COUNT ? hv_knob_names[k] : "?";
 }
 
 /* A knob from its environment variable, or def when that is unset. */
@@ -79,6 +83,9 @@ static int init_rest(HvMachine *m) {
     /* Henge b537dbb: a code change drops the cached branch targets into its page (under every live user id and
        kernel salt) instead of every CPU's whole branch cache. */
     knob_env(HV_K_IJCPAGES, 0);
+    /* Henge 7131022: exits chained into another page are listed per target page (HvRam.xhead), so a code change
+       unchains just those instead of scanning every cross-page chain under the translation lock. */
+    knob_env(HV_K_XCHAINPAGES, 0);
     /* As many blocks as the region holds (a block is at least ~160 bytes of
        code), so the region filling, not this table, is what flushes; two
        chainable exits each at most. Untouched entries cost nothing. */
@@ -97,7 +104,10 @@ static int init_rest(HvMachine *m) {
     m->slot_xa = calloc(m->max_slots, sizeof *m->slot_xa);
     m->slot_xpa = calloc(m->max_slots, sizeof *m->slot_xpa);
     m->xchained = calloc(m->max_slots, sizeof *m->xchained);
-    if (!m->slots || !m->slot_site || !m->slot_stub || !m->slot_cond || !m->slot_xa || !m->slot_xpa || !m->xchained) return -1;
+    m->slot_xnext = calloc(m->max_slots, sizeof *m->slot_xnext);
+    if (!m->slots || !m->slot_site || !m->slot_stub || !m->slot_cond || !m->slot_xa || !m->slot_xpa || !m->xchained ||
+        !m->slot_xnext)
+        return -1;
     pthread_mutex_init(&m->big_mu, NULL);
     pthread_cond_init(&m->big_cv, NULL);
     pthread_mutexattr_t ra;
@@ -297,6 +307,7 @@ void hv_machine_free(HvMachine *m) {
         free(m->ram[i].page_gen);
         free(m->ram[i].whint);
         free(m->ram[i].ijc_va);
+        free(m->ram[i].xhead);
     }
     free(m->blocks);
     for (int i = 0; i < HV_MAX_CPUS; i++) {
@@ -315,6 +326,7 @@ void hv_machine_free(HvMachine *m) {
     free(m->slot_xa);
     free(m->slot_xpa);
     free(m->xchained);
+    free(m->slot_xnext);
 }
 
 int hv_machine_add_ram(HvMachine *m, uint64_t pa, uint64_t size, void *host, int readonly) {
@@ -334,7 +346,8 @@ int hv_machine_add_ram(HvMachine *m, uint64_t pa, uint64_t size, void *host, int
     r->whint = calloc(pages * HV_MAX_CPUS, sizeof *r->whint);
     r->npages = pages;
     r->ijc_va = calloc(pages, sizeof *r->ijc_va);
-    return r->code_pages && r->page_gen && r->whint && r->ijc_va ? 0 : -1;
+    r->xhead = calloc(pages, sizeof *r->xhead);
+    return r->code_pages && r->page_gen && r->whint && r->ijc_va && r->xhead ? 0 : -1;
 }
 
 /* While the CPUs run (a device BAR backed by host memory, e.g. the virtio-gpu hostmem window):
@@ -355,8 +368,9 @@ int hv_machine_add_ram_live(HvMachine *m, uint64_t pa, uint64_t size, void *host
     r->page_gen = calloc(pages, sizeof *r->page_gen);
     r->whint = calloc(pages * HV_MAX_CPUS, sizeof *r->whint);
     r->npages = pages;
-    r->ijc_va = calloc(pages, sizeof *r->ijc_va); /* hv_invalidate_code reads it for any page that held code */
-    if (!r->code_pages || !r->page_gen || !r->whint || !r->ijc_va) return -1;
+    r->ijc_va = calloc(pages, sizeof *r->ijc_va); /* hv_invalidate_code reads these for any page that held code */
+    r->xhead = calloc(pages, sizeof *r->xhead);
+    if (!r->code_pages || !r->page_gen || !r->whint || !r->ijc_va || !r->xhead) return -1;
     __atomic_store_n(&m->nram, n + 1, __ATOMIC_RELEASE);
     return n;
 }
@@ -389,6 +403,18 @@ uint32_t *hv_smc_counts;
 uint64_t *hv_smc_last;
 uint64_t hv_smc_pages, hv_smc_cpu, hv_smc_dma;
 
+/* A chained exit into another page goes back to its stub (under the translation lock). */
+static void unchain(HvMachine *m, uint32_t idx) {
+    m->slot_xpa[idx] = 0;
+    __atomic_store_n(&m->slots[idx], 0, __ATOMIC_RELEASE);
+    uint32_t *site = m->slot_site[idx];
+    if (site) {
+        uint32_t insn = 0x14000000u | (uint32_t)((m->slot_stub[idx] - site) & 0x3ffffff); /* back to its stub */
+        hv_jit_write(&m->jit, site, &insn, 4);
+        hv_jit_finish(&m->jit, site, 1); /* the full wait: the old target must not run any more */
+    }
+}
+
 void hv_invalidate_code(HvMachine *m, uint64_t pa) {
     HvRam *r = hv_ram_lookup(m, pa);
     if (!r) return;
@@ -411,6 +437,18 @@ void hv_invalidate_code(HvMachine *m, uint64_t pa) {
        (whose next chain finds the new translation). Under the translation lock,
        as chaining them is: one that saw the old generation is done by now. */
     pthread_mutex_lock(&m->tr_mu);
+    /* HV_XCHAIN_PAGES (Henge 7131022): the exits chained into this page are on its own list. Whatever the knob
+       says now, both kinds of record are looked at: a knob changed at run time leaves the other kind until the
+       flush it asks for, and an empty one costs nothing. */
+    if (r->xhead) {
+        for (uint32_t k = r->xhead[pg]; k;) {
+            uint32_t idx = k - 1;
+            k = m->slot_xnext[idx];
+            m->slot_xnext[idx] = 0;
+            unchain(m, idx);
+        }
+        r->xhead[pg] = 0;
+    }
     uint64_t tpa = (r->pa + (pg << HV_TLB_PAGE_BITS)) | 1;
     for (uint32_t k = 0; k < m->nxchained;) {
         uint32_t idx = m->xchained[k];
@@ -418,14 +456,7 @@ void hv_invalidate_code(HvMachine *m, uint64_t pa) {
             k++;
             continue;
         }
-        m->slot_xpa[idx] = 0;
-        __atomic_store_n(&m->slots[idx], 0, __ATOMIC_RELEASE);
-        uint32_t *site = m->slot_site[idx];
-        if (site) {
-            uint32_t insn = 0x14000000u | (uint32_t)((m->slot_stub[idx] - site) & 0x3ffffff); /* back to its stub */
-            hv_jit_write(&m->jit, site, &insn, 4);
-            hv_jit_finish(&m->jit, site, 1);
-        }
+        unchain(m, idx);
         m->xchained[k] = m->xchained[--m->nxchained];
     }
     pthread_mutex_unlock(&m->tr_mu);

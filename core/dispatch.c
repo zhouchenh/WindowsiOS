@@ -38,6 +38,9 @@ void hv_flush_blocks(HvMachine *m) {
     m->nblocks = 0;
     m->nslots = 0;
     m->nxchained = 0;
+    if (m->xlist_used) /* slots restart from 0: no page's list may name one */
+        for (int i = 0; i < m->nram; i++)
+            if (m->ram[i].xhead) memset(m->ram[i].xhead, 0, m->ram[i].npages * sizeof *m->ram[i].xhead);
     hv_jit_reset(&m->jit);
     m->jit.limit = hv_knob[HV_K_JITCAP] > 0 ? ((size_t)hv_knob[HV_K_JITCAP] << 20) / sizeof(uint32_t) : 0; /* MB of it to use (testing) */
     /* HV_JIT_POISON: nothing old is left to run, so a stale pointer faults where it is used. */
@@ -742,10 +745,11 @@ static void print_stats(HvCpu *cpu, int force) {
 }
 
 /* Fill the slot of the chainable exit a block just left through, so it jumps
-   straight to b next time. Chains never need undoing: both blocks are in the
-   same 16 KB page, so when that page's code is invalidated the stale blocks are
-   only reachable from each other, and the exit_req check before every chained
-   jump gets a block that just wrote its own page back to the dispatcher. */
+   straight to b next time. Chains in a page never need undoing: both blocks are
+   in the same (4 KB) page, so when that page's code is invalidated the stale blocks
+   are only reachable from each other, and the exit_req check before every chained
+   jump gets a block that just wrote its own page back to the dispatcher. Exits
+   from another page are recorded so hv_invalidate_code can unchain them. */
 /* A stub's B just became a B to the chained block. HV_FAST_ICACHE (Henge a47f5e1): drop the line without waiting for
    every CPU, as Arm lets a CPU run a B while it changes into another B; one that still runs the old one goes to the
    stub, which follows the slot (stored first). The conditional branch below, and unchaining (hv_invalidate_code),
@@ -772,7 +776,13 @@ static void chain(HvMachine *m, uint64_t *slot, HvBlock *b) {
             return;
         }
         m->slot_xpa[idx] = page_pa | 1;
-        m->xchained[m->nxchained++] = idx;
+        if (hv_knob[HV_K_XCHAINPAGES] && b->ram->xhead) { /* on the target page's list (hv_invalidate_code) */
+            m->slot_xnext[idx] = b->ram->xhead[b->pg];
+            b->ram->xhead[b->pg] = idx + 1;
+            m->xlist_used = 1;
+        } else {
+            m->xchained[m->nxchained++] = idx;
+        }
         __atomic_store_n(slot, (uint64_t)(uintptr_t)b->code, __ATOMIC_RELEASE);
         uint32_t *site = m->slot_site[idx];
         int64_t off = site ? b->code - site : 0;

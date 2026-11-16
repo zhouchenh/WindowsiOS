@@ -50,6 +50,9 @@ static int run(const TestProgram *p, HvCpu *cpu, uint64_t x9) {
 int main(void) {
     setvbuf(stdout, NULL, _IONBF, 0);
     hv_machine_init(&m, 4 << 20);
+    printf("knobs:");
+    for (int k = HV_K_FASTICACHE; k < HV_K_COUNT; k++) printf(" %s=%d", hv_knob_name(k), hv_knob[k]);
+    printf("\n");
     stack = aligned_alloc(16384, 65536);
     hv_machine_add_ram(&m, ADDR(exc_programs_begin), exc_programs_finish - exc_programs_begin,
                        (void *)exc_programs_begin, 1);
@@ -168,6 +171,48 @@ int main(void) {
         memcpy(code, p->start, len);
         TestProgram copy = {p->name, NULL, code, code + ((const char *)p->end - (const char *)p->start)};
         if (!run(&copy, &c, 0)) check(p->name, "1 then 2 after patching", c.x[1], 3);
+    }
+
+    /* Code that other pages' exits are chained into changes (HV_XCHAIN_PAGES lists those exits per page): every such
+       exit must go back to its stub, or it keeps jumping into the old translation. 4 KB pages of a writable copy:
+       page 0 and page 2 branch into page 1, which sets x0 and goes on to page 3 (the stop). At a guest PA other than
+       the host address: an exit to another page is chained only where the page's host addend is not 0. */
+    {
+        uint32_t *xc = aligned_alloc(16384, 16384);
+        const uint64_t XPA = 0x50000000ull;
+        hv_machine_add_ram(&m, XPA, 16384, xc, 0);
+        const uint32_t P = 1024; /* words per 4 KB page */
+        #define MOVZ(rd, imm) (0xd2800000u | (uint32_t)(imm) << 5 | (rd))
+        #define B_TO(from, to) (0x14000000u | ((uint32_t)((int32_t)(to) - (int32_t)(from)) & 0x3ffffff))
+        memset(xc, 0, 16384);
+        xc[0] = MOVZ(0, 0), xc[1] = B_TO(1, P);                  /* page 0 -> page 1 */
+        xc[2 * P] = MOVZ(1, 5), xc[2 * P + 1] = B_TO(2 * P + 1, P); /* page 2 -> page 1 */
+        xc[P] = MOVZ(0, 1), xc[P + 1] = B_TO(P + 1, 3 * P);       /* page 1: x0 = n, -> page 3 */
+        const uint32_t *g = (const uint32_t *)(uintptr_t)XPA; /* guest addresses (the MMU is off) */
+        TestProgram from0 = {"xchain0", NULL, g, g + 3 * P}, from2 = {"xchain2", NULL, g + 2 * P, g + 3 * P};
+        uint64_t chained_before = m.stats.chained;
+        /* One CPU throughout (no reset between runs): an exit to another page is chained once that page is in the
+           TLB, from the second run on. */
+        if (run(&from0, &c, 0)) failures++;
+        for (uint32_t n = 1; n <= 4; n++) {
+            if (n == 3) hv_flush_blocks(&m); /* every chain and list starts over, slots from 0 again */
+            if (n > 1) {
+                uint32_t insn = MOVZ(0, n);
+                hv_phys_write(&m, XPA + 4 * P, &insn, 4); /* as a device or another CPU would: page 1 is code */
+            }
+            for (int round = 0; round < 2; round++) /* the second round runs through the chains the first made */
+                for (int from = 0; from < 2; from++) {
+                    const TestProgram *p = from ? &from2 : &from0;
+                    c.x[0] = 0;
+                    c.pc = (uint64_t)(uintptr_t)p->start;
+                    m.stop_pc = (uint64_t)(uintptr_t)p->end;
+                    int r = hv_run(&c);
+                    check("xchain", from ? "page 2 into page 1" : "page 0 into page 1", r == HV_EXIT_HALT ? c.x[0] : ~0ull, n);
+                }
+        }
+        check("xchain", "cross-page exits chained (and chained again after each change)", m.stats.chained - chained_before, 8);
+        #undef MOVZ
+        #undef B_TO
     }
 
     printf("%d checks, %d failures\n", checks, failures);
