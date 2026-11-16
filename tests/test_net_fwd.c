@@ -12,7 +12,8 @@
      expose-port (hv_net_add_hostfwd) shows up as a session forward and is not saved; what the guest may ask for is
      limited; the store file holds the saved forwards only.
    - a damaged store is put aside (<path>.bad) and the list starts empty.
-   - HV_NET_FWD_RULES=0: saved forwards are listed but not opened. */
+   - HV_NET_FWD_RULES=0: saved forwards are listed but not opened; HV_NET_FWD's forms (loopback, lan:, one
+     address, comma-separated, a bad item skipped) still open, from HV_NET_FWD_FILE as the Mac tool reads it. */
 #include "net_slirp.h"
 
 #include <arpa/inet.h>
@@ -642,9 +643,9 @@ static int scenario_rules_off(void) {
     fprintf(f, "{\"rules\":[{\"id\":\"a\",\"protocol\":\"tcp\",\"hostPort\":%d,\"guestPort\":7,\"scope\":\"loopback\",\"enabled\":true}]}", p);
     fclose(f);
     setenv("HV_NET_FWD_RULES", "0", 1);
-    char env[32];
-    int p_env = free_port();
-    snprintf(env, sizeof env, "%d:7", p_env);
+    char env[128];
+    int p_env = free_port(), p_env_lan = free_port(), p_env_addr = free_port();
+    snprintf(env, sizeof env, "%d:7, lan:%d:7,127.0.0.1:%d:7,bogus", p_env, p_env_lan, p_env_addr);
     setenv("HV_NET_FWD", env, 1);
     setenv("HV_NET_FWD_FILE", path, 1); /* as the Mac tool does */
     start_net();
@@ -655,6 +656,11 @@ static int scenario_rules_off(void) {
     snprintf(sid, sizeof sid, "session-tcp-%d", p_env);
     check("HV_NET_FWD still works (a session forward)", wait_for(sid, "\"state\":\"listening\"", 2000) &&
                                                              tcp_echo("127.0.0.1", p_env));
+    char what[96];
+    snprintf(sid, sizeof sid, "session-tcp-%d", p_env_lan);
+    snprintf(what, sizeof what, "\"listen\":[\"0.0.0.0:%d\",\"[::]:%d\"]", p_env_lan, p_env_lan);
+    check("HV_NET_FWD lan:host:guest listens everywhere", wait_for(sid, what, 2000) && tcp_echo("::1", p_env_lan));
+    check("HV_NET_FWD a.b.c.d:host:guest (outside the list)", tcp_echo("127.0.0.1", p_env_addr));
     guest_stop = 1;
     printf("fwd (HV_NET_FWD_RULES=0): %d failures\n", failures);
     fflush(stdout);

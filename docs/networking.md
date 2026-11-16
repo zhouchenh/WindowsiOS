@@ -164,15 +164,19 @@ file that cannot be read is renamed to `port_forwards.json.bad` and the list sta
   `hv_net_fwd_list_json`). `PUT` or `POST` `{"protocol": "tcp", "hostPort": 8080, "guestPort": 80}`
   adds one, always *this iPhone only* and from port 1024: the guest never opens a port to the
   network, that is the user's choice in the app. `DELETE ?id=…` removes one the guest added.
-- **`HV_NET_FWD=<host port>:<guest port>`** (debugging) adds one at start-up.
+- **`HV_NET_FWD`** (`Documents/env.txt`) adds TCP forwards at start-up, comma-separated:
+  `<host port>:<guest port>` (this iPhone only), `lan:<host port>:<guest port>` (local network),
+  `vpn:<host port>:<guest port>` (VPN). `a.b.c.d:<host port>:<guest port>` listens on that one IPv4
+  address, as a plain libslirp forward outside the list.
 
-**In Windows** the service has to run and its firewall has to let the port in. WinKit has two
-scripts (on the WINKIT drive and in `C:\WinKit`; `winkit/README.md` explains them in Chinese):
+**In Windows** the service has to run and its firewall has to let the port in. WinKit has scripts
+for this (on the WINKIT drive and in `C:\WinKit`; `winkit/README.md` explains them in Chinese):
 `REMOTE-DESKTOP.bat` (`enable_rdp.ps1`: the Remote Desktop host, which only Pro, Enterprise and
-Education have, with Network Level Authentication, and TCP and UDP 3389 open) and `SSH-SERVER.bat`
-(`enable_ssh.ps1`: Windows' OpenSSH Server, TCP 22). Their firewall rules allow every profile and
+Education have, with Network Level Authentication, and TCP and UDP 3389 open; `-Uninstall` puts
+the previous setting back) and `SSH-SETUP.bat` (`ssh_setup.ps1`: an OpenSSH server with key login
+only and TCP 22 open; `uninstall_ssh.ps1` removes it). The firewall rules allow every profile and
 every remote address, since clients through a forward keep their own address, which Windows would
-not count as its local subnet. `-Uninstall` undoes either.
+not count as its local subnet.
 
 ## Why there is no bridged mode
 
@@ -212,7 +216,7 @@ a comment). Restart the VM after changing them.
 | `HV_IPV6` | on | `0`: IPv4 only, no IPv6 at all (no router advertisements, IPv6 frames from the guest are dropped). |
 | `HV_DNS_PROXY` | on | `0`: libslirp answers DNS by forwarding to the host's first name server, and adds the IPv6 DNS server to its advertisements only if the host lists an IPv6 one. |
 | `HV_NET_LOG` | off | Set: one line per frame in the log (addresses, ports, protocol), IPv4 and IPv6. |
-| `HV_NET_FWD` | none | `<host port>:<guest port>`: one more TCP forward from the host's `127.0.0.1` and `[::1]` into the guest, for this session. |
+| `HV_NET_FWD` | none | TCP forwards into the guest for this session, comma-separated: `<host port>:<guest port>` (loopback), `lan:…`, `vpn:…`, or `a.b.c.d:…` (see [Port forwards](#port-forwards)). |
 | `HV_NET_FWD_FILE` | none (Mac) | The saved forwards' file for the Mac tool (on iOS it is the machine's `port_forwards.json`). |
 | `HV_NET_FWD_RULES` | on | `0`: saved forwards are listed but not opened (session forwards still are). |
 | `HV_NET_VPN_IF` | `utun,ipsec,ppp,tun,wg` | Which interfaces count as a VPN (name prefixes, comma-separated). |
