@@ -54,6 +54,8 @@ final class JITSetup: ObservableObject {
     private var vpnTask: Task<Void, Never>?
     private var awaitingVPN = false
     private var autoTried = false
+    /// CS_DEBUGGED as last seen by check(), to notice it turning on (iOS before 26).
+    private var csDebuggedSeen = winios_jit_is_debugger_attached()
 
     private init() {}
 
@@ -101,24 +103,35 @@ final class JITSetup: ObservableObject {
 
     private enum CheckResult { case live, waiting, failed }
 
-    /// Turns JIT on when a debugger traces the process now. Not on CS_DEBUGGED alone: that mark stays
-    /// set after a detach, and the view model already tries once on it each time the app becomes active
-    /// (all an iOS before 26 needs), so a stale mark costs no trap on every tick here.
+    /// Turns JIT on when a debugger traces the process now, or (before iOS 26) when CS_DEBUGGED has just
+    /// turned on: there StikDebug attaches and detaches straight away, which is all that is needed, so a
+    /// late attach can be over before a tick sees it traced. Only on the mark turning on, not on the mark
+    /// alone: it stays set after a detach, and the view model already tries once on it each time the app
+    /// becomes active, so a stale mark costs no trap on every tick here.
     private func check() -> CheckResult {
         if jitLive {
             becameLive()
             return .live
         }
-        guard winios_jit_is_traced() else { return .waiting }
-        jitLog("a debugger is attached; claiming the JIT region")
+        var markJustSet = false
+        if #unavailable(iOS 26) {
+            let marked = winios_jit_is_debugger_attached()
+            markJustSet = marked && !csDebuggedSeen
+            csDebuggedSeen = marked
+        }
+        let traced = winios_jit_is_traced()
+        guard traced || markJustSet else { return .waiting }
+        jitLog(traced ? "a debugger is attached; claiming the JIT region"
+                      : "CS_DEBUGGED turned on (a debugger came and went); claiming the JIT region")
         _ = WinIOSBridge.shared.tryAcquireJIT(true)
         if jitLive {
             becameLive(turnedOnHere: true)
             return .live
         }
         let detail = WinIOSBridge.shared.jitStatusText
-        if detail.hasPrefix("Failed") {
-            // The debugger answered, but the region it gave did not work out (winios_jit.c says why).
+        if detail.hasPrefix("Failed") || !traced {
+            // The debugger answered, but the region it gave did not work out, or (CS_DEBUGGED only) the
+            // plain RX/RW region did not (winios_jit.c says why).
             fail(L("调试器已连接，但 JIT 内存没能准备好：", "A debugger is attached, but the JIT memory could not be set up: ")
                  + detail + L("。请彻底关闭 Apple VM 再打开，然后重试。", ". Close Apple VM completely, open it again and retry."))
             return .failed
