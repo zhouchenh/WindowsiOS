@@ -203,6 +203,7 @@ typedef struct HvPerCpu {
        flush barrier). tlb_live: active and not itself waiting for acks, i.e. it
        may be using TLB entries right now. */
     int active, tlb_live;
+    uint32_t ack_waiters;        /* CPUs asleep in hv_cpu_sync waiting for ack_seq to move (HV_SYNC_WAIT) */
     uint32_t walk_seq;           /* odd while it walks page tables and fills its TLB (see hv_tlbi_drop_remote_va) */
     uint64_t walk_page[8];       /* the page walk k (walk_seq 2k -> 2k+1) fills, at [k % 8]; ~0: a process switch (HV_WALK_LOG) */
     uint32_t ijc_seq;            /* odd while it checks a block's mapping in its TLB and caches it (hv_ijc_fill_checked) */
@@ -329,7 +330,7 @@ int hv_ic_ivau_drops(void);
    ones after it) are read in init_rest with their defaults, so the Mac tool and the tests can set them too
    (Documents/env.txt on iOS): 0 turns one off. */
 enum { HV_K_NO_RAS, HV_K_SUPERBLOCKS, HV_K_GROUPS, HV_K_WFI_SPIN, HV_K_FLUSH, HV_K_TEST1, HV_K_TEST2, HV_K_TEST3, HV_K_TLBT, HV_K_JITCAP, HV_K_RECHECK,
-       HV_K_FASTICACHE, HV_K_IJCTTBKEY, HV_K_LOGFLUSH, HV_K_IJCPAGES, HV_K_XCHAINPAGES, HV_K_STASHVA, HV_K_WALKLOG, HV_K_COUNT };
+       HV_K_FASTICACHE, HV_K_IJCTTBKEY, HV_K_LOGFLUSH, HV_K_IJCPAGES, HV_K_XCHAINPAGES, HV_K_STASHVA, HV_K_WALKLOG, HV_K_SYNCWAIT, HV_K_COUNT };
 extern int hv_knob[HV_K_COUNT];
 int hv_knob_set(HvMachine *m, const char *name, int value);
 const char *hv_knob_name(int k); /* its environment variable */
@@ -366,6 +367,9 @@ void hv_ijc_drop_code_page(HvCpu *cpu, uint64_t v);
 void hv_cpu_sync(HvCpu *self, HvCpu *target, uint64_t seq);
 /* The owner: do what other CPUs asked. */
 void hv_cpu_process_requests(HvCpu *cpu);
+/* cpu stopped using its TLB (parked): wake CPUs asleep waiting for its acknowledgement (HV_SYNC_WAIT). */
+void hv_cpu_ack_wake(HvCpu *cpu);
+extern uint32_t hv_sync_wait_us; /* HV_SYNC_WAIT: longest sleep before looking again (tests make it long) */
 void hv_big_lock(HvMachine *m);
 void hv_big_unlock(HvMachine *m);
 /* Let a waiting CPU run (the lock is held again on return). */

@@ -1,7 +1,9 @@
 #include "harness.h"
 
 #include <mach/mach_time.h>
+#include <pthread.h>
 #include <stdlib.h>
+#include <unistd.h>
 
 DECLARE_PROGRAM(p_svc);
 DECLARE_PROGRAM(p_brk_undef);
@@ -46,6 +48,70 @@ static int run(const TestProgram *p, HvCpu *cpu, uint64_t x9) {
 }
 
 #define ADDR(sym) ((uint64_t)(uintptr_t)(sym))
+
+/* HV_SYNC_WAIT: a thread waiting for a CPU's acknowledgement (hv_cpu_sync) sleeps until the CPU acknowledges while
+   running, or parks (park(): the host pausing the machine, CPU_OFF, WFI, the flush barrier and leaving the dispatcher
+   all go through it). The CPU, on its own thread, is in the machine's tick with its TLB live while the request comes
+   in (kicked, at the stop PC); then (mode 0) it leaves the dispatcher without doing the request, parking, or (mode 1)
+   does the request from the tick and stays live a while longer. The sleep's timeout is made 2 s, so a wake that never
+   comes shows (any later acknowledgement or park would also end the wait: none comes before the CPU stops). */
+static HvMachine sm;
+static HvCpu scpu;
+static int s_in_tick, s_mode;
+
+static uint64_t s_tick(HvMachine *mm, HvCpu *cpu) {
+    (void)mm;
+    if (!__atomic_load_n(&s_in_tick, __ATOMIC_ACQUIRE)) {
+        __atomic_store_n(&s_in_tick, 1, __ATOMIC_RELEASE);
+        usleep(50000);
+        if (s_mode == 1) {
+            hv_cpu_process_requests(cpu);
+            usleep(600000);
+        }
+        cpu->x[0] = 7;
+    }
+    return 0;
+}
+
+static void *s_run(void *arg) {
+    (void)arg;
+    return (void *)(intptr_t)hv_run(&scpu);
+}
+
+static void test_sync_wait(void) {
+    if (hv_machine_init(&sm, 1 << 20) != 0) return;
+    uint32_t *code = aligned_alloc(16384, 16384);
+    code[0] = 0xd503201f;             /* (the stop) */
+    hv_machine_add_ram(&sm, ADDR(code), 16384, code, 1);
+    sm.tick = s_tick;
+    uint32_t saved_us = hv_sync_wait_us;
+    hv_sync_wait_us = 2000000;
+    for (int mode = 0; mode < 2; mode++) {
+        hv_cpu_reset(&scpu, &sm);
+        scpu.pc = ADDR(code);
+        sm.stop_pc = ADDR(code);
+        scpu.exit_req = 1; /* kicked: the dispatcher ticks before it looks at the PC */
+        __atomic_store_n(&s_in_tick, 0, __ATOMIC_RELEASE);
+        s_mode = mode;
+        pthread_attr_t at;
+        pthread_attr_init(&at);
+        pthread_attr_setstacksize(&at, 16u << 20);
+        pthread_t th;
+        pthread_create(&th, &at, s_run, NULL);
+        while (!__atomic_load_n(&s_in_tick, __ATOMIC_ACQUIRE)) usleep(100);
+        uint64_t seq = hv_cpu_post(&scpu, 0);
+        uint64_t t0 = mach_absolute_time();
+        hv_cpu_sync(NULL, &scpu, seq);
+        double ms = (mach_absolute_time() - t0) / 24000.0;
+        void *r;
+        pthread_join(th, &r);
+        const char *what = mode ? "acknowledged by a running CPU" : "the CPU parked";
+        printf("sync wait (HV_SYNC_WAIT=%d), %s: %.1f ms\n", hv_knob[HV_K_SYNCWAIT], what, ms);
+        check("sync wait", what, ms > 20 && ms < 400, 1);
+        check("sync wait", "the CPU ran on", (intptr_t)r == HV_EXIT_HALT && scpu.x[0] == 7, 1);
+    }
+    hv_sync_wait_us = saved_us;
+}
 
 int main(void) {
     setvbuf(stdout, NULL, _IONBF, 0);
@@ -214,6 +280,8 @@ int main(void) {
         #undef MOVZ
         #undef B_TO
     }
+
+    test_sync_wait();
 
     printf("%d checks, %d failures\n", checks, failures);
     return failures != 0;

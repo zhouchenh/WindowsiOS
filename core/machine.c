@@ -21,7 +21,7 @@ static int init_rest(HvMachine *m);
 int hv_knob[HV_K_COUNT];
 static const char *const hv_knob_names[] = {"HV_NO_RAS", "HV_SUPERBLOCKS", "HV_GROUPS", "HV_WFI_SPIN", "HV_FLUSH", "HV_K1", "HV_K2", "HV_K3", "HV_TLBT", "HV_JIT_CAP", "HV_RECHECK",
                                             "HV_FAST_ICACHE", "HV_IJC_TTBKEY", "HV_TLB_LOGFLUSH", "HV_IJC_PAGES", "HV_XCHAIN_PAGES",
-                                            "HV_STASH_VA", "HV_WALK_LOG"};
+                                            "HV_STASH_VA", "HV_WALK_LOG", "HV_SYNC_WAIT"};
 _Static_assert(sizeof hv_knob_names / sizeof hv_knob_names[0] == HV_K_COUNT, "a name for every knob");
 
 static void knobs_init(void) {
@@ -94,6 +94,8 @@ static int init_rest(HvMachine *m) {
     /* Henge aaba70b, 1ed86bd, 17e9ed9: another CPU's TLBI of a page done from here lets through walks of pages far
        enough from it (hv_walks_elsewhere) instead of counting every walk meanwhile as a race to wait for. */
     knob_env(HV_K_WALKLOG, 0);
+    /* Henge 061b250 (its second part): a CPU waiting for TLBI acknowledgements sleeps on a ulock instead of yielding. */
+    knob_env(HV_K_SYNCWAIT, 0);
     /* As many blocks as the region holds (a block is at least ~160 bytes of
        code), so the region filling, not this table, is what flushes; two
        chainable exits each at most. Untouched entries cost nothing. */
@@ -196,6 +198,8 @@ uint64_t hv_cpu_post_ijc_page(HvCpu *target, uint64_t v) {
     return post_locked_done(target, p);
 }
 
+static void ack_wake(HvPerCpu *p);
+
 void hv_cpu_process_requests(HvCpu *cpu) {
     HvPerCpu *p = cpu->pc_state;
     uint64_t seq = __atomic_load_n(&p->req_seq, __ATOMIC_ACQUIRE);
@@ -222,19 +226,57 @@ void hv_cpu_process_requests(HvCpu *cpu) {
     } else if (!(flags & HV_REQ_TLB_ALL)) { /* a whole flush dropped the branch cache already */
         for (uint32_t i = 0; i < npages; i++) hv_ijc_drop_code_page(cpu, pages[i]);
     }
-    __atomic_store_n(&p->ack_seq, seq, __ATOMIC_RELEASE);
+    /* Sequentially consistent (an STLR either way on arm64): ack_wake's load of ack_waiters must not come first. */
+    __atomic_store_n(&p->ack_seq, seq, __ATOMIC_SEQ_CST);
+    ack_wake(p);
+}
+
+/* HV_SYNC_WAIT (Henge 061b250): a CPU waiting for another's acknowledgement sleeps (after a short spin) instead of
+   spinning and yielding, so a host core is free for the CPU it waits on: the phone has two fast cores for four guest
+   CPUs, the display and the GPU. The kernel's compare-and-wait on the low 32 bits of ack_seq; woken when ack_seq
+   moves (hv_cpu_process_requests) or the CPU stops using its TLB (park(), which a CPU paused by the host, off, in
+   WFI or at the flush barrier goes through, and hv_cpu_sync's own), and in any case after hv_sync_wait_us. */
+extern int __ulock_wait(uint32_t operation, void *addr, uint64_t value, uint32_t timeout_us);
+extern int __ulock_wake(uint32_t operation, void *addr, uint64_t wake_value);
+#define HV_UL_COMPARE_AND_WAIT 1u
+#define HV_ULF_WAKE_ALL 0x100u
+#define HV_ULF_NO_ERRNO 0x1000000u
+uint32_t hv_sync_wait_us = 100;
+_Static_assert(sizeof(((HvPerCpu *)0)->ack_seq) == 8 && __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__, "the ulock word is ack_seq's low half");
+
+/* Wake whoever sleeps on p's ack_seq (it moved, or p stopped using its TLB). */
+static void ack_wake(HvPerCpu *p) {
+    if (__atomic_load_n(&p->ack_waiters, __ATOMIC_SEQ_CST))
+        __ulock_wake(HV_UL_COMPARE_AND_WAIT | HV_ULF_WAKE_ALL | HV_ULF_NO_ERRNO, &p->ack_seq, 0);
+}
+
+void hv_cpu_ack_wake(HvCpu *cpu) {
+    if (cpu->pc_state) ack_wake(cpu->pc_state);
 }
 
 void hv_cpu_sync(HvCpu *self, HvCpu *target, uint64_t seq) {
     HvPerCpu *t = target->pc_state, *s = self ? self->pc_state : NULL;
     HvMachine *mm = target->m;
     uint64_t t0 = mm->stats_interval ? mach_absolute_time() : 0;
-    if (s) __atomic_store_n(&s->tlb_live, 0, __ATOMIC_SEQ_CST); /* others need not wait for this one meanwhile */
+    if (s) {
+        __atomic_store_n(&s->tlb_live, 0, __ATOMIC_SEQ_CST); /* others need not wait for this one meanwhile */
+        ack_wake(s);
+    }
+    int sleep = hv_knob[HV_K_SYNCWAIT];
     for (uint32_t spins = 0;; spins++) {
-        if (__atomic_load_n(&t->ack_seq, __ATOMIC_ACQUIRE) >= seq) break;
+        uint64_t ack = __atomic_load_n(&t->ack_seq, __ATOMIC_ACQUIRE);
+        if (ack >= seq) break;
         if (!__atomic_load_n(&t->tlb_live, __ATOMIC_SEQ_CST)) break; /* parked: it does the work before it runs again */
         if (self) hv_cpu_process_requests(self);
-        if (spins > 200) sched_yield();
+        if (sleep && spins >= 64) {
+            __atomic_add_fetch(&t->ack_waiters, 1, __ATOMIC_SEQ_CST);
+            /* Asleep until ack_seq's low word moves, a wake, or the timeout (a missed wake costs no more than that). */
+            if (__atomic_load_n(&t->ack_seq, __ATOMIC_SEQ_CST) == ack && __atomic_load_n(&t->tlb_live, __ATOMIC_SEQ_CST))
+                __ulock_wait(HV_UL_COMPARE_AND_WAIT | HV_ULF_NO_ERRNO, &t->ack_seq, (uint32_t)ack, hv_sync_wait_us);
+            __atomic_sub_fetch(&t->ack_waiters, 1, __ATOMIC_SEQ_CST);
+        } else if (spins > 200) {
+            sched_yield();
+        }
     }
     if (s) {
         __atomic_store_n(&s->tlb_live, 1, __ATOMIC_SEQ_CST);

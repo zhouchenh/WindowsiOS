@@ -61,6 +61,7 @@ static void park(HvCpu *cpu) {
     HvPerCpu *p = cpu->pc_state;
     __atomic_store_n(&p->tlb_live, 0, __ATOMIC_SEQ_CST);
     __atomic_store_n(&p->active, 0, __ATOMIC_SEQ_CST);
+    hv_cpu_ack_wake(cpu); /* a CPU asleep waiting for this one's acknowledgement need not wait any more (HV_SYNC_WAIT) */
 }
 
 static void unpark(HvCpu *cpu) {
