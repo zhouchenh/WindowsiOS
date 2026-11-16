@@ -70,6 +70,7 @@ final class ChromeModel: ObservableObject {
     private var hintWork: DispatchWorkItem?
     private var vbarCheck: DispatchWorkItem?
     private var lastInsets = EdgeInsets()
+    private var lastViewport: CGSize = .zero
 
     private init() {
         var map: [ChromeSurface: Bool] = [:]
@@ -182,6 +183,7 @@ final class ChromeModel: ObservableObject {
             rootController = root
             RootControllerHooks.install(on: root)
         }
+        if lastViewport.width > 0 { reportScreen(viewport: lastViewport) }
         applySystemState()
     }
 
@@ -282,6 +284,7 @@ final class ChromeModel: ObservableObject {
     }
 
     func reportScreen(viewport: CGSize) {
+        lastViewport = viewport
         guard let screen = window?.screen else { return }
         let nb = screen.nativeBounds.size
         let text = String(format: "%.0f×%.0f pt · %.0f×%.0f px · scale %.0f · native %.3f",
@@ -539,6 +542,8 @@ enum ChromeLabelStyle {
     case bar
     case round(CGFloat)
     case key
+
+    var isBar: Bool { if case .bar = self { return true } else { return false } }
 }
 
 struct ChromeMenuLabel: View {
@@ -760,7 +765,7 @@ struct SessionMoreMenu: View {
                 Button(L("电源…", "Power…"), systemImage: "power") { showPower() }
             }
         } label: {
-            ChromeMenuLabel(title: L("更多", "More"), symbol: "ellipsis.circle", style: style)
+            ChromeMenuLabel(title: L("更多", "More"), symbol: style.isBar ? "ellipsis.circle" : "ellipsis", style: style)
         }
     }
 }
@@ -841,7 +846,7 @@ struct ChromeHintView: View {
             .padding(.vertical, 9)
             .background(.ultraThinMaterial, in: Capsule())
             .overlay(Capsule().strokeBorder(.white.opacity(0.12)))
-            .frame(maxWidth: min(area.width - 32, 520))
+            .frame(maxWidth: max(0, min(area.width - 32, 520)))
             .frame(width: area.width)
             .offset(x: area.minX, y: top)
             .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)

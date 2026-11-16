@@ -637,6 +637,7 @@ private struct SettingsSheet: View {
                     .navigationTitle((page ?? .display).title)
                     .navigationBarTitleDisplayMode(.inline)
             }
+            .id(page) // another page starts at its top, not inside the last one's Advanced
         }
         .navigationSplitViewStyle(.balanced)
         // DisplaySettingsSection and PortForwardingSection may read the model from the environment.
