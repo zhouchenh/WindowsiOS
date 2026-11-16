@@ -351,6 +351,25 @@ static void test_code_page_drops(HvMachine *m, HvCpu *cpu, HvCpu *cpu1) {
     hv_self = NULL;
     hv_cpu_process_requests(cpu1);
     check_that(t && !ijc_has(m, 1, 0, t), "code-page drops: a full request queue did not drop everything");
+
+    /* IC IVAU at EL1 with PAN set, on a user page (the kernel flushing a process's JIT range): PAN does not
+       apply to cache maintenance, so the page's translations still go. */
+    {
+        HvRam *rc = hv_ram_lookup(m, code_pa);
+        uint64_t pgc = (code_pa - rc->pa) >> HV_TLB_PAGE_BITS;
+        rc->code_pages[pgc] = 1;
+        uint64_t gen = rc->page_gen[pgc], save = cpu->pstate_extra;
+        int el = cpu->el;
+        hv_self = cpu;
+        cpu->el = 1;
+        cpu->pstate_extra |= HV_PSTATE_PAN;
+        cpu->x[1] = uva;
+        hv_sysreg_sys(cpu, 0xd50b7521u, 0); /* ic ivau, x1 */
+        cpu->pstate_extra = save;
+        cpu->el = el;
+        hv_self = NULL;
+        check_that(rc->page_gen[pgc] != gen && !rc->code_pages[pgc], "IC IVAU at EL1 with PAN kept a user page's translations");
+    }
     hv_cpu_reset(cpu, m);
 }
 

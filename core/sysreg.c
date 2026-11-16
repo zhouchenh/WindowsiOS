@@ -445,7 +445,10 @@ int hv_sysreg_sys(HvCpu *cpu, uint32_t insn, uint64_t pc) {
         if (!hv_ic_ivau_drops()) return 0;
         HvWalk w;
         hv_mmu_walk(cpu, xt, HV_ACC_READ, cpu->el, &w);
-        if (!w.fsc) hv_invalidate_code(cpu->m, w.pa);
+        /* PAN does not apply to cache maintenance: the kernel flushing a process's JIT range
+           (NtFlushInstructionCache) runs this at EL1 with PAN set on a user page. A permission
+           fault still leaves the walk's address. */
+        if (!w.fsc || (w.fsc & 0x3c) == HV_FSC_PERMISSION(0)) hv_invalidate_code(cpu->m, w.pa);
         return 0;
     }
     if (crn == 7 && (crm == 1 || crm == 5)) { /* IC IALLUIS, IALLU */
