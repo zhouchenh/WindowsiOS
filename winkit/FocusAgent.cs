@@ -14,6 +14,10 @@
 // Rectangles are in framebuffer (physical screen) pixels; [] when unknown.
 // The reply, and the reply to the long poll PUT .../focus?wait=20, is text to type (UTF-8), or 204.
 //
+// Only the session on the screen (the console session) reports and types. With fast user switching, a
+// disconnected session or a Remote Desktop session, the other sessions' agents keep quiet: their focus is
+// not on the screen the iPhone shows, and the iPhone's text is not for them.
+//
 // Limits: windows of elevated programs (administrator consoles, regedit) and the secure desktop (UAC,
 // Ctrl+Alt+Del, the lock screen) are out of reach of a normal user's program: there the app falls back to
 // the tap point and does not raise the keyboard by itself, and typed text that cannot be delivered is
@@ -118,6 +122,13 @@ namespace WinKit
         [DllImport("user32.dll", SetLastError = true)]
         static extern uint SendInput(uint n, INPUT[] inputs, int size);
 
+        [DllImport("kernel32.dll")]
+        static extern uint WTSGetActiveConsoleSessionId();
+        [DllImport("kernel32.dll")]
+        static extern uint GetCurrentProcessId();
+        [DllImport("kernel32.dll")]
+        static extern bool ProcessIdToSessionId(uint pid, out uint session);
+
         [DllImport("oleacc.dll")]
         static extern int AccessibleObjectFromWindow(IntPtr hwnd, uint id, ref Guid iid, [MarshalAs(UnmanagedType.IUnknown)] out object obj);
 
@@ -152,6 +163,7 @@ namespace WinKit
         static DateTime lastCaretSend = DateTime.MinValue;
         static int failures;
         static readonly object TypeGate = new object();
+        static uint ownSession = uint.MaxValue;
 
         static void Log(string s)
         {
@@ -185,6 +197,7 @@ namespace WinKit
             }
             ServicePointManager.DefaultConnectionLimit = 8;
             ServicePointManager.Expect100Continue = false;
+            if (!ProcessIdToSessionId(GetCurrentProcessId(), out ownSession)) ownSession = uint.MaxValue;
             bool useUia = !File.Exists(Path.Combine(dir, "focus_nouia"));
             Log("focus agent started (UI Automation " + (useUia ? "on" : "off") + ")");
             if (useUia) Uia.Start();
@@ -238,14 +251,41 @@ namespace WinKit
             Wake.Set();
         }
 
+        // Whether this session is the one on the screen (see the top of the file).
+        static bool OnScreen()
+        {
+            return ownSession != uint.MaxValue && ownSession == WTSGetActiveConsoleSessionId();
+        }
+
         static void Worker(bool useUia)
         {
             DpiAware();
-            Send("hello", true);
+            bool wasOnScreen = OnScreen();
+            if (wasOnScreen) Send("hello", true);
             DateTime lastSlow = DateTime.MinValue;
             for (;;)
             {
                 Wake.WaitOne(1000);
+                bool onScreen = OnScreen();
+                if (!onScreen)
+                {
+                    lock (Gate) { pendingFocus = false; pendingForeground = false; pendingCaret = false; }
+                    wasOnScreen = false;
+                    if (!File.Exists(Path.Combine(dir, "agent.ps1")))
+                    {
+                        Log("the WinKit helper was removed: the focus agent stops");
+                        return;
+                    }
+                    continue;
+                }
+                if (!wasOnScreen)
+                {
+                    // back on the screen: the app has heard nothing from here, or from another session
+                    wasOnScreen = true;
+                    Refresh(useUia, true);
+                    Send("hello", true);
+                    continue;
+                }
                 bool f, g, c;
                 lock (Gate) { f = pendingFocus; g = pendingForeground; c = pendingCaret; }
                 if (f || g)
@@ -473,6 +513,7 @@ namespace WinKit
 
         static bool Send(string ev, bool force)
         {
+            if (!OnScreen()) return false;
             string body;
             lock (SendGate) // the worker and the typing thread ("typefail") both report
             {
@@ -521,13 +562,20 @@ namespace WinKit
             DpiAware();
             for (;;)
             {
+                if (!OnScreen())
+                {
+                    Thread.Sleep(2000); // not this session's text: the agent on the screen takes it
+                    continue;
+                }
                 string reply = Put(Url + "?wait=20", "{}", 30000);
                 if (reply == null && failures > 0)
                 {
                     Thread.Sleep(failures > 10 ? 15000 : 2000); // the app is not there (or too old for this)
                     continue;
                 }
-                if (!string.IsNullOrEmpty(reply)) TypeText(reply);
+                if (string.IsNullOrEmpty(reply)) continue;
+                if (OnScreen()) TypeText(reply);
+                else Log("typing: the session left the screen: " + reply.Length + " characters not typed");
             }
         }
 

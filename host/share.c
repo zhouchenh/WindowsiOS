@@ -992,7 +992,10 @@ static int forwards(Conn *c, Request *r) {
    The agent PUTs a JSON report whenever Windows' keyboard focus, caret, foreground program or input
    language changes; reports (bodies with a "kind") go to the app's handler, in this process. The reply
    carries text from the iOS keyboard for the agent to type (UTF-8; \b is Backspace), or is 204 when there
-   is none. PUT .../focus?wait=N (N <= 25 s) waits for such text: the agent keeps one of these open. */
+   is none. PUT .../focus?wait=N (N <= 25 s) waits for such text: the agent keeps one of these open.
+   &active=0: an agent in a session that is not on the screen (another user's, a disconnected one, or a
+   Remote Desktop one). Its reports are not the screen the iPhone shows, and the iPhone's text is not for
+   it: it is not counted as the agent, its report is dropped and it takes no text (it just waits). */
 
 static pthread_mutex_t focus_mu = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t focus_cond = PTHREAD_COND_INITIALIZER;
@@ -1056,10 +1059,23 @@ static int focus_put(Conn *c, Request *r) {
     char *body = body_small(c, r, &len);
     if (!body) return -1;
     int wait = 0;
-    const char *q = strstr(r->query, "wait=");
-    if (q) wait = atoi(q + 5);
+    const char *q = query_value(r->query, "wait");
+    if (q) wait = atoi(q);
     if (wait < 0) wait = 0;
     if (wait > 25) wait = 25;
+    const char *active_s = query_value(r->query, "active");
+    if (active_s && *active_s == '0') {
+        free(body);
+        if (wait > 0) { /* held as long as asked, so a loop around it does not spin */
+            struct timeval now;
+            gettimeofday(&now, NULL);
+            struct timespec until = {.tv_sec = now.tv_sec + wait, .tv_nsec = now.tv_usec * 1000};
+            pthread_mutex_lock(&focus_mu);
+            while (pthread_cond_timedwait(&focus_cond, &focus_mu, &until) != ETIMEDOUT) {}
+            pthread_mutex_unlock(&focus_mu);
+        }
+        return respond_empty(c, r, 204, "No Content");
+    }
     pthread_mutex_lock(&focus_mu);
     focus_seen = time(NULL);
     HvShareFocusHandler handler = focus_handler;

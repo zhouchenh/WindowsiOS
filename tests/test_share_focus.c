@@ -2,7 +2,9 @@
 /* /.henge/focus of host/share.c over its Unix socket, as the WinKit focus agent (winkit/FocusAgent.cs)
    uses it: reports reach the app's handler (heartbeats do not), text from the iOS keyboard is handed out
    once (UTF-8, \b kept), the long poll gets text queued while it waits and times out with 204, the busy
-   flag, and no text is taken while no agent was ever heard from. No network, no VM. */
+   flag, and no text is taken while no agent was ever heard from. An agent in a session that is not on the
+   screen (&active=0) is not the agent: its reports are dropped and it never takes the text. No network,
+   no VM. */
 #include "share.h"
 
 #include <pthread.h>
@@ -85,6 +87,11 @@ int main(void) {
     char out[4096];
     CHECK(hv_share_focus_agent_seen() == -1);
     CHECK(hv_share_focus_send_text("x") == -1); /* no agent yet */
+    /* an agent in another session: not counted, its report dropped */
+    CHECK(req("PUT", "/.henge/focus?active=0", "{\"seq\":1,\"event\":\"focus\",\"kind\":\"text\"}", out, sizeof out) == 204);
+    CHECK(calls == 0);
+    CHECK(hv_share_focus_agent_seen() == -1);
+    CHECK(hv_share_focus_send_text("x") == -1);
     CHECK(req("PUT", "/.henge/focus", "{\"seq\":1,\"event\":\"focus\",\"kind\":\"text\"}", out, sizeof out) == 204);
     CHECK(calls == 1 && strstr(got, "\"text\""));
     CHECK(hv_share_focus_agent_seen() >= 0);
@@ -103,6 +110,15 @@ int main(void) {
     CHECK(req("PUT", "/.henge/focus?wait=5", "{}", out, sizeof out) == 200);
     CHECK(strstr(out, "\r\n\r\n\xe4\xbd\xa0\xe5\xa5\xbd b\b") != NULL);
     pthread_join(t, NULL);
+    /* text is never handed to another session's agent, even one waiting for it: it stays for the agent on
+       the screen */
+    CHECK(hv_share_focus_send_text("secret") == 0);
+    CHECK(req("PUT", "/.henge/focus?wait=1&active=0", "{\"kind\":\"text\"}", out, sizeof out) == 204);
+    CHECK(strstr(out, "secret") == NULL);
+    CHECK(calls == 2);
+    CHECK(hv_share_focus_text_busy() == 1);
+    CHECK(req("PUT", "/.henge/focus", "{}", out, sizeof out) == 200);
+    CHECK(strstr(out, "\r\n\r\nsecret") != NULL);
     /* and times out with 204 */
     CHECK(req("PUT", "/.henge/focus?wait=1", "{}", out, sizeof out) == 204);
     CHECK(req("GET", "/.henge/focus", "", out, sizeof out) == 404);
