@@ -714,6 +714,7 @@ function ai {
             b.prepareAndStart(with: nil)
             syncFromBridge()
         }
+        JITSetup.shared.appBecameActive { [weak self] in self?.onAppBecameActive() } // app-jit hook
     }
 
     func startOrRetry() {

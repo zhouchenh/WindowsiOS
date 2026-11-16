@@ -39,6 +39,7 @@ struct SessionView: View {
         .statusBarHidden(true)
         .persistentSystemOverlays(.hidden)
         .defersSystemGestures(on: .all)
+        .onOpenURL { JITSetup.shared.handleOpenURL($0) } // app-jit hook
         .onAppear {
             WinIOSBridge.shared.updateScreenSize(UIScreen.main.bounds.size, scale: UIScreen.main.scale)
         }
@@ -283,8 +284,9 @@ private struct LaunchPage: View {
                             : L("请通过 StikDebug 开启 JIT", "Please enable JIT with StikDebug")
                     ) {
                         if !vm.isJITLive {
-                            Button(L("用 StikDebug 开启", "Enable with StikDebug")) { vm.requestStikDebugJIT() }
+                            Button(L("用 StikDebug 开启", "Enable with StikDebug")) { JITSetup.shared.enable() } // app-jit hook
                                 .buttonStyle(.bordered)
+                            JITPanel() // app-jit hook
                         }
                     }
                     Divider().padding(.leading, 52)
