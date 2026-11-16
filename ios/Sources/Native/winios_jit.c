@@ -14,6 +14,7 @@
 #include <mach/task.h>
 #include <mach/task_info.h>
 #include <mach/vm_map.h>
+#include <stdlib.h>
 #include <os/log.h>
 #include <os/proc.h>
 #include <signal.h>
@@ -90,6 +91,17 @@ static atomic_bool g_jit_live;
 static char g_status[256] = "Not initialized";
 
 static uint32_t g_cfg_jit_mb, g_cfg_ram_mb;
+/* Address space kept free next to guest RAM for the 3D stack (virglrenderer, DXMT, Metal buffers and
+   heaps). 1 GB was too little with 3D on and no extended-VA entitlement: Windows' compositor at
+   sign-in made Metal refuse a staging buffer and DXMT wrote through the null result (SIGSEGV in
+   MTLBuffer_updateContents). With 3D on, keep 2.5 GB free instead (guest RAM gets about 1.5 GB less). */
+static uint32_t g_cfg_3d_room_mb = 1024;
+
+void winios_jit_configure_3d(bool on) {
+    g_cfg_3d_room_mb = on ? 2560 : 1024;
+    const char *e = getenv("HV_3D_ROOM_MB"); /* override, in MiB (env.txt) */
+    if (e && atoi(e) >= 256) g_cfg_3d_room_mb = (uint32_t)atoi(e);
+}
 
 /* Set once the debugger that gave the JIT region was told to detach (when it was asked to). */
 static bool g_detach_requested;
@@ -143,17 +155,18 @@ static void prealloc_ledger_exempt_ram(void) {
         if (g_cfg_ram_mb >= 1024 && mb > g_cfg_ram_mb) continue; /* the user's cap */
         uint8_t *p = hv_alloc_no_footprint(mb << 20);
         if (p) {
-            /* Leave address space for the 3D stack (virglrenderer, DXMT, Metal heaps): ~1 GB. */
-            void *room = mmap(NULL, 1024ull << 20, PROT_NONE, MAP_ANON | MAP_PRIVATE, -1, 0);
+            /* Leave address space for the 3D stack (virglrenderer, DXMT, Metal heaps): see g_cfg_3d_room_mb. */
+            uint64_t room_bytes = (uint64_t)g_cfg_3d_room_mb << 20;
+            void *room = mmap(NULL, room_bytes, PROT_NONE, MAP_ANON | MAP_PRIVATE, -1, 0);
             if (room == MAP_FAILED) {
                 vm_deallocate(mach_task_self(), (vm_address_t)p, mb << 20);
                 continue;
             }
-            munmap(room, 1024ull << 20);
+            munmap(room, room_bytes);
             g_guest_ram = p;
             g_guest_ram_bytes = mb << 20;
-            WINIOS_LOG("pre-allocated %llu MiB ledger-exempt Guest RAM at %p",
-                       (unsigned long long)mb, (void *)p);
+            WINIOS_LOG("pre-allocated %llu MiB ledger-exempt Guest RAM at %p (%u MiB kept free for 3D)",
+                       (unsigned long long)mb, (void *)p, g_cfg_3d_room_mb);
             return;
         }
     }

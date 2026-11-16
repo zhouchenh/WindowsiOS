@@ -542,6 +542,7 @@ function ai {
         // before anything can acquire JIT: the sizes it will use
         winios_jit_configure(UInt32(max(0, UserDefaults.standard.integer(forKey: "winios.jitMB"))),
                              UInt32(max(0, UserDefaults.standard.integer(forKey: "winios.ramMB"))))
+        winios_jit_configure_3d(VMViewModel.readGPU3DSwitch())
         let bridge = WinIOSBridge.shared
         bridge.installTrapGuard()
         bridge.setDisplayFrameRate(frameRate)
