@@ -488,7 +488,8 @@ static int scenario_rules(void) {
     off.enabled = 0;
     put(off);
     check("turned off", wait_for("both", "\"state\":\"off\"", 2000));
-    check("turned off: closed", tcp_closed("127.0.0.1", p_moved) && !in_use(SOCK_STREAM, "::1", p_moved));
+    /* (Refused, not "can bind it": a relayed connection may linger in TIME_WAIT on the port.) */
+    check("turned off: closed", tcp_closed("127.0.0.1", p_moved) && tcp_closed("::1", p_moved));
 
     /* Local network: every interface. */
     int p_lan = free_port();
@@ -539,6 +540,12 @@ static int scenario_rules(void) {
     close(holder);
     check("... and opened once it is free", wait_for("busy", "\"state\":\"listening\"", 6000));
     check("... and works", tcp_echo("127.0.0.1", p_busy));
+
+    /* Opened again (as after the app comes back from the background): still working. */
+    hv_net_fwd_reopen();
+    check("reopen: synced", hv_net_fwd_sync(3000) == 0);
+    check("reopen: still listening", has("busy", "\"state\":\"listening\"") && has("lan", "\"state\":\"listening\""));
+    check("reopen: works", tcp_echo("127.0.0.1", p_busy) && tcp_echo("::1", p_lan) && udp_echo("::1", p_lan));
 
     /* expose-port: a session forward, listed, not saved; the same port again changes nothing. */
     int p_exp = free_port();

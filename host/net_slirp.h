@@ -58,6 +58,9 @@ int hv_net_fwd_put(HvFwdRule *r, int session, char *err, size_t errlen);
 int hv_net_fwd_remove(const char *id, int session_only);
 /* Interfaces changed: the VPN's address is looked up again and forwards that failed are tried again. */
 void hv_net_fwd_refresh(void);
+/* Closes and opens every forward again (iOS may take a suspended app's listening sockets away: call this when the
+   app comes back to the foreground). */
+void hv_net_fwd_reopen(void);
 /* Waits up to timeout_ms until the network thread has applied every change made so far. 0 when done (or when the
    network is not running), -1 on timeout. */
 int hv_net_fwd_sync(int timeout_ms);

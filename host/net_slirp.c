@@ -268,6 +268,7 @@ typedef struct Applied { /* what is open for a rule: network thread only */
 typedef struct Rule {
     int used, removed, session;
     int dirty;       /* changed since the network thread last looked */
+    int reopen;      /* close and open again (hv_net_fwd_reopen) */
     uint64_t serial; /* which use of the slot */
     HvFwdRule cfg;
     /* state, from the network thread */
@@ -623,16 +624,21 @@ static void *pump_thread(void *arg) {
 
 static void *tcp_bridge_thread(void *arg) {
     Bridge *br = arg;
+    int dead = 0; /* the socket broke (iOS reclaims a suspended app's listeners): wait for hv_net_fwd_reopen */
     for (;;) {
-        struct pollfd fds[2] = {{br->fd, POLLIN, 0}, {br->stop[0], POLLIN, 0}};
+        struct pollfd fds[2] = {{dead ? -1 : br->fd, POLLIN, 0}, {br->stop[0], POLLIN, 0}};
         if (poll(fds, 2, -1) < 0) {
             if (errno == EINTR) continue;
             break;
         }
         if (fds[1].revents) break;
+        if (fds[0].revents & (POLLERR | POLLNVAL)) dead = 1;
         if (!(fds[0].revents & POLLIN)) continue;
         int c = accept(br->fd, NULL, NULL);
-        if (c < 0) continue;
+        if (c < 0) {
+            if (errno != EAGAIN && errno != EINTR && errno != ECONNABORTED) dead = 1;
+            continue;
+        }
         no_sigpipe(c);
         Pump *p = malloc(sizeof *p);
         pthread_t t;
@@ -659,18 +665,23 @@ static void *udp_bridge_thread(void *arg) {
     UdpPeer peers[UDP_PEERS];
     for (int i = 0; i < UDP_PEERS; i++) peers[i].fd = -1;
     static __thread uint8_t buf[65536];
+    int dead = 0; /* as in tcp_bridge_thread */
     for (;;) {
         struct pollfd fds[2 + UDP_PEERS];
         fds[0] = (struct pollfd){br->stop[0], POLLIN, 0};
-        fds[1] = (struct pollfd){br->fd, POLLIN, 0};
+        fds[1] = (struct pollfd){dead ? -1 : br->fd, POLLIN, 0};
         for (int i = 0; i < UDP_PEERS; i++) fds[2 + i] = (struct pollfd){peers[i].fd, POLLIN, 0};
         if (poll(fds, 2 + UDP_PEERS, 1000) < 0 && errno != EINTR) break;
         if (fds[0].revents) break;
         int64_t now = now_ms();
-        if (fds[1].revents & POLLIN) {
+        if (fds[1].revents & POLLNVAL) dead = 1;
+        if (fds[1].revents & (POLLIN | POLLERR)) {
             struct sockaddr_in6 from;
             socklen_t fl = sizeof from;
             ssize_t n = recvfrom(br->fd, buf, sizeof buf, 0, (struct sockaddr *)&from, &fl);
+            if (n < 0 && errno != EAGAIN && errno != EINTR && errno != ECONNREFUSED && errno != EHOSTUNREACH &&
+                errno != ENETUNREACH)
+                dead = 1;
             if (n >= 0 && from.sin6_family == AF_INET6) {
                 int k = -1, oldest = 0;
                 for (int i = 0; i < UDP_PEERS; i++) {
@@ -1174,6 +1185,19 @@ void hv_net_fwd_refresh(void) {
     wake_net();
 }
 
+void hv_net_fwd_reopen(void) {
+    pthread_mutex_lock(&fwd_mu);
+    int open = 0;
+    for (int i = 0; i < MAX_RULES; i++) {
+        rules[i].dirty = rules[i].reopen = 1;
+        open += rules[i].used && rules[i].cfg.enabled && net_running;
+    }
+    if (open) fprintf(stderr, "winvm: net: opening the port forwards again\n");
+    fwd_changed_locked();
+    pthread_mutex_unlock(&fwd_mu);
+    wake_net();
+}
+
 int hv_net_fwd_sync(int timeout_ms) {
     struct timespec until;
     clock_gettime(CLOCK_REALTIME, &until);
@@ -1364,7 +1388,7 @@ static int same_place(const Applied *ap, const HvFwdRule *c, const Want *w) {
 }
 
 typedef struct Snap {
-    int used, removed, session, dirty, errored;
+    int used, removed, session, dirty, reopen, errored;
     uint64_t serial;
     HvFwdRule c;
     char state[12], msg[160], warn[160], listen0[64];
@@ -1385,6 +1409,8 @@ static void fwd_reconcile(int periodic) {
         Rule *r = &rules[i];
         memset(&s[i], 0, sizeof s[i]);
         s[i].used = r->used, s[i].removed = r->removed, s[i].session = r->session, s[i].dirty = r->dirty;
+        s[i].reopen = r->reopen;
+        r->reopen = 0;
         s[i].errored = !strcmp(r->state, "error");
         s[i].serial = r->serial, s[i].c = r->cfg;
         memcpy(s[i].state, r->state, sizeof s[i].state);
@@ -1423,7 +1449,7 @@ static void fwd_reconcile(int periodic) {
             snprintf(o[i].state, sizeof o[i].state, "error");
             snprintf(o[i].code, sizeof o[i].code, "%s", w[i].code);
             snprintf(o[i].msg, sizeof o[i].msg, "%s", w[i].msg);
-        } else if (same_place(ap, c, &w[i]) || (!ap->on && s[i].errored && !s[i].dirty && !periodic)) {
+        } else if (!s[i].reopen && (same_place(ap, c, &w[i]) || (!ap->on && s[i].errored && !s[i].dirty && !periodic))) {
             act[i] = 0; /* as it is (a failed one is tried again on the timer, or when it is changed) */
         } else {
             if (ap->on) fwd_teardown(ap);
