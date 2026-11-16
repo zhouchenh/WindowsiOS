@@ -345,10 +345,13 @@ final class JITSetup: ObservableObject {
                 showBuiltInSetup = true
                 return
             }
-            ownVPNConnected = OwnVPN.isConnected
+            refreshVPNStatus()
             // Not a hard stop: a VPN whose interface is named otherwise still gets its try, and the helper
             // says what failed.
-            if !ownVPNConnected { jitLog("no VPN tunnel interface is up; trying the device address anyway") }
+            if !ownVPNConnected {
+                jitLog(vpnConnected ? "LocalDevVPN is connected, not your own VPN; trying the device address anyway"
+                                    : "no VPN tunnel interface is up; trying the device address anyway")
+            }
             requestDebugger()
             return
         }
@@ -685,7 +688,8 @@ final class JITSetup: ObservableObject {
     }
 
     /// Test connection (the user's own VPN): the helper connects to RemotePairing's port at the device
-    /// address and, once paired, checks that RemotePairing answers there. Says which stage failed.
+    /// address, checks that RemotePairing answers its opening handshake there and, once paired, that a
+    /// session works. Says which stage failed.
     func testConnection() {
         guard !helperBusy, !busy else { return }
         if let reason = WinBuiltInJIT.unavailableReason {
@@ -816,12 +820,14 @@ struct JITPanel: View {
             JITMethodRow()
             if jit.builtInUsesOwnVPN {
                 // No LocalDevVPN here: the helper goes through the user's own VPN.
+                // OwnVPN does not count LocalDevVPN; with it up, the user's own VPN is not (one VPN at a time).
                 HStack(spacing: 6) {
                     Image(systemName: jit.ownVPNConnected ? "checkmark.shield.fill" : "shield.slash")
-                        .foregroundStyle(jit.ownVPNConnected ? .green : .secondary)
+                        .foregroundStyle(jit.ownVPNConnected ? .green : jit.vpnConnected ? .orange : .secondary)
                     Text(jit.ownVPNConnected ? L("VPN 已连接（内置 JIT 通过它连到本机）", "VPN connected (built-in JIT reaches this device through it)")
-                                             : L("没有连接 VPN：内置 JIT 要通过你的 VPN 连到本机", "No VPN connected: built-in JIT reaches this device through your VPN"))
-                        .font(.footnote).foregroundStyle(.secondary)
+                         : jit.vpnConnected ? L("LocalDevVPN 正连着：请改连你自己的 VPN", "LocalDevVPN is connected: connect your own VPN instead")
+                         : L("没有连接 VPN：内置 JIT 要通过你的 VPN 连到本机", "No VPN connected: built-in JIT reaches this device through your VPN"))
+                        .font(.footnote).foregroundStyle(jit.vpnConnected && !jit.ownVPNConnected ? .orange : .secondary)
                 }
             } else {
                 HStack(spacing: 6) {

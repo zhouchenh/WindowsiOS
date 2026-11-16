@@ -17,7 +17,7 @@ struct WinJITRequest: Codable, Sendable {
         /// Attach to `targetPID` and run the JIT script until it detaches.
         case enable
         case resetDDI
-        /// Connect to RemotePairing at the device address and, with a pairing file, check that it answers.
+        /// Check that RemotePairing answers at the device address and, with a pairing file, that a session works.
         case testConnection
     }
 
@@ -62,13 +62,14 @@ struct WinJITRequest: Codable, Sendable {
     enum ConnectionCheck: String, Codable, Sendable {
         /// No TCP connection to RemotePairing's port at the address (or no open port was found there).
         case cannotConnect
-        /// Connected, but RemotePairing never answered: iOS may not answer on the VPN's interface, or
-        /// the port is another service.
+        /// Connected, but RemotePairing never answered its opening handshake: the connection was closed
+        /// or reset first, nothing came back, or another service replied. iOS may not answer on the
+        /// VPN's interface, or the port is another service.
         case noAnswer
-        /// Connected and RemotePairing answered, but the session failed (pairing refused, the tunnel's
-        /// second port not reachable through the VPN, ...): the message says how.
+        /// Connected and RemotePairing answered its opening handshake, but the session failed (pairing
+        /// refused, the tunnel's second port not reachable through the VPN, ...): the message says how.
         case remotePairingFailed
-        /// Connected; RemotePairing was not tried (no pairing file).
+        /// RemotePairing answered its opening handshake; no session was tried (no pairing file).
         case connected
         /// RemotePairing answered and a session over it worked.
         case ok

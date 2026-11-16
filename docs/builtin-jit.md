@@ -98,10 +98,11 @@ of the device, and the session opens a second port for its tunnel.
 
 **In Apple VM**: Built-in JIT setup › **3. Connection** › **My VPN**, and enter `R` (an IPv4 or IPv6
 address, with or without brackets). With your VPN connected, tap **Test connection**: it connects to
-RemotePairing at `R` and, once paired, checks that RemotePairing answers there. It says which step
-failed: no connection at all (VPN off, `R` not routed into it, or the server not reflecting), connected
-but RemotePairing did not answer, or RemotePairing answered and the session failed (the details say
-how; "tunnel port could not be reached" means the server forwards only some ports). Then **Prepare**
+`R` and sends RemotePairing's opening handshake, which needs no pairing, and once paired it also opens
+a session. It says which step failed: no connection at all (VPN off, `R` not routed into it, or the
+server not reflecting), connected but RemotePairing did not answer (the connection was closed, nothing
+came back, or another service replied), or RemotePairing answered and the session failed (the details
+say how; "tunnel port could not be reached" means the server forwards only some ports). Then **Prepare**
 and **Enable** as usual. The JIT row shows whether a VPN is up instead of LocalDevVPN's state, and
 Apple VM never opens LocalDevVPN in this mode. StikDebug is unaffected: it is a separate app with its
 own setting.
@@ -112,8 +113,10 @@ These use documentation addresses: replace them with yours. The VPN is WireGuard
 of a Linux server whose own tunnel address is `10.66.0.1`; the device's tunnel address is `10.66.0.2`.
 
 **IPv4 reflector**: `R` = `10.66.1.2`, an address of a range no one uses, sent back to the device.
-The device's WireGuard peer must route it into the tunnel (AllowedIPs includes `10.66.1.2/32`, or
-`0.0.0.0/0`). With nftables:
+The device's WireGuard peer must route `R` into the tunnel and accept the reflected packets, whose
+source is the server's masquerade address `10.66.0.1`: WireGuard drops a packet whose source is not in
+the peer's AllowedIPs. So AllowedIPs includes both `10.66.1.2/32` and `10.66.0.1/32` (or
+`10.66.0.0/16`, or `0.0.0.0/0`). With nftables:
 
 ```
 table ip jit_reflector {
@@ -145,12 +148,32 @@ address in the VPN and you would rather not spend IPv4 addresses. `R` is an IPv6
 server, for example one in a second /64 of the VPN's prefix with the device's interface identifier
 (device `2001:db8:0:1::abcd`, reflector `2001:db8:0:2::abcd`), and the server translates it to the
 device's IPv4 tunnel address `10.66.0.2`, with the source translated to the server's IPv4 address on
-`wg0`. That is stateful NAT64 with a fixed destination per device, plus the masquerade above; a NAT64
-translator such as Jool or TAYGA does it (with TAYGA, its IPv4 side then goes through a NAT44
-masquerade like the one above). With a translator's standard prefix scheme instead of a per-device
+`wg0`.
+
+A fixed IPv6-to-IPv4 mapping per address like this is stateless translation with an explicit address
+mapping table (SIIT with EAM, RFC 7757), not stateful NAT64: a stateful NAT64's pool can only take the
+IPv4 address from the last 32 bits of its prefix (below). The device's own IPv6 source needs a mapping
+too, to an unused IPv4 address such as `10.66.2.2`, which the masquerade then turns into the server's
+address. A sketch, to check against your translator's documentation:
+
+- Jool in SIIT mode (Jool's documentation recommends its own network namespace when the same server
+  also does NAT):
+  `jool_siit eamt add 2001:db8:0:2::abcd/128 10.66.0.2/32` and
+  `jool_siit eamt add 2001:db8:0:1::abcd/128 10.66.2.2/32`.
+- TAYGA: `map 10.66.0.2 2001:db8:0:2::abcd` and `map 10.66.2.2 2001:db8:0:1::abcd` (or a
+  `dynamic-pool` for the sources), with `R` and `10.66.2.2` routed to TAYGA's interface.
+- Then a NAT44 masquerade of the translated packets towards the device, for example
+  `oifname "wg0" ip saddr 10.66.2.2 ip daddr 10.66.0.2 masquerade` in the postrouting chain above
+  (`ct status dnat` does not match them: the translator, not conntrack, rewrote the destination).
+
+The server must forward IPv6 as well as IPv4 (`net.ipv6.conf.all.forwarding=1`).
+
+With a stateful NAT64 (Jool's NAT64 mode with pool6 and pool4, for example) instead of a per-device
 address, `R` is the device's IPv4 address embedded in the translator's IPv6 prefix (RFC 6052): with
-the prefix `2001:db8:64::/96`, `R` is `2001:db8:64::a42:2` (`2001:db8:64::10.66.0.2`). Either way the
-device's peer must route `R` into the tunnel (AllowedIPs includes it, or `::/0`).
+the prefix `2001:db8:64::/96`, `R` is `2001:db8:64::a42:2` (`2001:db8:64::10.66.0.2`), and the source
+becomes a pool4 address. Either way the device's peer must route `R` into the tunnel (AllowedIPs
+includes it, or `::/0`) and accept the IPv4 source the reflected packets arrive with (the server's
+`10.66.0.1/32`, or the pool4 address).
 
 ### Caveats
 
@@ -178,8 +201,10 @@ device's peer must route `R` into the tunnel (AllowedIPs includes it, or `::/0`)
 - **Signing without `get-task-allow`** (a distribution certificate, some signing services): no
   debugger can attach. The setup says so.
 - **LocalDevVPN** is a third-party app. Built-in JIT does not work without it, or without your own
-  VPN set up as a reflector (above). Another VPN that routes 10.7.0.1 to this device also works with
-  the LocalDevVPN setting.
+  VPN set up as a reflector (above). Another VPN that routes 10.7.0.1 back to this device works too,
+  with the **My VPN** setting and `10.7.0.1` as the address. The LocalDevVPN setting counts only a
+  tunnel with an address in 10.7.0.0/16 as connected, and otherwise opens LocalDevVPN when it is
+  installed, which disconnects the other VPN.
 - On-device pairing uses iOS 27's device-initiated pairing, which Apple does not document; an iOS
   update could change it. Importing a pairing file, or StikDebug, keeps working then.
 
@@ -188,8 +213,9 @@ device's peer must route `R` into the tunnel (AllowedIPs includes it, or `::/0`)
 - **"Apple VM couldn't reach this device"**: LocalDevVPN is not connected or not routing. Connect
   it, turn off other VPNs (Tailscale and the like), then try again.
 - **My VPN: "couldn't connect to this device through your VPN"**: the VPN is off, the reflector
-  address is not routed into it, or the server does not reflect it. **"Connected through your VPN,
-  but RemotePairing did not answer"**: the server reflects, but iOS did not answer RemotePairing there
+  address is not routed into it, the server does not reflect it, or the device's AllowedIPs lack the
+  address the reflected packets come from. **"Connected through your VPN, but RemotePairing did not
+  answer"**: the server reflects, but iOS closed the connection or did not answer RemotePairing there
   (or the port is another service): use LocalDevVPN.
 - **On cellular only**, LocalDevVPN can show Connected while iOS sends the connection over the
   mobile network. Apple VM retries twice by itself. If it still fails, turn Cellular Data off in

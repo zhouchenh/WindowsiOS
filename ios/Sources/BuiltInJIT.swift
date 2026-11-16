@@ -71,21 +71,34 @@ enum JITConnectionMode: String, CaseIterable, Identifiable {
 }
 
 /// The user's own VPN, as far as this device can see it: a tunnel interface that is up with an address
-/// that is not link-local.
+/// that is not link-local, and is not LocalDevVPN's.
 enum OwnVPN {
     /// utun* (WireGuard, most VPN apps) with an IPv4 address or an IPv6 one outside fe80::/10, or
     /// ipsec* (IKEv2) with an IPv4 address or a unique local IPv6 one: with Wi-Fi Calling or VoLTE
-    /// iOS brings up ipsec interfaces with a carrier's global IPv6 address and no VPN at all.
+    /// iOS brings up ipsec interfaces with a carrier's global IPv6 address and no VPN at all. A utun
+    /// with an address in 10.7.0.0/16 is LocalDevVPN (LocalDevVPN.isConnected), which routes only its
+    /// own network, so it does not count, whatever other addresses it has.
     static var isConnected: Bool {
         var list: UnsafeMutablePointer<ifaddrs>?
         guard getifaddrs(&list) == 0, let first = list else { return false }
         defer { freeifaddrs(list) }
-        for p in sequence(first: first, next: { $0.pointee.ifa_next }) {
+        let interfaces = Array(sequence(first: first, next: { $0.pointee.ifa_next }))
+        var localDevVPN = Set<String>()
+        for p in interfaces {
+            let ifa = p.pointee
+            guard let sa = ifa.ifa_addr, Int32(sa.pointee.sa_family) == AF_INET else { continue }
+            let ip = sa.withMemoryRebound(to: sockaddr_in.self, capacity: 1) {
+                UInt32(bigEndian: $0.pointee.sin_addr.s_addr)
+            }
+            let name = String(cString: ifa.ifa_name)
+            if ip >> 16 == 0x0a07, name.hasPrefix("utun") { localDevVPN.insert(name) }
+        }
+        for p in interfaces {
             let ifa = p.pointee
             guard (ifa.ifa_flags & UInt32(IFF_UP)) != 0, let sa = ifa.ifa_addr else { continue }
             let name = String(cString: ifa.ifa_name)
             let utun = name.hasPrefix("utun")
-            guard utun || name.hasPrefix("ipsec") else { continue }
+            guard utun || name.hasPrefix("ipsec"), !localDevVPN.contains(name) else { continue }
             switch Int32(sa.pointee.sa_family) {
             case AF_INET:
                 let ip = sa.withMemoryRebound(to: sockaddr_in.self, capacity: 1) {
@@ -617,14 +630,14 @@ enum JITOwnVPNAdvice {
             return L("通过你的 VPN 连不上本机。请确认 VPN 已连接，地址填的是 VPN 服务器转回本机的那个（反射地址），并且服务器上的反射规则在生效，然后重试。",
                      "Apple VM couldn't connect to this device through your VPN. Check that the VPN is connected, that the address is the one its server routes back to this device (the reflector address), and that the reflector is running on the server, then try again.")
         case .noAnswer:
-            return L("通过你的 VPN 连上了，但本机的 RemotePairing 服务没有回应。iOS 可能不在 VPN 的接口上回应它，或者这个端口是别的服务。请改用 LocalDevVPN。",
-                     "Connected through your VPN, but this device's RemotePairing service did not answer. iOS may not answer it on the VPN's interface, or that port is another service. Use LocalDevVPN instead.")
+            return L("通过你的 VPN 连上了，但本机的 RemotePairing 服务没有回应（连接被关闭、没有回音，或回应的是别的服务）。iOS 可能不在 VPN 的接口上回应它，或者这个端口是别的服务。请改用 LocalDevVPN。",
+                     "Connected through your VPN, but this device's RemotePairing service did not answer (the connection was closed, nothing came back, or another service replied). iOS may not answer it on the VPN's interface, or that port is another service. Use LocalDevVPN instead.")
         case .remotePairingFailed:
             return L("通过你的 VPN 连上了，RemotePairing 也回应了，但会话没有建立（详情见下）。如果是隧道端口连不上，请让反射规则对这个地址的所有端口生效；如果配对被拒绝，请重新配对。",
                      "Connected through your VPN and RemotePairing answered, but the session failed (details below). If its tunnel port could not be reached, have the reflector forward every port of that address; if the pairing was refused, pair again.")
         case .connected:
-            return L("通过你的 VPN 能连到本机的端口。配对后再测试一次，可以确认 RemotePairing 会回应。",
-                     "This device's port is reachable through your VPN. Test again once paired to check that RemotePairing answers.")
+            return L("通过你的 VPN，本机的 RemotePairing 有回应。配对后再测试一次，可以确认会话能建立。",
+                     "This device's RemotePairing answers through your VPN. Test again once paired to check that a session works.")
         case .ok:
             return L("通过你的 VPN 连接正常：RemotePairing 有回应。", "Works through your VPN: RemotePairing answered.")
         }

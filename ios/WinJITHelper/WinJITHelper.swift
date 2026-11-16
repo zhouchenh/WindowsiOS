@@ -60,8 +60,7 @@ private enum WinJITWork {
             }
 
             if request.operation == .testConnection, request.pairingData?.isEmpty ?? true {
-                return testWithoutPairing(configuration: configuration, needsScan: needsScan, ownVPN: ownVPN,
-                                          portNote: portNote)
+                return testWithoutPairing(configuration: configuration, needsScan: needsScan, portNote: portNote)
             }
             guard let pairingData = request.pairingData, !pairingData.isEmpty else {
                 throw NSError(domain: "WinJITHelper", code: 1,
@@ -72,24 +71,23 @@ private enum WinJITWork {
                 "\(pairingFilePrefix)\(getpid())-\(UUID().uuidString).plist")
             try pairingData.write(to: pairingURL, options: [.atomic, .completeFileProtectionUntilFirstUserAuthentication])
             defer { try? manager.removeItem(at: pairingURL) }
-            if needsScan {
-                let found = findRSDPort(pairingFile: pairingURL, base: configuration, ownVPN: ownVPN)
-                if let port = found.port {
+            if needsScan && ownVPN {
+                // The port that answers RemotePairing's handshake is RemotePairing's, whatever the session
+                // on it then comes to: checkRemotePairing below reports that (a refused pairing, say).
+                switch findRSDPortThroughVPN(host: configuration.deviceAddress) {
+                case .found(let port):
+                    configuration.rsdPort = port
+                    portNote += " [port scan: RemotePairing answered on \(port)]"
+                case .notFound(let check):
+                    return .init(success: false, message: check.detail + portNote + " [port scan: no RemotePairing port found]",
+                                 txmPresent: StikJIT.isTXMPresent, connection: check.result)
+                }
+            } else if needsScan {
+                if let port = findRSDPort(pairingFile: pairingURL, base: configuration) {
                     configuration.rsdPort = port
                     portNote += " [port scan: using \(port)]"
                 } else {
                     portNote += " [port scan: no RemotePairing port found]"
-                    if ownVPN {
-                        // No open port at all: the address does not lead back here. Open ports but none
-                        // answered: they lead here, but RemotePairing did not answer on any of them.
-                        return .init(success: false,
-                                     message: (found.openPorts == 0
-                                        ? "No port in 49152-65535 is open at the device address through your VPN."
-                                        : "\(found.openPorts) port(s) are open at the device address, but none answered as RemotePairing.")
-                                        + portNote,
-                                     txmPresent: StikJIT.isTXMPresent,
-                                     connection: found.openPorts == 0 ? .cannotConnect : .noAnswer)
-                    }
                 }
             }
 
@@ -175,27 +173,61 @@ private enum WinJITWork {
 
     /// The last port that worked, then every open port in iOS's range, each probed with a real StikJIT call.
     /// The port changes at each reboot of the device, so a stale remembered one just falls through to the scan.
-    /// Through the user's VPN a closed port answers only after a round trip to its server, so each batch
-    /// of the scan waits longer, and each probe has a deadline (checkRemotePairing).
-    private static func findRSDPort(pairingFile: URL, base: StikJIT.Configuration,
-                                    ownVPN: Bool) -> (port: UInt16?, openPorts: Int) {
+    private static func findRSDPort(pairingFile: URL, base: StikJIT.Configuration) -> UInt16? {
         func works(_ port: UInt16) -> Bool {
             var probe = base
             probe.rsdPort = port
-            if ownVPN {
-                return checkRemotePairing(pairingFile: pairingFile, configuration: probe, timeout: 8).result == .ok
-            }
             probe.connectionTimeout = 2
             return (try? StikJIT.isDDIMounted(pairingFile: pairingFile, configuration: probe)) != nil
         }
         let last = UInt16(exactly: UserDefaults.standard.integer(forKey: lastPortKey)) ?? 0
-        if last != 0, works(last) { return (last, 1) }
-        let open = ownVPN ? RSDPortScanner.openPorts(host: base.deviceAddress, waitMs: 700)
-                          : RSDPortScanner.openPorts(host: base.deviceAddress)
+        if last != 0, works(last) { return last }
+        let open = RSDPortScanner.openPorts(host: base.deviceAddress)
         NSLog("[WinJITHelper] open ports: %@", open.map(String.init).joined(separator: ","))
-        guard let port = open.first(where: works) else { return (nil, open.count) }
+        guard let port = open.first(where: works) else { return nil }
         UserDefaults.standard.set(Int(port), forKey: lastPortKey)
-        return (port, open.count)
+        return port
+    }
+
+    enum PortSearch {
+        case found(UInt16)
+        /// Why no port answered: no open port at all (.cannotConnect), or open ports where RemotePairing
+        /// did not answer (.noAnswer), with what each came to.
+        case notFound(Check)
+    }
+
+    /// Through the user's VPN: the last port that answered, then every open port in iOS's range, each
+    /// asked RemotePairing's opening handshake (no pairing needed). A closed port answers only after a
+    /// round trip to the VPN's server, so each batch of the scan waits longer.
+    private static func findRSDPortThroughVPN(host: String) -> PortSearch {
+        let family = JITDeviceAddress.family(host)
+        func probe(_ port: UInt16) -> RSDPortScanner.ProbeOutcome {
+            let outcome = RSDPortScanner.remotePairingAnswers(host: host, port: port, connectMs: 5_000, answerMs: 5_000)
+            NSLog("[WinJITHelper] stage: RemotePairing handshake (%@, port %u): %@", family, UInt32(port),
+                  outcome.description)
+            return outcome
+        }
+        let last = UInt16(exactly: UserDefaults.standard.integer(forKey: lastPortKey)) ?? 0
+        if last != 0, probe(last) == .answered { return .found(last) }
+        NSLog("[WinJITHelper] stage: scanning for open ports (%@)", family)
+        let open = RSDPortScanner.openPorts(host: host, waitMs: 700).filter { $0 != last }
+        NSLog("[WinJITHelper] open ports: %@", open.map(String.init).joined(separator: ","))
+        guard !open.isEmpty else {
+            return .notFound(Check(result: .cannotConnect,
+                                   detail: "No port in 49152-65535 is open at this device's \(family) address through your VPN."))
+        }
+        var outcomes: [String] = []
+        for port in open {
+            let outcome = probe(port)
+            if outcome == .answered {
+                UserDefaults.standard.set(Int(port), forKey: lastPortKey)
+                return .found(port)
+            }
+            outcomes.append("\(port): \(outcome)")
+        }
+        return .notFound(Check(result: .noAnswer,
+                               detail: "\(open.count) port(s) are open at this device's \(family) address, but RemotePairing answered on none of them ("
+                                + outcomes.joined(separator: "; ") + ")."))
     }
 
     // MARK: Checking the device address (the user's VPN, and Test connection)
@@ -206,33 +238,28 @@ private enum WinJITWork {
         var detail: String
     }
 
-    /// Stage by stage: a TCP connection to RemotePairing's port, then a RemotePairing session (StikJIT's
-    /// Developer Disk Image query: pair-verify, the tunnel, RSD) with a deadline. A failure says which
-    /// stage it was: cannot connect, connected but no answer, or answered and then failed.
+    /// Stage by stage, so a failure says which stage it was: a TCP connection to RemotePairing's port and
+    /// its opening handshake (handshakeCheck: cannot connect, or connected but no answer), then, with
+    /// the pairing, a RemotePairing session (StikJIT's Developer Disk Image query: pair-verify, the
+    /// tunnel, RSD) with a deadline: any failure there comes after RemotePairing answered.
     private static func checkRemotePairing(pairingFile: URL, configuration: StikJIT.Configuration,
                                            timeout: TimeInterval = 20) -> Check {
+        if let failed = handshakeCheck(configuration) { return failed }
         let family = JITDeviceAddress.family(configuration.deviceAddress)
         let port = configuration.rsdPort
-        NSLog("[WinJITHelper] stage: TCP connect (%@, port %u)", family, UInt32(port))
-        let tcp = RSDPortScanner.connect(host: configuration.deviceAddress, port: port,
-                                         timeoutMs: Int32(configuration.connectionTimeout * 1000))
-        NSLog("[WinJITHelper] stage: TCP connect: %@", tcp.description)
-        guard tcp == .open else {
-            return Check(result: .cannotConnect,
-                         detail: "Cannot connect to this device at its \(family) address, port \(port): \(tcp).")
-        }
         NSLog("[WinJITHelper] stage: RemotePairing session (deadline %d s)", Int(timeout))
         switch StikJITCall.run(timeout: timeout, {
             try StikJIT.isDDIMounted(pairingFile: pairingFile, configuration: configuration)
         }) {
         case .returned(let mounted):
-            NSLog("[WinJITHelper] stage: RemotePairing answered (DDI %@)", mounted ? "mounted" : "not mounted")
+            NSLog("[WinJITHelper] stage: RemotePairing session worked (DDI %@)", mounted ? "mounted" : "not mounted")
             return Check(result: .ok, detail: "Connected to port \(port) and RemotePairing answered"
                          + " (Developer Disk Image \(mounted ? "mounted" : "not mounted yet")).")
         case .threw(let message):
-            NSLog("[WinJITHelper] stage: RemotePairing failed: %@", message)
+            NSLog("[WinJITHelper] stage: RemotePairing session failed: %@", message)
             // idevice reports its own connects as InternalError("connect: ...") for RemotePairing's port
-            // and ("TLS tunnel: ...") for the tunnel port RemotePairing opens once it has answered.
+            // and ("TLS tunnel: ...") for the tunnel port RemotePairing opens once it has answered; its
+            // socket errors come as Socket(... kind: ConnectionReset / UnexpectedEof ...).
             if message.contains("TLS tunnel") {
                 return Check(result: .remotePairingFailed,
                              detail: "Connected to port \(port) and RemotePairing answered, but the tunnel port it opened could not be reached at the same address: \(message)")
@@ -241,41 +268,63 @@ private enum WinJITWork {
                 return Check(result: .cannotConnect,
                              detail: "Cannot connect to this device at its \(family) address, port \(port): \(message)")
             }
+            let lowered = message.lowercased()
+            if ["connectionreset", "connection reset", "unexpectedeof", "early eof", "brokenpipe"].contains(where: lowered.contains) {
+                return Check(result: .remotePairingFailed,
+                             detail: "Connected to port \(port) and RemotePairing answered, then this device closed the session (usually: it no longer accepts this pairing): \(message)")
+            }
             return Check(result: .remotePairingFailed,
-                         detail: "Connected to port \(port), but the RemotePairing session failed: \(message)")
+                         detail: "Connected to port \(port) and RemotePairing answered, but the session failed: \(message)")
         case .timedOut:
-            NSLog("[WinJITHelper] stage: RemotePairing did not answer within %d s", Int(timeout))
-            return Check(result: .noAnswer,
-                         detail: "Connected to port \(port), but RemotePairing did not answer within \(Int(timeout)) s.")
+            NSLog("[WinJITHelper] stage: RemotePairing session did not finish within %d s", Int(timeout))
+            return Check(result: .remotePairingFailed,
+                         detail: "Connected to port \(port) and RemotePairing answered, but the session did not finish within \(Int(timeout)) s.")
         }
     }
 
-    /// Test connection without a pairing file: only the TCP connection (to any open port in iOS's range
-    /// when the port is not known; which of them is RemotePairing takes the pairing to tell).
-    private static func testWithoutPairing(configuration: StikJIT.Configuration, needsScan: Bool, ownVPN: Bool,
-                                           portNote: String) -> WinJITRequest.Response {
+    /// The first two stages at configuration's address and port: the TCP connection and RemotePairing's
+    /// answer to its opening handshake. nil when RemotePairing answered.
+    private static func handshakeCheck(_ configuration: StikJIT.Configuration) -> Check? {
         let family = JITDeviceAddress.family(configuration.deviceAddress)
-        if needsScan {
-            NSLog("[WinJITHelper] stage: scanning for open ports (%@)", family)
-            let open = ownVPN ? RSDPortScanner.openPorts(host: configuration.deviceAddress, waitMs: 700)
-                              : RSDPortScanner.openPorts(host: configuration.deviceAddress)
-            NSLog("[WinJITHelper] stage: %d open port(s)", open.count)
-            return .init(success: !open.isEmpty,
-                         message: open.isEmpty
-                            ? "No open port in 49152-65535 at this device's \(family) address." + portNote
-                            : "\(open.count) open port(s) at this device's \(family) address; pair to check which is RemotePairing." + portNote,
-                         txmPresent: StikJIT.isTXMPresent, connection: open.isEmpty ? .cannotConnect : .connected)
-        }
         let port = configuration.rsdPort
-        NSLog("[WinJITHelper] stage: TCP connect (%@, port %u)", family, UInt32(port))
-        let tcp = RSDPortScanner.connect(host: configuration.deviceAddress, port: port,
-                                         timeoutMs: Int32(configuration.connectionTimeout * 1000))
-        NSLog("[WinJITHelper] stage: TCP connect: %@", tcp.description)
-        return .init(success: tcp == .open,
-                     message: tcp == .open
-                        ? "Connected to port \(port) at this device's \(family) address; pair to check that RemotePairing answers." + portNote
-                        : "Cannot connect to this device at its \(family) address, port \(port): \(tcp)." + portNote,
-                     txmPresent: StikJIT.isTXMPresent, connection: tcp == .open ? .connected : .cannotConnect)
+        NSLog("[WinJITHelper] stage: TCP connect and RemotePairing handshake (%@, port %u)", family, UInt32(port))
+        let outcome = RSDPortScanner.remotePairingAnswers(host: configuration.deviceAddress, port: port,
+                                                          connectMs: Int32(configuration.connectionTimeout * 1000),
+                                                          answerMs: 10_000)
+        NSLog("[WinJITHelper] stage: RemotePairing handshake: %@", outcome.description)
+        switch outcome {
+        case .answered:
+            return nil
+        case .cannotConnect(let tcp):
+            return Check(result: .cannotConnect,
+                         detail: "Cannot connect to this device at its \(family) address, port \(port): \(tcp).")
+        case .closedWithoutAnswer, .silent, .otherService:
+            return Check(result: .noAnswer, detail: "Port \(port) at this device's \(family) address: \(outcome).")
+        }
+    }
+
+    /// Test connection without a pairing file: the TCP connection and RemotePairing's answer to its
+    /// opening handshake, on the known port or on whichever open port in iOS's range answers.
+    private static func testWithoutPairing(configuration: StikJIT.Configuration, needsScan: Bool,
+                                           portNote: String) -> WinJITRequest.Response {
+        var configuration = configuration
+        if needsScan {
+            switch findRSDPortThroughVPN(host: configuration.deviceAddress) {
+            case .found(let port):
+                configuration.rsdPort = port
+            case .notFound(let check):
+                return .init(success: false, message: check.detail + portNote,
+                             txmPresent: StikJIT.isTXMPresent, connection: check.result)
+            }
+        }
+        if let failed = handshakeCheck(configuration) {
+            return .init(success: false, message: failed.detail + portNote,
+                         txmPresent: StikJIT.isTXMPresent, connection: failed.result)
+        }
+        return .init(success: true,
+                     message: "RemotePairing answered on port \(configuration.rsdPort) at this device's "
+                        + "\(JITDeviceAddress.family(configuration.deviceAddress)) address; pair to check that a session works." + portNote,
+                     txmPresent: StikJIT.isTXMPresent, connection: .connected)
     }
 }
 
