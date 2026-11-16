@@ -41,6 +41,9 @@ final class ClipboardSync: ObservableObject {
     static let maxBytes = 1 << 20
     /// The helper asks again at most 25 s apart.
     static let helperAliveSeconds = 40
+    /// Windows' text is taken at most this often (the newest wins): a guest that copies over and over
+    /// must not keep the main thread busy or the iPhone's clipboard (and Universal Clipboard) churning.
+    static let fromWindowsInterval: CFTimeInterval = 0.4
     /// Notification name of WinIOSGuestClipboardDidChangeNotification (winios_bridge.m).
     static let guestChanged = Notification.Name("WinIOSGuestClipboardDidChange")
 
@@ -73,6 +76,9 @@ final class ClipboardSync: ObservableObject {
         didSet { defaults.set(knownChangeCount, forKey: Key.changeCount) }
     }
     private var toastGeneration = 0
+    /// When Windows' text was last taken, and whether a later take is waiting for the interval to pass.
+    private var lastGuestTake: CFTimeInterval = -.infinity
+    private var guestTakeScheduled = false
 
     private init() {
         fromWindows = defaults.object(forKey: Key.fromWindows) as? Bool ?? true
@@ -99,7 +105,22 @@ final class ClipboardSync: ObservableObject {
 
     // MARK: - Windows → iPhone
 
+    /// The share server tells the app once and waits for the take before it tells again (however often
+    /// the guest copies meanwhile), so taking no more often than fromWindowsInterval limits all of it.
     private func guestCopied() {
+        guard !guestTakeScheduled else { return }
+        let wait = lastGuestTake + Self.fromWindowsInterval - CACurrentMediaTime()
+        guard wait > 0 else { takeGuestText(); return }
+        guestTakeScheduled = true
+        DispatchQueue.main.asyncAfter(deadline: .now() + wait) { [weak self] in
+            guard let self else { return }
+            self.guestTakeScheduled = false
+            self.takeGuestText()
+        }
+    }
+
+    private func takeGuestText() {
+        lastGuestTake = CACurrentMediaTime()
         guard let text = bridge.takeGuestClipboard() else { return }
         guard fromWindows else { return } // taken, so that it does not arrive later
         if UIApplication.shared.applicationState == .active {
@@ -116,6 +137,7 @@ final class ClipboardSync: ObservableObject {
     }
 
     private func becameActive() {
+        if pendingFromWindows == nil { lastGuestTake = CACurrentMediaTime() }
         if let text = pendingFromWindows ?? bridge.takeGuestClipboard() {
             pendingFromWindows = nil
             if fromWindows { putOnPasteboard(text) }
@@ -218,7 +240,8 @@ final class ClipboardSync: ObservableObject {
     private func show(_ text: String, symbol: String) {
         toastGeneration += 1
         let generation = toastGeneration
-        toast = Toast(text: text, symbol: symbol)
+        // The same message again only stays longer: not shown anew (no animation, no new announcement).
+        if toast?.text != text || toast?.symbol != symbol { toast = Toast(text: text, symbol: symbol) }
         DispatchQueue.main.asyncAfter(deadline: .now() + 1.8) { [weak self] in
             guard let self, self.toastGeneration == generation else { return }
             self.toast = nil

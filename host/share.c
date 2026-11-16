@@ -867,6 +867,9 @@ static int clipboard_put(Conn *c, Request *r) {
     unsigned long changed = 0;
     pthread_mutex_lock(&clip_mu);
     clip_agent_seen = agent_seen = time(NULL);
+    /* The app is told once until it takes the text (hv_share_take_clipboard): a guest that PUTs over and
+       over gets one notification in flight at a time, and the app takes the newest when it gets to it. */
+    int was_pending = guest_clip_pending;
     int counted = agent[0] && agent_seq;
     int overtaken = counted && !strcmp(agent, clip_agent_id) && agent_seq <= clip_agent_seq;
     if (copy && !overtaken) {
@@ -877,7 +880,7 @@ static int clipboard_put(Conn *c, Request *r) {
         memcpy(clip_agent_id, agent, sizeof agent);
         clip_agent_seq = agent_seq;
     }
-    if (changed) notify = clip_listener, opaque = clip_listener_opaque;
+    if (changed && !was_pending) notify = clip_listener, opaque = clip_listener_opaque;
     unsigned long seq = clip_seq;
     int origin = clip_origin;
     pthread_mutex_unlock(&clip_mu);

@@ -299,7 +299,8 @@ int main(void) {
     r = put_text("/.henge/clipboard", "no count");
     CHECK(r.seq == 7, "without agent/n: %lu", r.seq);
     free_reply(&r);
-    CHECK(heard(NULL) == 4, "heard %d", heard(NULL));
+    /* Told once until the app takes it: five was news, the rest came while it still waited. */
+    CHECK(heard(NULL) == 2, "heard %d", heard(NULL));
 
     /* Empty is no change; a byte order mark is dropped. */
     r = put_text("/.henge/clipboard", "");
@@ -367,6 +368,28 @@ int main(void) {
     r = request("DELETE", "/.henge/clipboard", NULL, 0);
     CHECK(r.status == 404, "other methods: %d", r.status);
     free_reply(&r);
+
+    /* A guest that PUTs over and over: one notification in flight until the app takes the text, and
+       the take gets the newest. Then the next copy is news again. */
+    taken = hv_share_take_clipboard();
+    CHECK(taken && strlen(taken) == HV_SHARE_CLIP_MAX, "the newest before the flood");
+    free(taken);
+    int before = heard(NULL);
+    for (int i = 0; i < 300; i++) {
+        char t[32];
+        snprintf(t, sizeof t, "flood %d", i);
+        r = put_text("/.henge/clipboard", i % 2 ? t : "flood"); /* each one a change */
+        free_reply(&r);
+    }
+    CHECK(heard(&hs) == before + 1 && hs == 10, "flood: heard %d more, seq %lu", heard(NULL) - before, hs);
+    taken = hv_share_take_clipboard();
+    CHECK(taken && !strcmp(taken, "flood 299"), "the newest after the flood: %s", taken ? taken : "(none)");
+    free(taken);
+    CHECK(hv_share_take_clipboard() == NULL, "taken once");
+    r = put_text("/.henge/clipboard", "after the flood");
+    free_reply(&r);
+    CHECK(heard(NULL) == before + 2, "news again after the take: %d", heard(NULL) - before);
+    free(hv_share_take_clipboard());
 
     unlink(sock_path);
     rmdir(dir);

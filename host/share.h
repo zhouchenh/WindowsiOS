@@ -24,7 +24,9 @@ unsigned long hv_share_push_clipboard(const char *text);
 char *hv_share_take_clipboard(void);
 /* The slot as it is (malloc'd, or NULL when empty), its sequence number and HV_SHARE_CLIP_FROM_*. */
 char *hv_share_get_clipboard(unsigned long *seq, int *origin);
-/* Called on the server's thread, without locks held, each time the guest copies something new. */
+/* Called on the server's thread, without locks held, when the guest copies something new and nothing
+   the guest copied is waiting for hv_share_take_clipboard already: once until the app takes it, however
+   often the guest copies meanwhile (the take gets the newest). */
 typedef void (*hv_share_clip_fn)(unsigned long seq, void *opaque);
 void hv_share_set_clipboard_listener(hv_share_clip_fn fn, void *opaque);
 /* Seconds since the guest's clipboard helper was last heard from: 0 while it waits for news, -1 never. */
