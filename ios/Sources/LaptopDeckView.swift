@@ -707,6 +707,15 @@ struct LaptopDeckView: View {
                 sendModifiedTap(fnHid)
                 return
             }
+            if action == .forwardDelete {
+                // down now, up on release: Windows' own typematic repeats it while held
+                if ctrlLatched { WinIOSBridge.shared.sendKeyHid(0xe0, down: true) }
+                if altLatched  { WinIOSBridge.shared.sendKeyHid(0xe2, down: true) }
+                if winLatched  { WinIOSBridge.shared.sendKeyHid(0xe3, down: true) }
+                if shiftLatched { WinIOSBridge.shared.sendKeyHid(0xe1, down: true) }
+                WinIOSBridge.shared.sendKeyHid(0x4c, down: true)
+                return
+            }
             performFunctionAction(action)
 
         case .regular(let hid, _, _, let fnHid, _, _):
@@ -729,8 +738,12 @@ struct LaptopDeckView: View {
             let actualHid = (fnActive && fnHid != nil) ? fnHid! : hid
             WinIOSBridge.shared.sendKeyHid(actualHid, down: false)
             releaseLatchedModifiers()
-        case .functionKey(let action, _, _, _, _) where action == .forwardDelete:
+        case .functionKey(let action, let fnHid, _, _, _) where action == .forwardDelete:
             keyUpHaptic.impactOccurred(intensity: 0.22)
+            if !(fnActive && fnHid != nil) {
+                WinIOSBridge.shared.sendKeyHid(0x4c, down: false)
+                releaseLatchedModifiers()
+            }
         default:
             break
         }
@@ -940,7 +953,6 @@ private struct SurfaceKeycapView: View {
     let onKeyUp: () -> Void
 
     @State private var isPressed: Bool = false
-    @State private var repeater = KeyAutoRepeater()
 
     var body: some View {
         let radius: CGFloat = isFunctionStrip ? 3.8 : 4.6
@@ -963,7 +975,6 @@ private struct SurfaceKeycapView: View {
                     if !isPressed {
                         isPressed = true
                         onKeyDown()
-                        startAutoRepeatIfApplicable()
                     }
                 }
                 .onEnded { _ in
@@ -971,12 +982,11 @@ private struct SurfaceKeycapView: View {
                 }
         )
         // The deck can go away mid-press (unfolding flat, F12, a three-finger tap, or another deck
-        // layout); the gesture then never ends, so stop the repeat and let the key up here.
+        // layout); the gesture then never ends, so let the key up here.
         .onDisappear { releaseIfPressed() }
     }
 
     private func releaseIfPressed() {
-        stopAutoRepeat()
         if isPressed {
             isPressed = false
             onKeyUp()
@@ -1061,57 +1071,5 @@ private struct SurfaceKeycapView: View {
         case .upDownStack:
             EmptyView()
         }
-    }
-
-    private func startAutoRepeatIfApplicable() {
-        var repeatCode: UInt8? = nil
-        switch spec.role {
-        case .regular(let hid, _, _, let fnHid, _, _):
-            let actual = (isFnActive && fnHid != nil) ? fnHid! : hid
-            if [0x2a, 0x2c, 0x4c, 0x4f, 0x50].contains(actual) {
-                repeatCode = actual
-            }
-        case .functionKey(let action, _, _, _, _) where action == .forwardDelete:
-            repeatCode = 0x4c
-        default:
-            break
-        }
-        guard let code = repeatCode else { return }
-        repeater.start(code)
-    }
-
-    private func stopAutoRepeat() {
-        repeater.stop()
-    }
-}
-
-/// Repeats a held deck key. A reference type, so stopping it reaches the timers it scheduled even
-/// after the keycap view is gone; each start/stop bumps the generation, so a timer callback already
-/// queued from an earlier press does nothing.
-@MainActor
-private final class KeyAutoRepeater {
-    private var timer: Timer?
-    private var generation = 0
-
-    func start(_ code: UInt8) {
-        stop()
-        let gen = generation
-        timer = Timer.scheduledTimer(withTimeInterval: 0.36, repeats: false) { [weak self] _ in
-            Task { @MainActor in
-                guard let self, self.generation == gen else { return }
-                self.timer = Timer.scheduledTimer(withTimeInterval: 0.065, repeats: true) { [weak self] _ in
-                    Task { @MainActor in
-                        guard let self, self.generation == gen else { return }
-                        WinIOSBridge.shared.tapKeyHid(code)
-                    }
-                }
-            }
-        }
-    }
-
-    func stop() {
-        generation &+= 1
-        timer?.invalidate()
-        timer = nil
     }
 }
