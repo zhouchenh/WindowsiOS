@@ -195,7 +195,7 @@ targets:
           - $(inherited)
           - "@executable_path/../../Frameworks"
     dependencies:
-      # StikJIT 1.9.0 (MPL-2.0) with ios/patches/stikjit-high-address.patch, from
+      # StikJIT 1.9.0 (MPL-2.0) with ios/patches/stikjit-high-address.patch and stikjit-ipv6-address.patch, from
       # scripts/build_jit_deps.sh; embedded into the app's Frameworks by its Embed StikJIT script.
       - framework: deps/StikJIT.xcframework
         embed: false

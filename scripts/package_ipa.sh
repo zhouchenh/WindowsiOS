@@ -195,7 +195,8 @@ otool -L "$XA/WinJITHelper" > "$WORK/helper-libs.txt"
 grep -q "@rpath/StikJIT.framework/StikJIT" "$WORK/helper-libs.txt" ||
     fail "WinJITHelper does not link @rpath/StikJIT.framework"
 for f in LICENSE-GPL-2.0.txt LICENSE-GPL-3.0.txt LICENSE-StikJIT-MPL-2.0.txt LICENSE-idevice-MIT.txt \
-         LICENSES-stikjit-idevice-crates.txt LICENSES-rppairing-crates.txt stikjit-high-address.patch; do
+         LICENSES-stikjit-idevice-crates.txt LICENSES-rppairing-crates.txt stikjit-high-address.patch \
+         stikjit-ipv6-address.patch; do
     [ -f "$X/legal/$f" ] || fail "legal/$f missing"
 done
 codesign --verify --deep --strict "$X" || fail "the ad-hoc signature does not verify"

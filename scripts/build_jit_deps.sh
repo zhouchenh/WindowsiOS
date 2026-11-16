@@ -4,10 +4,13 @@
 # Builds the two dependencies of Built-in JIT (docs/builtin-jit.md) from source into the
 # gitignored ios/deps:
 #
-#   ios/deps/StikJIT.xcframework     StikJIT 1.9.0 (MPL-2.0, StikDebug/StikJIT) with our patch
-#                                    ios/patches/stikjit-high-address.patch (from Henge's
-#                                    ci/stikjit-high-address.patch: 16 hex digits in the $M page
-#                                    addresses instead of 9). The WinJITHelper app extension links it.
+#   ios/deps/StikJIT.xcframework     StikJIT 1.9.0 (MPL-2.0, StikDebug/StikJIT) with our patches,
+#                                    in this order: ios/patches/stikjit-high-address.patch (from
+#                                    Henge's ci/stikjit-high-address.patch: 16 hex digits in the $M
+#                                    page addresses instead of 9) and
+#                                    ios/patches/stikjit-ipv6-address.patch (the device address may
+#                                    be IPv6, for Built-in JIT over the user's own VPN). The
+#                                    WinJITHelper app extension links it.
 #   ios/deps/lib/libhusk_rppairing.a On-device pairing for iOS 27 (Husk's src/rppairing-ios,
 #                                    GPL-2.0-or-later, over idevice 0.1.68, MIT). The app links it;
 #                                    its C interface is ios/Sources/Native/HuskRPPairing.h.
@@ -15,7 +18,7 @@
 # and refreshes, in ios/Sources/Resources/legal (bundled as the app's legal/ folder),
 # LICENSES-rppairing-crates.txt (the licence notices of every crate in libhusk_rppairing.a),
 # LICENSES-stikjit-idevice-crates.txt (the same for idevice's FFI inside StikJIT.framework),
-# LICENSE-StikJIT-MPL-2.0.txt, a copy of the StikJIT patch and LICENSE-GPL-2.0.txt (Husk's
+# LICENSE-StikJIT-MPL-2.0.txt, a copy of each StikJIT patch and LICENSE-GPL-2.0.txt (Husk's
 # licence, the same as Apple VM's). LICENSE-GPL-3.0.txt there is kept by hand (legal/README.txt).
 #
 #   scripts/build_jit_deps.sh [--force]
@@ -48,7 +51,8 @@ FORCE=0
 STIKJIT_URL="https://github.com/StikDebug/StikJIT.git"
 STIKJIT_TAG="1.9.0"
 STIKJIT_REV="32287268fa5824f9edce4cb359f5833ce0cf7b00"
-STIKJIT_PATCH="$ROOT/ios/patches/stikjit-high-address.patch"
+# Applied in this order; the framework is rebuilt whenever this list or a patch changes.
+STIKJIT_PATCHES=(stikjit-high-address.patch stikjit-ipv6-address.patch)
 # The idevice commit whose Cargo.lock gives the crates in StikJIT's libidevice_ffi.a (see above).
 IDEVICE_URL="https://github.com/jkcoxson/idevice.git"
 IDEVICE_REV="d32c8189c51c2789496b0768039419c3705498c3"
@@ -104,13 +108,20 @@ fetch_stikjit() {
 build_stikjit() {
     local src="$WORK/StikJIT"
     local stamp="$OUT/StikJIT.xcframework/.applevm-build"
-    local want="$STIKJIT_REV $(shasum -a 256 "$STIKJIT_PATCH" | cut -d' ' -f1)"
+    local want="$STIKJIT_REV" patch
+    for patch in "${STIKJIT_PATCHES[@]}"; do
+        [ -f "$ROOT/ios/patches/$patch" ] || die "ios/patches/$patch is missing"
+        want+=" $patch:$(shasum -a 256 "$ROOT/ios/patches/$patch" | cut -d' ' -f1)"
+    done
     if [ "$FORCE" = 0 ] && [ -f "$stamp" ] && [ "$(cat "$stamp")" = "$want" ]; then
-        step "StikJIT.xcframework is up to date ($STIKJIT_TAG + patch)"
+        step "StikJIT.xcframework is up to date ($STIKJIT_TAG + ${STIKJIT_PATCHES[*]})"
         return
     fi
     fetch_stikjit
-    git -C "$src" apply "$STIKJIT_PATCH"
+    for patch in "${STIKJIT_PATCHES[@]}"; do
+        step "StikJIT: applying $patch"
+        git -C "$src" apply "$ROOT/ios/patches/$patch"
+    done
     step "StikJIT: xcodegen and archive (Release, iphoneos, unsigned)"
     (cd "$src" && xcodegen generate --quiet)
     xcodebuild archive -project "$src/StikJIT.xcodeproj" -scheme StikJIT -configuration Release \
@@ -124,8 +135,8 @@ build_stikjit() {
         -output "$OUT/StikJIT.xcframework" > /dev/null
     echo "$want" > "$stamp"
     cp "$src/LICENSE" "$LEGAL/LICENSE-StikJIT-MPL-2.0.txt"
-    # MPL-2.0: our modification travels with the app, next to the licence.
-    cp "$STIKJIT_PATCH" "$LEGAL/stikjit-high-address.patch"
+    # MPL-2.0: our modifications travel with the app, next to the licence.
+    for patch in "${STIKJIT_PATCHES[@]}"; do cp "$ROOT/ios/patches/$patch" "$LEGAL/$patch"; done
     echo "-> ios/deps/StikJIT.xcframework"
 }
 
