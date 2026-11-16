@@ -99,12 +99,15 @@ time, unless the person chose Allow for it. So:
   Clipboard; any view can mount it.
 - Sending by itself when the app becomes active is off by default. It runs only when it is switched on
   AND the app found the permission to be Allow. iOS has no call that tells the permission, so "Check" (and
-  switching the option on) reads the clipboard once, at the person's request: a read that waits more than
-  0.35 s waited for iOS's question (Ask), one that gives nothing at once is Deny, otherwise Allow. Reading
-  text this app wrote itself never asks, so that check needs text copied in another app. Before every
-  automatic read, `UIPasteboard.changeCount` and `hasStrings` (neither of which asks) skip a clipboard
-  with nothing new or no text. If iOS asks after all (the setting was changed), automatic sending stops
-  until checked again.
+  switching the option on) reads the clipboard once, at the person's request: text at once is Allow,
+  nothing at once is Deny, and a read that waits more than 0.35 s is taken as Ask (it waited for iOS's
+  question), with a note that it may also be text that is slow to come (copied on another device, or
+  large), so the check is best done with text copied on this iPhone. Reading text this app wrote itself
+  never asks, so that check needs text copied in another app. Before every automatic read,
+  `UIPasteboard.changeCount` and `hasStrings` (neither of which asks) skip a clipboard with nothing new or
+  no text. The automatic read does not go by time: text is Allow (or the person just answered Allow
+  Paste), so it is sent; no text (Deny, or Don't Allow on a question) stops automatic sending until
+  checked again.
 - To allow it: iOS Settings › Apple VM › Paste from Other Apps › Allow. The item appears once the app has
   read the clipboard at least once.
 - "Paste into Windows after tapping Paste" presses Ctrl+V once Windows has the text (see above), only

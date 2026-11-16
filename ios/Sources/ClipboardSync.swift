@@ -170,14 +170,17 @@ final class ClipboardSync: ObservableObject {
         guard board.changeCount != knownChangeCount else { return } // nothing new, or what came from Windows
         knownChangeCount = board.changeCount
         guard board.hasStrings else { return } // a picture, or nothing: not read
-        let (text, asked) = readPasteboard()
-        if asked {
-            // iOS asked after all: the setting was changed. Not by itself again until checked.
-            pastePermission = .ask
-        } else if text == nil {
-            pastePermission = .denied
+        // Text means Allow, or the person just answered Allow Paste: consent either way. How long the read
+        // took decides nothing here: under Allow it can take a second too (text copied on a Mac comes over
+        // the network, a large one takes time), and that must not stop the automatic sending.
+        let (text, slow) = readPasteboard()
+        guard let text else {
+            // Deny, or Don't Allow on a question iOS asked after all: not by itself again until checked.
+            // (Slow: it waited for that answer, so the setting is Ask.)
+            pastePermission = slow ? .ask : .denied
+            return
         }
-        if let text { send(text, force: false, paste: false) }
+        send(text, force: false, paste: false)
     }
 
     private func send(_ text: String, force: Bool, paste: Bool) {
@@ -213,7 +216,8 @@ final class ClipboardSync: ObservableObject {
 
     // MARK: - Paste permission
 
-    /// Reads the clipboard and tells whether iOS asked first: the read waits for the person's answer.
+    /// Reads the clipboard, and whether that took long enough that iOS may have asked first (the read
+    /// waits for the person's answer). Only a hint: a slow read can also be text from another device.
     private func readPasteboard() -> (String?, Bool) {
         let start = CACurrentMediaTime()
         let text = UIPasteboard.general.string
@@ -230,9 +234,20 @@ final class ClipboardSync: ObservableObject {
             show(L("先在别的 App 里拷贝一段文字，再检查", "Copy some text in another app first, then check"), symbol: "info.circle")
             return
         }
-        let (text, asked) = readPasteboard()
+        let (text, slow) = readPasteboard()
         knownChangeCount = board.changeCount // looked at, not sent
-        pastePermission = asked ? .ask : text == nil ? .denied : .allowed
+        if text == nil {
+            pastePermission = slow ? .ask : .denied
+        } else if slow {
+            // iOS asked (Ask), or the text was slow to come: copied on another device, or large. Not
+            // taken as Allow, which would let the app read by itself without knowing.
+            pastePermission = .ask
+            show(L("读取很慢：如果 iOS 没有询问，可能是别的设备上拷贝的。请在这台 iPhone 上拷贝文字后再检查",
+                   "That took long: if iOS did not ask, the text may come from another device. Copy text on this iPhone and check again"),
+                 symbol: "info.circle")
+        } else {
+            pastePermission = .allowed
+        }
     }
 
     // MARK: - Status
