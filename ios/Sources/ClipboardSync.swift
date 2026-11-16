@@ -230,7 +230,7 @@ final class ClipboardSync: ObservableObject {
     func checkPastePermission() {
         let board = UIPasteboard.general
         guard board.hasStrings, board.changeCount != knownChangeCount else {
-            pastePermission = .unknown
+            // Nothing to find out from: an earlier result (Allow, say, which automatic sending runs on) stays.
             show(L("先在别的 App 里拷贝一段文字，再检查", "Copy some text in another app first, then check"), symbol: "info.circle")
             return
         }
