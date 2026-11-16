@@ -346,6 +346,11 @@ final class DisplaySettings: ObservableObject {
             m.division = window.reservedRegions(kind: .division, options: .includeInactive).map(describe)
         }
         Self.lastScreenShortSide = min(m.nativeWidth, m.nativeHeight)
+        // Published state changes after this layout pass, not during it.
+        DispatchQueue.main.async { [weak self] in self?.store(metrics: m) }
+    }
+
+    private func store(metrics m: DisplayMetrics) {
         updateSurface()
         let k = "\(surface.rawValue).\(m.orientation)"
         guard lastLogged[k] != m else { return }
