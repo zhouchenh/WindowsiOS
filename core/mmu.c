@@ -577,11 +577,17 @@ void hv_ijc_drop_va(HvCpu *cpu, uint64_t va, int asid) {
     ijc_drop_va(cpu, va, asid, 0);
 }
 
-void hv_tlb_flush_va_asid(HvCpu *cpu, uint64_t va, int asid) {
+static void stash_drop_va(HvPerCpu *p, uint64_t va, int asid);
+
+/* page_stash: only va's page goes from the stashes (HV_STASH_VA, a TLBI of one page), not all of asid's entries. */
+static void flush_va(HvCpu *cpu, uint64_t va, int asid, int page_stash) {
     /* Tagged addresses may sit in any slot's tag byte, so check by the low 56 bits. */
     uint32_t idx = (va >> HV_TLB_PAGE_BITS) & (HV_TLB_SIZE - 1);
     hv_ijc_drop_va(cpu, va, asid);
-    if (!((va >> 55) & 1)) hv_tlb_stash_drop(cpu, asid);
+    if (!((va >> 55) & 1)) {
+        if (page_stash && cpu->pc_state) stash_drop_va(cpu->pc_state, va, asid);
+        else hv_tlb_stash_drop(cpu, asid);
+    }
     for (int el = 0; el < 3; el++) {
         HvTlbEntry *e = hv_tlb_ent(cpu, idx, el);
         memset(e, 0x80, sizeof *e);
@@ -622,6 +628,16 @@ void hv_tlb_flush_va_asid(HvCpu *cpu, uint64_t va, int asid) {
             }
         }
     }
+}
+
+void hv_tlb_flush_va_asid(HvCpu *cpu, uint64_t va, int asid) {
+    flush_va(cpu, va, asid, 0);
+}
+
+/* A TLBI of one page (by VA). HV_STASH_VA (Henge 5d4e092): as hv_tlb_flush_va_asid, but the stashes of switched-out
+   processes lose only that page's entries, or all of asid's when va may lie in a large page (stash_drop_va). */
+void hv_tlb_flush_va_page(HvCpu *cpu, uint64_t va, int asid) {
+    flush_va(cpu, va, asid, hv_knob[HV_K_STASHVA]);
 }
 
 /* A TLBI by range too big to do page by page in the TLB (which then drops its
@@ -682,9 +698,10 @@ void hv_tlb_flush_va(HvCpu *cpu, uint64_t va) {
    this entry was there, it must not stay writable. */
 static void stash_drop(HvPerCpu *p, int asid);
 
-static void write_guard(HvCpu *cpu, HvRam *ram, uint64_t pg, uint32_t code, HvTlbEntry *e) {
-    /* Say where, so that the page becoming code drops just this entry (or, if
-       this CPU now maps it writable twice, makes the protector scan). */
+/* Say where, so that the page becoming code drops just this entry (or, if
+   this CPU now maps it writable twice, makes the protector scan). The check
+   that must follow, after a full fence, is write_guard's last two lines. */
+static void write_hint(HvCpu *cpu, HvRam *ram, uint64_t pg, uint32_t code) {
     uint64_t *hint = &ram->whint[pg * HV_MAX_CPUS + cpu->index];
     uint64_t mine = code + 1, old = __atomic_load_n(hint, __ATOMIC_RELAXED), now = old;
     const uint8_t *host_page = ram->host + (pg << HV_TLB_PAGE_BITS);
@@ -700,6 +717,10 @@ static void write_guard(HvCpu *cpu, HvRam *ram, uint64_t pg, uint32_t code, HvTl
         if (!have) now = place >= 0 ? (old & ~(0xffffull << (16 * place))) | mine << (16 * place) : HV_WHINT_MANY;
         if (now != old) __atomic_store_n(hint, now, __ATOMIC_RELAXED);
     }
+}
+
+static void write_guard(HvCpu *cpu, HvRam *ram, uint64_t pg, uint32_t code, HvTlbEntry *e) {
+    write_hint(cpu, ram, pg, code);
     __atomic_thread_fence(__ATOMIC_SEQ_CST);
     if (__atomic_load_n(&ram->code_pages[pg], __ATOMIC_RELAXED)) e->write_tag = HV_TLB_INVALID;
 }
@@ -807,7 +828,10 @@ int hv_tlbi_drop_remote_va(HvCpu *target, uint64_t va, int asid) {
     if (s1 & 1) { if (target->m->stats_interval) target->m->stats.race_kind[0]++; return 0; } /* mid-walk: it may be about to fill from the old table */
     uint32_t c1 = __atomic_load_n(&p->ijc_seq, __ATOMIC_SEQ_CST);
     if (c1 & 1) { if (target->m->stats_interval) target->m->stats.race_kind[1]++; return 0; } /* caching a block it may have looked up through the old mapping */
-    if (!((va >> 55) & 1)) stash_drop(p, asid);
+    if (!((va >> 55) & 1)) {
+        if (hv_knob[HV_K_STASHVA]) stash_drop_va(p, va, asid); /* large pages: all of asid's, see there */
+        else stash_drop(p, asid);
+    }
     uint32_t idx = (va >> HV_TLB_PAGE_BITS) & (HV_TLB_SIZE - 1);
     int fetched = 0; /* the target may be running code from the page: it must leave and look again */
     for (int t = 0; t < 3; t++) { /* the slot whatever its tag byte, as hv_tlb_flush_va_asid does */
@@ -1128,6 +1152,42 @@ static void stash_drop(HvPerCpu *p, int asid) {
     }
 }
 
+/* HV_STASH_VA (Henge 5d4e092): forget the stashed entries for va's 4 KB page in address space asid (-1: all), not
+   whole stashes. Stash keys are ukeys, (ASID << 48) | TTBR0 base, with the ASID masked as tlbi_asid masks the TLBI's.
+   A page of a larger mapping (a 2 MB or 1 GB block, or a 16/64 KB granule page) is held as many 4 KB entries, all of
+   which a TLBI of any one of them must drop: when va falls in this CPU's large-page filters (set by every fill from
+   such a mapping, cleared only with the whole TLB, which drops every stash too) the whole of asid's stashes go
+   instead. Other CPUs do this to the target's stashes too, under the same walk_seq check as stash_drop; they only
+   ever write tags (never an addend), so a restore racing it reads each entry whole or with a tag gone, and the drop
+   counts as raced and is done again by the target itself. */
+static void stash_drop_va(HvPerCpu *p, uint64_t va, int asid) {
+    uint32_t h2 = hv_large_2m_bit(va), hb = hv_large_big_bit(va);
+    if ((__atomic_load_n(&p->large_2m_bloom[h2 >> 6], __ATOMIC_RELAXED) >> (h2 & 63) & 1) ||
+        (__atomic_load_n(&p->large_big_bloom[hb >> 6], __ATOMIC_RELAXED) >> (hb & 63) & 1)) {
+        stash_drop(p, asid);
+        return;
+    }
+    uint64_t pg = va & 0x00ffffffffffffffull & ~(uint64_t)PAGE_MASK; /* tagged addresses: by the low 56 bits */
+    for (int i = 0; i < HV_STASHES; i++) {
+        HvTlbStash *s = &p->stash[i];
+        uint64_t t = __atomic_load_n(&s->ttbr0, __ATOMIC_SEQ_CST);
+        if (!t || (asid >= 0 && (t >> 48) && (int)(t >> 48) != asid)) continue;
+        uint32_t n = __atomic_load_n(&s->n, __ATOMIC_RELAXED);
+        if (n > HV_STASH_CAP) n = HV_STASH_CAP;
+        for (uint32_t k = 0; k < n; k++) {
+            HvTlbEntry *e = &s->ent[k];
+            uint64_t rt = __atomic_load_n(&e->read_tag, __ATOMIC_RELAXED), wt = __atomic_load_n(&e->write_tag, __ATOMIC_RELAXED),
+                     xt = __atomic_load_n(&e->exec_tag, __ATOMIC_RELAXED);
+            if (rt == HV_TLB_INVALID && wt == HV_TLB_INVALID && xt == HV_TLB_INVALID) continue;
+            uint64_t tag = rt != HV_TLB_INVALID ? rt + HV_TLB_ADJ : xt != HV_TLB_INVALID ? hv_exec_key(xt, e->addend) : wt + HV_TLB_ADJ;
+            if ((tag & 0x00ffffffffffffffull & ~(uint64_t)PAGE_MASK) != pg) continue;
+            __atomic_store_n(&e->read_tag, HV_TLB_INVALID, __ATOMIC_RELAXED);
+            __atomic_store_n(&e->write_tag, HV_TLB_INVALID, __ATOMIC_RELAXED);
+            __atomic_store_n(&e->exec_tag, HV_TLB_INVALID, __ATOMIC_RELAXED);
+        }
+    }
+}
+
 void hv_tlb_stash_drop(HvCpu *cpu, int asid) {
     if (cpu->pc_state) stash_drop(cpu->pc_state, asid);
 }
@@ -1230,17 +1290,36 @@ void hv_tlb_switch_user(HvCpu *cpu, uint64_t old, uint64_t now) {
             int fresh = __atomic_load_n(&r->gen, __ATOMIC_SEQ_CST) == r->saved_gen;
             __atomic_store_n(&r->ttbr0, 0, __ATOMIC_SEQ_CST); /* used up either way: the live TLB has them now */
             if (!fresh) break;
+            /* HV_STASH_VA (Henge ba9392e): writable entries get all their hints first, then one fence, then each
+               page's code check (write_guard's two halves, batched: every entry is in place and hinted before the
+               fence and checked after it). Which page is kept from the copy in the TLB, not read again from the
+               stash, where another CPU's drop may be clearing tags meanwhile. */
+            int batch = hv_knob[HV_K_STASHVA];
+            static __thread struct { HvRam *ram; uint64_t pg; uint16_t code; } pend[HV_STASH_CAP];
+            uint32_t npend = 0;
             for (uint32_t j = 0; j < r->n; j++) {
+                const HvTlbEntry *from = &r->ent[j];
+                if (from->read_tag == HV_TLB_INVALID && from->write_tag == HV_TLB_INVALID && from->exec_tag == HV_TLB_INVALID)
+                    continue; /* its page had a TLBI while it was put aside (stash_drop_va) */
                 HvTlbEntry *e = &cpu->tlb[0] + r->slot[j];
-                *e = r->ent[j];
+                *e = *from;
                 cpu->user_fills[cpu->nuser_fills++] = r->slot[j];
                 if (e->write_tag != HV_TLB_INVALID) {
                     const uint8_t *host = (const uint8_t *)(uintptr_t)(e->write_tag + HV_TLB_ADJ + e->addend);
                     HvRam *ram = ram_of_host(m, host);
+                    uint64_t pg = ram ? (uint64_t)(host - ram->host) >> HV_TLB_PAGE_BITS : 0;
                     if (!ram) e->write_tag = HV_TLB_INVALID;
-                    else write_guard(cpu, ram, (uint64_t)(host - ram->host) >> HV_TLB_PAGE_BITS, r->slot[j], e);
+                    else if (!batch) write_guard(cpu, ram, pg, r->slot[j], e);
+                    else {
+                        write_hint(cpu, ram, pg, r->slot[j]);
+                        pend[npend].ram = ram, pend[npend].pg = pg, pend[npend++].code = r->slot[j];
+                    }
                 }
             }
+            if (npend) __atomic_thread_fence(__ATOMIC_SEQ_CST);
+            for (uint32_t q = 0; q < npend; q++)
+                if (__atomic_load_n(&pend[q].ram->code_pages[pend[q].pg], __ATOMIC_RELAXED))
+                    (&cpu->tlb[0] + pend[q].code)->write_tag = HV_TLB_INVALID;
             if (m->stats_interval) m->stats.stash_hits++;
             if (m->stats_interval) m->stats.stash_entries += r->n;
             break;

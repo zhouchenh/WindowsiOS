@@ -327,7 +327,7 @@ int hv_ic_ivau_drops(void);
    ones after it) are read in init_rest with their defaults, so the Mac tool and the tests can set them too
    (Documents/env.txt on iOS): 0 turns one off. */
 enum { HV_K_NO_RAS, HV_K_SUPERBLOCKS, HV_K_GROUPS, HV_K_WFI_SPIN, HV_K_FLUSH, HV_K_TEST1, HV_K_TEST2, HV_K_TEST3, HV_K_TLBT, HV_K_JITCAP, HV_K_RECHECK,
-       HV_K_FASTICACHE, HV_K_IJCTTBKEY, HV_K_LOGFLUSH, HV_K_IJCPAGES, HV_K_XCHAINPAGES, HV_K_COUNT };
+       HV_K_FASTICACHE, HV_K_IJCTTBKEY, HV_K_LOGFLUSH, HV_K_IJCPAGES, HV_K_XCHAINPAGES, HV_K_STASHVA, HV_K_COUNT };
 extern int hv_knob[HV_K_COUNT];
 int hv_knob_set(HvMachine *m, const char *name, int value);
 const char *hv_knob_name(int k); /* its environment variable */

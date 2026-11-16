@@ -353,6 +353,89 @@ static void test_code_page_drops(HvMachine *m, HvCpu *cpu, HvCpu *cpu1) {
     hv_cpu_reset(cpu, m);
 }
 
+/* Is user page va in cpu's TLB (table 0, as EL0 filled it)? */
+static int tlb_has_user(HvCpu *cpu, uint64_t va) {
+    const HvTlbEntry *e = hv_tlb_ent(cpu, (uint32_t)(va >> 12) & (HV_TLB_SIZE - 1), 0);
+    uint64_t page = va & ~0xfffull;
+    return e->read_tag == page - HV_TLB_ADJ || e->write_tag == page - HV_TLB_ADJ || e->exec_tag == hv_exec_key(page, e->addend);
+}
+
+static void switch_asid(HvCpu *cpu, uint64_t asid) {
+    cpu->x[0] = asid << 48 | tlb_r0;
+    hv_sysreg_msr(cpu, 0xd5182000u, 0); /* msr ttbr0_el1, x0 */
+}
+
+/* TLBI VAE1 (is: VAE1IS, all: VAAE1IS) of va for asid, from cpu (EL1). */
+static void tlbi_va(HvCpu *cpu, uint64_t va, uint64_t asid, int is, int all) {
+    cpu->el = 1;
+    cpu->x[1] = asid << 48 | ((va >> 12) & 0xfffffffffffull);
+    hv_sysreg_sys(cpu, 0xd5080000u | 8u << 12 | (is ? 3u : 7u) << 8 | (all ? 3u : 1u) << 5 | 1u, 0);
+}
+
+/* HV_STASH_VA: a TLBI of one page drops that page from the TLB entries a switched-out process keeps, here and from
+   another CPU; with 4 KB pages and 2 MB blocks (any of a block's pages drops them all); a page that became code while
+   put aside comes back read-only. */
+static void test_stash_va(HvMachine *m, HvCpu *cpu, HvCpu *cpu1) {
+    tlb_tables();
+    hv_self = NULL;
+    const uint64_t blk = UBLOCKS + (1ull << 21); /* the second 2 MB block */
+    for (int remote = 0; remote < 2; remote++) {
+        HvCpu *c = remote ? cpu1 : cpu; /* the CPU whose stash is checked; TLBIs come from cpu */
+        hv_cpu_reset(cpu, m);
+        hv_cpu_reset_index(cpu1, m, 1);
+        tlb_mmu_on(cpu, 5);
+        tlb_mmu_on(cpu1, 5);
+        const char *where = remote ? "another CPU's" : "this CPU's";
+
+        /* Pages: 100 of ASID 5, put aside; ASID 5's page 10 and ASID 7's page 20 have a TLBI. */
+        tlb_touch(c, UPAGES, 100, 0, 512);
+        switch_asid(c, 6);
+        tlbi_va(cpu, UPAGES + (10 << 12), 5, remote, 0);
+        tlbi_va(cpu, UPAGES + (20 << 12), 7, remote, 0);
+        if (remote) hv_cpu_process_requests(cpu1); /* anything left to it */
+        switch_asid(c, 5);
+        int back = 0;
+        for (int i = 0; i < 100; i++) back += tlb_has_user(c, UPAGES + ((uint64_t)i << 12));
+        check_that(!tlb_has_user(c, UPAGES + (10 << 12)), "stash, %s: a page with a TLBI while put aside came back", where);
+        if (hv_knob[HV_K_STASHVA])
+            check_that(back == 99, "stash, %s: %d of the 99 untouched pages came back (HV_STASH_VA)", where, back);
+
+        /* All ASIDs (VAAE1): page 30 goes from every stash. */
+        switch_asid(c, 6);
+        tlbi_va(cpu, UPAGES + (30 << 12), 0, remote, 1);
+        if (remote) hv_cpu_process_requests(cpu1);
+        switch_asid(c, 5);
+        check_that(!tlb_has_user(c, UPAGES + (30 << 12)), "stash, %s: a page with a TLBI for every ASID came back", where);
+
+        /* A 2 MB block: 50 of its pages put aside, then a TLBI of a page of it that was never filled. */
+        tlb_touch(c, blk, 50, 0, 2048);
+        switch_asid(c, 6);
+        tlbi_va(cpu, blk + (300 << 12), 5, remote, 0);
+        if (remote) hv_cpu_process_requests(cpu1);
+        switch_asid(c, 5);
+        int blk_back = 0;
+        for (int i = 0; i < 50; i++) blk_back += tlb_has_user(c, blk + ((uint64_t)i << 12));
+        check_that(blk_back == 0, "stash, %s: %d pages of a 2 MB block came back after a TLBI of another of its pages", where, blk_back);
+
+        /* A writable page put aside becomes code meanwhile: it comes back, but not writable. */
+        uint64_t wva = UPAGES + (40 << 12), pa;
+        check_that(hv_mmu_access(c, wva, HV_ACC_WRITE, 0, &pa) == 0, "stash: write access setup");
+        switch_asid(c, 6);
+        HvRam *r = hv_ram_lookup(m, pa);
+        uint64_t pg = (pa - r->pa) >> HV_TLB_PAGE_BITS;
+        __atomic_store_n(&r->code_pages[pg], 1, __ATOMIC_SEQ_CST); /* as the dispatcher does before translating it */
+        for (int i = 0; i < m->ncpus; i++) hv_tlb_protect_code_page(m->cpus[i], r, pg);
+        switch_asid(c, 5);
+        const HvTlbEntry *we = hv_tlb_ent(c, (uint32_t)(wva >> 12) & (HV_TLB_SIZE - 1), 0);
+        check_that(we->read_tag == (wva & ~0xfffull) - HV_TLB_ADJ && we->write_tag == HV_TLB_INVALID,
+                   "stash, %s: a page that became code came back %s", where,
+                   we->read_tag == HV_TLB_INVALID ? "not at all" : "writable");
+        r->code_pages[pg] = 0;
+    }
+    hv_cpu_reset(cpu, m);
+    hv_cpu_reset_index(cpu1, m, 1);
+}
+
 int main(void) {
     static HvMachine m;
     static HvCpu cpu, cpu1;
@@ -718,6 +801,7 @@ int main(void) {
 
     test_logged_flush(&m, &cpu);
     test_code_page_drops(&m, &cpu, &cpu1);
+    test_stash_va(&m, &cpu, &cpu1);
 
     printf("%d checks, %d failures\n", checks, failures);
     return failures != 0;

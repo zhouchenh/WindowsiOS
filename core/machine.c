@@ -20,7 +20,8 @@ static int init_rest(HvMachine *m);
 
 int hv_knob[HV_K_COUNT];
 static const char *const hv_knob_names[] = {"HV_NO_RAS", "HV_SUPERBLOCKS", "HV_GROUPS", "HV_WFI_SPIN", "HV_FLUSH", "HV_K1", "HV_K2", "HV_K3", "HV_TLBT", "HV_JIT_CAP", "HV_RECHECK",
-                                            "HV_FAST_ICACHE", "HV_IJC_TTBKEY", "HV_TLB_LOGFLUSH", "HV_IJC_PAGES", "HV_XCHAIN_PAGES"};
+                                            "HV_FAST_ICACHE", "HV_IJC_TTBKEY", "HV_TLB_LOGFLUSH", "HV_IJC_PAGES", "HV_XCHAIN_PAGES",
+                                            "HV_STASH_VA"};
 _Static_assert(sizeof hv_knob_names / sizeof hv_knob_names[0] == HV_K_COUNT, "a name for every knob");
 
 static void knobs_init(void) {
@@ -86,6 +87,10 @@ static int init_rest(HvMachine *m) {
     /* Henge 7131022: exits chained into another page are listed per target page (HvRam.xhead), so a code change
        unchains just those instead of scanning every cross-page chain under the translation lock. */
     knob_env(HV_K_XCHAINPAGES, 0);
+    /* Henge 5d4e092 and ba9392e: a TLBI of one page (here or from another CPU) drops only that 4 KB page from the
+       stashed TLB entries of switched-out processes (all of the ASID's when the page may be part of a large one), and
+       a process switch puts stashed entries back with one fence. */
+    knob_env(HV_K_STASHVA, 0);
     /* As many blocks as the region holds (a block is at least ~160 bytes of
        code), so the region filling, not this table, is what flushes; two
        chainable exits each at most. Untouched entries cost nothing. */
