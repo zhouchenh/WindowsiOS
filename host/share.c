@@ -788,7 +788,8 @@ static int clipboard_respond(Conn *c, Request *r, int status, const char *reason
    number (one from before the app restarted, say) is answered at once. 200 with the text, or 204 when
    there is none; X-Henge-Seq and X-Henge-Origin (host or guest) either way. Asking for news past N says
    the helper has put N on the guest's clipboard (hv_share_clipboard_agent_has), unless &missed=1: it
-   could not, so Ctrl+V must not follow. */
+   could not, so Ctrl+V must not follow; or &active=0: the helper of a session that is not on the screen
+   (another user's, or a disconnected one), which does not take the device's text. */
 static int clipboard_get(Conn *c, Request *r) {
     if (body_discard(c, r) != 0) return -1;
     const char *since_s = query_value(r->query, "since");
@@ -797,6 +798,8 @@ static int clipboard_get(Conn *c, Request *r) {
     unsigned long wait = wait_s ? strtoul(wait_s, NULL, 10) : 25;
     const char *missed_s = query_value(r->query, "missed");
     int missed = missed_s && *missed_s == '1';
+    const char *active_s = query_value(r->query, "active");
+    int inactive = active_s && *active_s == '0';
     if (wait > 25) wait = 25;
     struct timespec until;
     struct timeval now;
@@ -807,7 +810,7 @@ static int clipboard_get(Conn *c, Request *r) {
     clip_agent_seen = agent_seen = time(NULL);
     if (since_s) {
         /* Not a number from before the app restarted, and really on the guest's clipboard. */
-        if (since <= clip_seq && !missed) clip_agent_has = since;
+        if (since <= clip_seq && !missed && !inactive) clip_agent_has = since;
         clip_waiters++;
         while (clip_seq == since && pthread_cond_timedwait(&clip_cond, &clip_mu, &until) != ETIMEDOUT) {}
         clip_waiters--;

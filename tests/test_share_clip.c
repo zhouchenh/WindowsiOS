@@ -246,6 +246,11 @@ int main(void) {
     CHECK(r.status == 200 && r.seq == 2, "missed: %d %lu", r.status, r.seq);
     free_reply(&r);
     CHECK(hv_share_clipboard_agent_has() == 1, "missed is not had: %lu", hv_share_clipboard_agent_has());
+    /* Nor is it had by the helper of a session that is not on the screen. */
+    r = request("GET", "/.henge/clipboard?since=2&wait=1&active=0", NULL, 0);
+    CHECK(r.status == 200 && r.seq == 2, "inactive: %d %lu", r.status, r.seq);
+    free_reply(&r);
+    CHECK(hv_share_clipboard_agent_has() == 1, "an inactive session's is not had: %lu", hv_share_clipboard_agent_has());
 
     /* With nothing new it waits as long as asked, then says what there is. */
     double t0 = now_s();

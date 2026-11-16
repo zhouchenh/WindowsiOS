@@ -9,6 +9,9 @@
 //   clipboard changes; the text goes on Windows' clipboard, and only then is the next ?since= asked for,
 //   which tells the app that Ctrl+V may follow. If the text could not be put there (another program kept
 //   the clipboard busy, say), the next one says &missed=1, so that no Ctrl+V pastes the old text.
+// Sessions: one helper runs in each signed-in user's session, but only the one on the screen (the active
+//   console session) exchanges text. The others neither send nor take any, and ask with &active=0, which
+//   does not tell the app that Windows has the text.
 // Loops: what this helper wrote itself is known by the clipboard's sequence number, and is not sent
 //   back; nor is the same text put there again by another program right after (a clipboard manager).
 //   Text that password managers mark as private (ExcludeClipboardContentFromMonitorProcessing,
@@ -38,6 +41,9 @@ namespace WinKit
         [DllImport("user32.dll", SetLastError = true)] static extern bool AddClipboardFormatListener(IntPtr hwnd);
         [DllImport("user32.dll", SetLastError = true)] static extern bool RemoveClipboardFormatListener(IntPtr hwnd);
         [DllImport("user32.dll")] static extern uint GetClipboardSequenceNumber();
+        [DllImport("kernel32.dll")] static extern uint WTSGetActiveConsoleSessionId();
+        [DllImport("kernel32.dll")] static extern uint GetCurrentProcessId();
+        [DllImport("kernel32.dll")] static extern bool ProcessIdToSessionId(uint pid, out uint session);
         [DllImport("user32.dll", SetLastError = true)] static extern bool OpenClipboard(IntPtr hwnd);
         [DllImport("user32.dll")] static extern bool CloseClipboard();
         [DllImport("user32.dll", SetLastError = true)] static extern bool EmptyClipboard();
@@ -77,6 +83,7 @@ namespace WinKit
         static readonly AutoResetEvent toHostReady = new AutoResetEvent(false);
 
         static readonly string agentId = Guid.NewGuid().ToString("N");
+        static uint ownSession = uint.MaxValue;
         static long sent;
         static readonly string logPath = Path.Combine(
             Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), @"WinKit\clipboard.log");
@@ -93,6 +100,7 @@ namespace WinKit
                 ServicePointManager.DefaultConnectionLimit = 8;
                 Application.ThreadException += delegate(object s, ThreadExceptionEventArgs e) { Log("ui: " + e.Exception.Message); };
                 AppDomain.CurrentDomain.UnhandledException += delegate(object s, UnhandledExceptionEventArgs e) { Log("fatal: " + e.ExceptionObject); };
+                if (!ProcessIdToSessionId(GetCurrentProcessId(), out ownSession)) ownSession = uint.MaxValue;
                 excludeFormat = RegisterClipboardFormat("ExcludeClipboardContentFromMonitorProcessing");
                 historyFormat = RegisterClipboardFormat("CanIncludeInClipboardHistory");
                 cloudFormat = RegisterClipboardFormat("CanUploadToCloudClipboard");
@@ -151,6 +159,7 @@ namespace WinKit
         static void ClipboardChanged()
         {
             if (GetClipboardSequenceNumber() == ownSequence) return; // this helper's own write
+            if (!OnScreen()) return; // another user's copies, or a disconnected session's
             string text = ReadClipboardText();
             if (text == null) return;
             text = text.Replace("\r\n", "\n");
@@ -262,7 +271,8 @@ namespace WinKit
                 int status;
                 try
                 {
-                    status = Get(first ? Url : Url + "?since=" + since + (missed ? "&missed=1" : ""), out seq, out origin, out text);
+                    string url = first ? Url : Url + "?since=" + since + (missed ? "&missed=1" : "") + (OnScreen() ? "" : "&active=0");
+                    status = Get(url, out seq, out origin, out text);
                 }
                 catch (Exception e)
                 {
@@ -277,7 +287,8 @@ namespace WinKit
                             (first ? CountClipboardFormats() == 0 : seq != since);
                 first = false;
                 missed = false;
-                if (news && !DeliverRetrying(text))
+                if (news && !OnScreen()) missed = true; // not for this session: left to the one on the screen
+                else if (news && !DeliverRetrying(text))
                 {
                     Log("could not put the iPhone's text " + seq + " on the clipboard");
                     missed = true;
@@ -303,6 +314,14 @@ namespace WinKit
                 }
                 return (int)resp.StatusCode;
             }
+        }
+
+        // Whether this session is the one on the screen. With fast user switching, or a session left
+        // disconnected, other users' helpers run too: they must not take the iPhone's text, nor tell the app
+        // that Windows has it while the session on the screen does not yet.
+        static bool OnScreen()
+        {
+            return ownSession != uint.MaxValue && ownSession == WTSGetActiveConsoleSessionId();
         }
 
         // A few tries, about 2 s in all at most: the app waits 2.5 s before it gives up on Ctrl+V.

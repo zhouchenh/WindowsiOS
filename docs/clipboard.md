@@ -73,6 +73,9 @@ UTF-8, malformed requests, the app's listener and the helper's status.
 - It runs in the user's own session, not elevated, through the scheduled task **WinKit Clipboard**: at
   logon, and every 5 minutes after that (a running helper is left alone, a stopped one is started again).
   A mutex keeps it to one per session. If a policy refuses the task, a Startup folder shortcut is used.
+- With more than one session (fast user switching, or a session left disconnected), only the helper of
+  the session on the screen (`WTSGetActiveConsoleSessionId`) sends or takes text. The others still wait
+  for news, with `&active=0`, which does not tell the app that Windows has the text.
 - Its log: `%LOCALAPPDATA%\WinKit\clipboard.log`.
 
 Install: `START.bat` does it; `CLIPBOARD.bat` on the WINKIT drive does only this, without administrator
