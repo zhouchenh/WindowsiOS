@@ -116,7 +116,7 @@ in Windows, who can connect, and on or off. Who can connect:
 | --- | --- | --- |
 | This iPhone only | `127.0.0.1` and `[::1]` | apps on the iPhone (a Remote Desktop app connecting to `localhost`, Safari for OAuth redirects) |
 | Local network | `0.0.0.0` and `[::]` (every interface) | devices on the same Wi-Fi, on the iPhone's Personal Hotspot, and on a VPN |
-| VPN | the address of the active VPN interface (`utun…`, `ipsec…`) | devices on the VPN (WireGuard and similar) |
+| VPN | the address of the active VPN interface (`utun…`, `wg…`, `tun…`, `ppp…`, `ipsec…`, in that order of preference; one with an IPv4 address, or a unique local IPv6 address `fc00::/7`) | devices on the VPN (WireGuard and similar) |
 
 - **IPv4** is libslirp's own host forward (`slirp_add_hostfwd` / `slirp_remove_hostfwd`). The guest
   sees loopback clients as `10.0.2.2` and other clients with their own address.
@@ -129,9 +129,11 @@ in Windows, who can connect, and on or off. Who can connect:
   listen on IPv4 (`0.0.0.0`, or a dual-stack `[::]` socket, as most Windows services do). libslirp
   could forward to the guest's IPv6 address (`slirp_add_hostxfwd`), but Windows picks that address
   itself (random interface IDs, temporary addresses), so this is left out.
-- **The VPN's address** is the first VPN interface that is up with an IPv4 address that is not
-  link-local (iOS's own `utun` interfaces only have link-local IPv6 addresses and are passed over),
-  else one with an IPv6 address. It is looked up again every 3 seconds while a VPN forward exists,
+- **The VPN's address** is the VPN interface that is up with an IPv4 address that is not
+  link-local, else one with a unique local IPv6 address (`fc00::/7`), preferring `utun`, `wg`,
+  `tun`, `ppp`, then `ipsec`. iOS's own `utun` interfaces only have link-local IPv6 addresses, and
+  the carrier's tunnels for Wi-Fi Calling and VoLTE (`ipsec…` with a global IPv6 address from the
+  carrier and no IPv4) are no VPN the user connected: both are passed over. It is looked up again every 3 seconds while a VPN forward exists,
   and when the app's network monitor sees a change; a forward with no VPN connected waits ("no VPN")
   and opens when one comes. This works with VPNs that hand packets to iOS (the WireGuard app); a VPN
   app that runs its own network stack in user space never delivers incoming connections to other
@@ -221,7 +223,7 @@ a comment). Restart the VM after changing them.
 | `HV_NET_FWD` | none | TCP forwards into the guest for this session, comma-separated: `<host port>:<guest port>` (loopback), `lan:…`, `vpn:…`, or `a.b.c.d:…` (see [Port forwards](#port-forwards)). |
 | `HV_NET_FWD_FILE` | none (Mac) | The saved forwards' file for the Mac tool (on iOS it is the machine's `port_forwards.json`). |
 | `HV_NET_FWD_RULES` | on | `0`: saved forwards are listed but not opened (session forwards still are). |
-| `HV_NET_VPN_IF` | `utun,ipsec,ppp,tun,wg` | Which interfaces count as a VPN (name prefixes, comma-separated). |
+| `HV_NET_VPN_IF` | `utun,wg,tun,ppp,ipsec` | Which interfaces count as a VPN (name prefixes, comma-separated, preferred in this order). Only one with an IPv4 address or a unique local IPv6 address counts, so the carrier's Wi-Fi Calling / VoLTE tunnels (`ipsec…` with only a global IPv6 address) are not taken for a VPN. |
 | `HV_NET_LAN_IF` | `en,bridge` | Which interfaces' addresses the settings show for the local network. |
 
 ## Tests

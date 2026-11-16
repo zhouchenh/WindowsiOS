@@ -911,8 +911,22 @@ static int usable6(const struct sockaddr *sa) {
            !IN6_IS_ADDR_V4MAPPED(a);
 }
 static const char *vpn_ifs(void) {
-    const char *e = getenv("HV_NET_VPN_IF"); /* which interfaces are a VPN's; the tests use lo0 */
-    return e && *e ? e : "utun,ipsec,ppp,tun,wg";
+    const char *e = getenv("HV_NET_VPN_IF"); /* which interfaces are a VPN's, preferred in this order; the tests use lo0 */
+    return e && *e ? e : "utun,wg,tun,ppp,ipsec";
+}
+/* Which of list's comma-separated prefixes name starts with (its place in the list), or -1. */
+static int if_rank(const char *name, const char *list) {
+    int k = 0;
+    for (const char *p = list; *p; k++) {
+        const char *e = strchr(p, ',');
+        size_t n = e ? (size_t)(e - p) : strlen(p);
+        if (n && !strncmp(name, p, n)) return k;
+        p += n + (e ? 1 : 0);
+    }
+    return -1;
+}
+static int ula6(const struct sockaddr *sa) { /* fc00::/7: a private network's own IPv6 addresses */
+    return (((const struct sockaddr_in6 *)sa)->sin6_addr.s6_addr[0] & 0xfe) == 0xfc;
 }
 static const char *lan_ifs(void) {
     const char *e = getenv("HV_NET_LAN_IF");
@@ -926,22 +940,28 @@ typedef struct VpnAddr {
     struct in6_addr a6;
 } VpnAddr;
 
-/* The active VPN: the first VPN interface that is up with an IPv4 address (else one with an IPv6 address); iOS's
-   own utun interfaces only have link-local addresses and are passed over. */
+/* The active VPN: a VPN interface that is up with an IPv4 address, else one with a unique local IPv6 address
+   (fc00::/7), preferring the list's order (utun, wg, tun, ppp, then ipsec). iOS's own utun interfaces only have
+   link-local addresses, and the carrier's tunnels for Wi-Fi Calling and VoLTE (ipsecN, a global IPv6 address from
+   the carrier and no IPv4) are not a VPN the user connected: both are passed over. */
 static void vpn_lookup(VpnAddr *v) {
     memset(v, 0, sizeof *v);
     struct ifaddrs *ifa = NULL;
     if (getifaddrs(&ifa) != 0) return;
     const char *list = vpn_ifs();
-    for (int want4 = 1; want4 >= 0 && !v->ifname[0]; want4--)
+    for (int want4 = 1; want4 >= 0 && !v->ifname[0]; want4--) {
+        int best = -1;
         for (struct ifaddrs *i = ifa; i; i = i->ifa_next) {
-            if (!i->ifa_addr || !(i->ifa_flags & IFF_UP) || !if_matches(i->ifa_name, list)) continue;
-            int fam = i->ifa_addr->sa_family;
-            if ((want4 && fam == AF_INET && usable4(i->ifa_addr)) || (!want4 && fam == AF_INET6 && usable6(i->ifa_addr))) {
+            if (!i->ifa_addr || !(i->ifa_flags & IFF_UP)) continue;
+            int rank = if_rank(i->ifa_name, list), fam = i->ifa_addr->sa_family;
+            if (rank < 0 || (best >= 0 && rank >= best)) continue;
+            if ((want4 && fam == AF_INET && usable4(i->ifa_addr)) ||
+                (!want4 && fam == AF_INET6 && usable6(i->ifa_addr) && ula6(i->ifa_addr))) {
                 snprintf(v->ifname, sizeof v->ifname, "%s", i->ifa_name);
-                break;
+                best = rank;
             }
         }
+    }
     for (struct ifaddrs *i = ifa; i && v->ifname[0]; i = i->ifa_next) {
         if (!i->ifa_addr || strcmp(i->ifa_name, v->ifname)) continue;
         if (i->ifa_addr->sa_family == AF_INET && !v->has4 && usable4(i->ifa_addr))
