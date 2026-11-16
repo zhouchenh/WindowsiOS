@@ -8,9 +8,9 @@ import dnssd
 ///
 /// Since iOS 26 the device picks that port at boot and advertises it as `_remotepairing._tcp`; the fixed
 /// 49152 StikJIT falls back to is closed then, so every attempt times out at 10.7.0.1:49152. The app's own lookup
-/// (RemotePairingPortDiscovery) connects to the service to learn its port, and on some devices that never
-/// becomes ready. This reads the port from the service's SRV record with DNSServiceResolve instead, which
-/// needs no connection.
+/// (RemotePairingPortDiscovery) connects to the service to learn its port, which can fail when the
+/// connection does not become ready in time, or when Local Network access is off. This reads the port from
+/// the service's SRV record with DNSServiceResolve instead, which needs no connection.
 enum RSDPortResolver {
     struct Result {
         var port: UInt16?

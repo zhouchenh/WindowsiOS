@@ -326,7 +326,11 @@ enum JITPairingFileStore {
 /// nil lets the helper look it up itself (RSDPortResolver, then a port scan).
 enum RemotePairingPortDiscovery {
     private static let serviceType = "_remotepairing._tcp"
+    /// Runs discover(), which blocks it until a port is found or the timeout passes.
     private static let queue = DispatchQueue(label: "applevm.remotepairing-discovery", qos: .utility)
+    /// The browser's and the connection's handlers. Not `queue`: discover() blocks that one, and the
+    /// handlers would only run after the wait had timed out.
+    private static let eventQueue = DispatchQueue(label: "applevm.remotepairing-discovery.events", qos: .utility)
     private static let lock = NSLock()
     nonisolated(unsafe) private static var cachedPort: UInt16?
     nonisolated(unsafe) private static var lastFailure: Date?
@@ -427,7 +431,7 @@ enum RemotePairingPortDiscovery {
                     break
                 }
             }
-            connection.start(queue: queue)
+            connection.start(queue: eventQueue)
         }
         browser.stateUpdateHandler = { state in
             switch state {
@@ -436,7 +440,7 @@ enum RemotePairingPortDiscovery {
             }
         }
 
-        browser.start(queue: queue)
+        browser.start(queue: eventQueue)
         _ = semaphore.wait(timeout: .now() + timeout)
         browser.cancel()
         resultLock.lock()
