@@ -7,7 +7,8 @@ import UIKit
 /// what this side puts there.
 ///
 /// Windows → iPhone: writing UIPasteboard never asks the person anything, so what Windows copies is put on
-/// the iPhone's clipboard right away while the app is in front, or as soon as it is again.
+/// the iPhone's clipboard right away while the app is in front, or as soon as it is again, unless the
+/// person copied something on the iPhone after Windows did: the newer copy stays.
 ///
 /// iPhone → Windows: an app that reads the clipboard by itself gets iOS's "Allow Paste" question, unless
 /// the person set Settings › Apple VM › Paste from Other Apps › Allow. So it goes through the system's
@@ -69,8 +70,8 @@ final class ClipboardSync: ObservableObject {
     private var bridge: WinIOSBridge { WinIOSBridge.shared }
     private var started = false
     private var observers: [NSObjectProtocol] = []
-    /// What Windows copied while the app was not in front.
-    private var pendingFromWindows: String?
+    /// What Windows copied while the app was not in front, and UIPasteboard.changeCount at that time.
+    private var pendingFromWindows: (text: String, changeCount: Int)?
     /// UIPasteboard.changeCount when the app last wrote the clipboard or sent it: anything else is new.
     private var knownChangeCount: Int {
         didSet { defaults.set(knownChangeCount, forKey: Key.changeCount) }
@@ -126,7 +127,7 @@ final class ClipboardSync: ObservableObject {
         if UIApplication.shared.applicationState == .active {
             putOnPasteboard(text)
         } else {
-            pendingFromWindows = text // the newest wins
+            pendingFromWindows = (text, UIPasteboard.general.changeCount) // the newest wins
         }
     }
 
@@ -136,11 +137,19 @@ final class ClipboardSync: ObservableObject {
         show(L("已从 Windows 拷贝", "Copied from Windows"), symbol: "doc.on.clipboard")
     }
 
+    /// Windows' text from while the app was away goes on the clipboard only if nothing was copied on the
+    /// iPhone after it: a newer copy in another app is the one the person wants (and the one sent to Windows
+    /// next, if that is on), not to be replaced by older text from Windows.
     private func becameActive() {
-        if pendingFromWindows == nil { lastGuestTake = CACurrentMediaTime() }
-        if let text = pendingFromWindows ?? bridge.takeGuestClipboard() {
+        let changeCount = UIPasteboard.general.changeCount // reading it never asks
+        if let pending = pendingFromWindows {
             pendingFromWindows = nil
-            if fromWindows { putOnPasteboard(text) }
+            if fromWindows && changeCount == pending.changeCount { putOnPasteboard(pending.text) }
+        } else {
+            lastGuestTake = CACurrentMediaTime()
+            // Arrived just now, or while a take waited: when is not known, so only onto a clipboard that
+            // nothing was copied to since the app last wrote or read it.
+            if let text = bridge.takeGuestClipboard(), fromWindows, changeCount == knownChangeCount { putOnPasteboard(text) }
         }
         sendOnActivationIfAllowed()
     }

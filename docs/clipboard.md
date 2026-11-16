@@ -86,7 +86,9 @@ rights, and can be run again. `CLIPBOARD.bat remove` or `uninstall_clipboard.ps1
 **Windows → iPhone.** Writing `UIPasteboard` never asks anything. When Windows copies, the share server
 calls the app (`hv_share_set_clipboard_listener` → `WinIOSGuestClipboardDidChangeNotification`) and the
 text is put on the clipboard while the app is active; otherwise it waits (the newest only) until the app
-is active again. A short "Copied from Windows" shows at the bottom. Settings › Clipboard › "Windows →
+is active again, and is dropped if something was copied on the iPhone after it (`UIPasteboard.changeCount`
+moved on since the text arrived): the iPhone's newer copy stays, and is the one sent to Windows when that
+is on. A short "Copied from Windows" shows at the bottom. Settings › Clipboard › "Windows →
 iPhone automatically" (on by default) switches it off.
 
 **iPhone → Windows.** An app that reads the clipboard by itself gets iOS's "Allow Paste" question each
