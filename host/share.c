@@ -797,9 +797,115 @@ static int forwards(Conn *c, Request *r) {
     return respond_empty(c, r, 405, "Method Not Allowed");
 }
 
+/* ---- /.henge/focus: the WinKit focus agent (winkit/FocusAgent.cs) ----
+   The agent PUTs a JSON report whenever Windows' keyboard focus, caret, foreground program or input
+   language changes; reports (bodies with a "kind") go to the app's handler, in this process. The reply
+   carries text from the iOS keyboard for the agent to type (UTF-8; \b is Backspace), or is 204 when there
+   is none. PUT .../focus?wait=N (N <= 25 s) waits for such text: the agent keeps one of these open. */
+
+static pthread_mutex_t focus_mu = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t focus_cond = PTHREAD_COND_INITIALIZER;
+static HvShareFocusHandler focus_handler;
+static void *focus_opaque;
+static char *focus_text; /* waiting to be typed */
+static size_t focus_text_len;
+static time_t focus_text_at;
+static time_t focus_seen;
+static struct timespec focus_taken; /* CLOCK_MONOTONIC: when the agent last took text */
+
+void hv_share_set_focus_handler(HvShareFocusHandler handler, void *opaque) {
+    pthread_mutex_lock(&focus_mu);
+    focus_handler = handler;
+    focus_opaque = opaque;
+    pthread_mutex_unlock(&focus_mu);
+}
+
+long hv_share_focus_agent_seen(void) {
+    pthread_mutex_lock(&focus_mu);
+    long ago = focus_seen ? (long)(time(NULL) - focus_seen) : -1;
+    pthread_mutex_unlock(&focus_mu);
+    return ago;
+}
+
+int hv_share_focus_send_text(const char *utf8) {
+    size_t n = utf8 ? strlen(utf8) : 0;
+    if (!n) return 0;
+    pthread_mutex_lock(&focus_mu);
+    /* the agent's long poll comes back at least every ~25 s: longer silence means it is not running */
+    if (!focus_seen || time(NULL) - focus_seen > 45 || focus_text_len + n > 64 * 1024) {
+        pthread_mutex_unlock(&focus_mu);
+        return -1;
+    }
+    char *grown = realloc(focus_text, focus_text_len + n + 1);
+    if (!grown) {
+        pthread_mutex_unlock(&focus_mu);
+        return -1;
+    }
+    memcpy(grown + focus_text_len, utf8, n + 1);
+    focus_text = grown;
+    if (!focus_text_len) focus_text_at = time(NULL);
+    focus_text_len += n;
+    pthread_cond_broadcast(&focus_cond);
+    pthread_mutex_unlock(&focus_mu);
+    return 0;
+}
+
+int hv_share_focus_text_busy(void) {
+    struct timespec now;
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    pthread_mutex_lock(&focus_mu);
+    double since = (double)(now.tv_sec - focus_taken.tv_sec) + (double)(now.tv_nsec - focus_taken.tv_nsec) / 1e9;
+    int busy = focus_text_len > 0 || (focus_taken.tv_sec && since < 0.25);
+    pthread_mutex_unlock(&focus_mu);
+    return busy;
+}
+
+static int focus_put(Conn *c, Request *r) {
+    size_t len = 0;
+    char *body = body_small(c, r, &len);
+    if (!body) return -1;
+    int wait = 0;
+    const char *q = strstr(r->query, "wait=");
+    if (q) wait = atoi(q + 5);
+    if (wait < 0) wait = 0;
+    if (wait > 25) wait = 25;
+    pthread_mutex_lock(&focus_mu);
+    focus_seen = time(NULL);
+    HvShareFocusHandler handler = focus_handler;
+    void *opaque = focus_opaque;
+    pthread_mutex_unlock(&focus_mu);
+    if (handler && strstr(body, "\"kind\"")) handler(body, len, opaque);
+    free(body);
+
+    pthread_mutex_lock(&focus_mu);
+    if (wait > 0 && !focus_text_len) {
+        struct timeval now;
+        gettimeofday(&now, NULL);
+        struct timespec until = {.tv_sec = now.tv_sec + wait, .tv_nsec = now.tv_usec * 1000};
+        while (!focus_text_len && pthread_cond_timedwait(&focus_cond, &focus_mu, &until) != ETIMEDOUT) {}
+    }
+    char *text = focus_text;
+    size_t text_len = focus_text_len;
+    if (text && time(NULL) - focus_text_at > 15) { /* typed long ago with no agent to take it: not now */
+        fprintf(stderr, "share: focus: dropped %zu bytes of text nobody took for 15 s\n", text_len);
+        free(text);
+        text = NULL;
+    }
+    focus_text = NULL;
+    focus_text_len = 0;
+    if (text) clock_gettime(CLOCK_MONOTONIC, &focus_taken);
+    focus_seen = time(NULL);
+    pthread_mutex_unlock(&focus_mu);
+    int rc = text ? respond(c, r, 200, "OK", "Content-Type: text/plain; charset=utf-8\r\n", text, text_len)
+                  : respond_empty(c, r, 204, "No Content");
+    free(text);
+    return rc;
+}
+
 static int serve_henge(Conn *c, Request *r) {
     const char *what = r->path + strlen("/.henge/");
     if (!strcmp(what, "forwards")) return forwards(c, r);
+    if (!strcmp(what, "focus") && (!strcmp(r->method, "PUT") || !strcmp(r->method, "POST"))) return focus_put(c, r);
     if (!strcmp(what, "install") && !strcmp(r->method, "GET")) {
         if (body_discard(c, r) != 0) return -1;
         return respond(c, r, 200, "OK", "Content-Type: text/plain\r\n", install_script, sizeof install_script - 1);

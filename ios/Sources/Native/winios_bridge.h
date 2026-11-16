@@ -139,6 +139,21 @@ extern NSNotificationName const WinIOSDisplayWillReshapeNotification;
 - (nullable NSString *)archInstallStatus;
 - (BOOL)archInstallPending;
 
+/* ---- Keyboard, text and zoom ---- */
+/// Pan/zoom of the shown picture: zoom (>= 1) about the view's centre, then moved by (tx, ty) as fractions
+/// of the view's width and height (y down). 1, 0, 0 shows it as fitted.
+- (void)setViewZoom:(double)zoom translateX:(double)tx y:(double)ty;
+/// Text a USB keyboard cannot type (Chinese, accents, emoji), typed in Windows by the WinKit focus agent
+/// (\b is Backspace, \n Enter). NO when no agent is listening.
+- (BOOL)sendUnicodeText:(NSString *)text;
+/// Seconds since the WinKit focus agent was last heard from, -1 if never.
+@property (nonatomic, readonly) NSInteger focusAgentSeenSeconds;
+/// Text sent through the focus agent may still be on its way: keys sent by USB now could overtake it.
+@property (nonatomic, readonly) BOOL unicodeTextBusy;
+/// A small picture of the whole Windows screen (the mini-map), made off the main thread; the completion
+/// runs on the main thread, with nil when there is none. One at a time: a call while one runs gets nil.
+- (void)makeScreenThumbnailMaxPixels:(NSInteger)maxPixels completion:(void (^)(CGImageRef _Nullable image))completion;
+
 @end
 
 /* Port forwards (host/net_slirp.h, ios/Sources/PortForwardingView.swift): saved per machine in
@@ -165,5 +180,9 @@ extern NSNotificationName const WinIOSDisplayWillReshapeNotification;
 /// Which machine's saved forwards are in use (the running one's, else the selected one's).
 - (void)usePortForwardsOfMachineDirectory:(NSString *)dir;
 @end
+
+/// Posted on the main thread for each report of the WinKit focus agent; userInfo[@"report"] is the
+/// decoded JSON object (see winkit/FocusAgent.cs).
+extern NSNotificationName const WinIOSFocusReportNotification;
 
 NS_ASSUME_NONNULL_END

@@ -8,7 +8,10 @@ import UIKit
 ///   one finger moves the pointer, a tap is a left click, a two-finger tap is a right click,
 ///   two fingers scroll, tap-then-hold (or a long press) drags, a three-finger tap shows the toolbar.
 /// In direct mode a tap clicks where the finger is, as on a touch-screen PC.
-final class MetalCanvasUIView: UIView, UIKeyInput {
+/// A pinch zooms in the Windows app (Ctrl + wheel); a three-finger double-tap zooms the picture itself
+/// (then a pinch sets that zoom, three fingers drag it, and a map of the screen shows where you are).
+/// Typing: see TextInputBridge.swift (text, focus) and WindowsKeyBar.swift (the keys above the keyboard).
+final class MetalCanvasUIView: UIView, UITextInput {
     override class var layerClass: AnyClass { CAMetalLayer.self }
 
     var metalLayer: CAMetalLayer { layer as! CAMetalLayer }
@@ -56,9 +59,42 @@ final class MetalCanvasUIView: UIView, UIKeyInput {
     private let lightHaptic = UIImpactFeedbackGenerator(style: .light)
     private let mediumHaptic = UIImpactFeedbackGenerator(style: .medium)
 
-    // MARK: keyboard state
-    private var stickyModifiers: Set<UInt8> = []
-    private lazy var accessoryBar = KeyAccessoryBar(owner: self)
+    // MARK: keyboard, text and zoom state
+    /// Ctrl/Alt/Shift/Win latches and the bar key held in Windows.
+    let keys = WindowsKeyState()
+    /// Pan/zoom of the picture (keyboard pan, viewport zoom).
+    let viewport = ViewportController()
+    /// What the iOS keyboard is composing (TextInputBridge.swift).
+    let textDoc = TextInputDocument()
+    lazy var keyBar = WindowsKeyBar(canvas: self, keys: keys, viewport: viewport)
+    /// The screen map shown over the picture while it is zoomed and the key bar is not up.
+    private(set) var floatingMap: MiniMapView?
+    /// The keyboard should come up (a text box got the focus): the SwiftUI side raises it.
+    var onKeyboardRequested: (() -> Void)?
+    var lastFocus: FocusReport?
+    var lastTouchAt: CFTimeInterval = 0
+    /// Where a finger last tapped, in unzoomed picture points (stands in for the caret).
+    var lastTapPicturePoint: CGPoint?
+    var keyboardAutoShown = false
+    var pendingHide: DispatchWorkItem?
+    private var lastInputSize: CGSize = .zero
+    private var lastFramebufferSize: CGSize = .zero
+    // two fingers: scroll, or pinch (Ctrl + wheel to Windows; the viewport zoom while zoomed)
+    private enum TwoFingerMode { case undecided, scroll, pinchApp, pinchViewport }
+    private var twoMode: TwoFingerMode = .undecided
+    private var pinchStartDistance: CGFloat = 0
+    private var pinchLastDistance: CGFloat = 0
+    private var pinchStartZoom: CGFloat = 1
+    private var pinchAccum: CGFloat = 0
+    private var pinchCtrlDown = false
+    // three fingers: tap = toolbar, double-tap = viewport zoom, drag = pan the zoomed picture
+    private var lastThreeTapAt: CFTimeInterval = 0
+    private var pendingThreeTap: DispatchWorkItem?
+
+    // UITextInput
+    weak var inputDelegate: UITextInputDelegate?
+    var markedTextStyle: [NSAttributedString.Key: Any]?
+    lazy var tokenizer: UITextInputTokenizer = UITextInputStringTokenizer(textInput: self)
 
     override init(frame: CGRect) {
         super.init(frame: frame)
@@ -88,6 +124,7 @@ final class MetalCanvasUIView: UIView, UIKeyInput {
         inputAssistantItem.trailingBarButtonGroups = []
         NotificationCenter.default.addObserver(self, selector: #selector(releaseAllKeys),
                                                name: UIApplication.willResignActiveNotification, object: nil)
+        configureInput()
         // Pointer movement and its scroll wheel.
         let hover = UIHoverGestureRecognizer(target: self, action: #selector(handleHover(_:)))
         addGestureRecognizer(hover)
@@ -108,6 +145,7 @@ final class MetalCanvasUIView: UIView, UIKeyInput {
     override func layoutSubviews() {
         super.layoutSubviews()
         updateDrawableScale()
+        inputLayoutChanged()
     }
 
     // MARK: drawable size, scale and sampling (display engine; see DisplaySettings.swift)
@@ -157,7 +195,8 @@ final class MetalCanvasUIView: UIView, UIKeyInput {
         if metalLayer.contentsGravity != gravity { metalLayer.contentsGravity = gravity }
     }
 
-    private func normalizedPoint(for pt: CGPoint) -> (Double, Double) {
+    private func normalizedPoint(for screenPt: CGPoint) -> (Double, Double) {
+        let pt = viewport.unproject(screenPt) // the picture may be panned or zoomed
         let bw = max(1.0, bounds.width)
         let bh = max(1.0, bounds.height)
         let fbW = Double(WinIOSBridge.shared.framebufferWidth)
@@ -206,6 +245,8 @@ final class MetalCanvasUIView: UIView, UIKeyInput {
         guard !newFingers.isEmpty else { return }
 
         let now = CACurrentMediaTime()
+        lastTouchAt = now
+        checkFramebufferSize()
         if fingers.isEmpty {
             gestureStart = now
             maxFingers = 0
@@ -213,6 +254,7 @@ final class MetalCanvasUIView: UIView, UIKeyInput {
             scrollAccum = 0
             consumed = false
             dragging = false
+            twoMode = .undecided
             firstPoint = newFingers.first!.location(in: self)
             if directTouch {
                 let (nx, ny) = normalizedPoint(for: firstPoint)
@@ -228,7 +270,76 @@ final class MetalCanvasUIView: UIView, UIKeyInput {
         fingers.append(contentsOf: newFingers)
         maxFingers = max(maxFingers, fingers.count)
         if fingers.count > 1 { cancelLongPress() }
+        if fingers.count == 2 && twoMode == .undecided {
+            pinchStartDistance = fingerDistance()
+            pinchLastDistance = pinchStartDistance
+        } else if fingers.count > 2 {
+            endPinch() // a third finger: not a pinch any more
+        }
         lastCentroid = centroid()
+    }
+
+    private func fingerDistance() -> CGFloat {
+        guard fingers.count >= 2 else { return 0 }
+        let a = fingers[0].location(in: self), b = fingers[1].location(in: self)
+        return hypot(a.x - b.x, a.y - b.y)
+    }
+
+    /// Two fingers changing their distance: Ctrl + wheel steps to the Windows app (its own zoom), at the
+    /// fingers in direct mode, at the pointer in trackpad mode; while the picture is zoomed, its zoom.
+    private func pinchMoved(centroid c: CGPoint, delta: CGPoint) {
+        let d = fingerDistance()
+        guard d > 1, pinchStartDistance > 1 else { return }
+        if twoMode == .undecided {
+            let ratio = abs(d - pinchStartDistance) / pinchStartDistance
+            if ratio > 0.1 && travelled < abs(d - pinchStartDistance) {
+                consumed = true
+                if viewport.isZoomed {
+                    twoMode = .pinchViewport
+                    pinchStartZoom = viewport.zoom
+                    pinchStartDistance = d
+                } else if KeyboardOptions.pinchToWindows {
+                    twoMode = .pinchApp
+                    pinchAccum = 0
+                    pinchLastDistance = d
+                    if directTouch {
+                        let (nx, ny) = normalizedPoint(for: c)
+                        PointerController.shared.moveAbsolute(x: nx, y: ny)
+                    }
+                    WinIOSBridge.shared.sendKeyHid(WindowsKeyState.ctrl, down: true)
+                    pinchCtrlDown = true
+                } else {
+                    twoMode = .scroll
+                }
+            } else if travelled > tapSlop * 1.5 {
+                twoMode = .scroll
+            }
+            return
+        }
+        switch twoMode {
+        case .pinchViewport:
+            viewport.setZoom(pinchStartZoom * d / pinchStartDistance, anchor: c)
+            viewport.pan(by: delta)
+        case .pinchApp:
+            pinchAccum += log(d / pinchLastDistance)
+            pinchLastDistance = d
+            let notch: CGFloat = 0.12 // about 13% of finger spread per wheel notch
+            if abs(pinchAccum) >= notch {
+                let steps = Int(pinchAccum / notch)
+                pinchAccum -= CGFloat(steps) * notch
+                PointerController.shared.scroll(steps: Int8(clamping: max(-4, min(4, steps))))
+            }
+        default:
+            break
+        }
+    }
+
+    private func endPinch() {
+        if pinchCtrlDown {
+            pinchCtrlDown = false
+            WinIOSBridge.shared.sendKeyHid(WindowsKeyState.ctrl, down: false)
+        }
+        if twoMode == .pinchApp || twoMode == .pinchViewport { twoMode = .scroll }
     }
 
     override func touchesMoved(_ touches: Set<UITouch>, with event: UIEvent?) {
@@ -243,6 +354,15 @@ final class MetalCanvasUIView: UIView, UIKeyInput {
         lastCentroid = c
         travelled += hypot(dx, dy)
         if travelled > tapSlop { cancelLongPress() }
+        if fingers.count == 2 && twoMode != .scroll {
+            pinchMoved(centroid: c, delta: CGPoint(x: dx, y: dy))
+            if twoMode != .scroll { return }
+        }
+        if fingers.count == 3 && viewport.isZoomed && travelled > tapSlop {
+            consumed = true // three fingers drag the zoomed picture
+            viewport.pan(by: CGPoint(x: dx, y: dy))
+            return
+        }
         if consumed { return }
 
         if fingers.count == 1 {
@@ -257,8 +377,11 @@ final class MetalCanvasUIView: UIView, UIKeyInput {
                 let (nx, ny) = normalizedPoint(for: c)
                 PointerController.shared.moveAbsolute(x: nx, y: ny)
             } else {
+                // zoomed in: finer pointer steps, and the picture follows the pointer near its edges
                 PointerController.shared.moveRelative(dxPoints: dx, dyPoints: dy,
-                                                      padWidth: bounds.width, padHeight: bounds.height)
+                                                      padWidth: bounds.width * viewport.zoom,
+                                                      padHeight: bounds.height * viewport.zoom)
+                if viewport.isZoomed { followPointer() }
             }
         } else if fingers.count == 2 {
             scrollAccum += dy
@@ -286,12 +409,14 @@ final class MetalCanvasUIView: UIView, UIKeyInput {
         }
         let before = fingers.count
         fingers.removeAll { touches.contains($0) }
+        if fingers.count < 2 { endPinch() } // Ctrl never stays down
         guard before > 0, fingers.isEmpty else {
             if !fingers.isEmpty { lastCentroid = centroid() }
             return
         }
         cancelLongPress()
         let now = CACurrentMediaTime()
+        lastTouchAt = now
         let wasTap = !cancelled && travelled <= tapSlop && (now - gestureStart) <= tapMaxDuration
         if maxFingers < 3 && !cancelled { onUserInteraction?() }
 
@@ -302,6 +427,10 @@ final class MetalCanvasUIView: UIView, UIKeyInput {
             return
         }
         guard wasTap, !consumed else { return }
+        if maxFingers == 1 {
+            lastTapPicturePoint = viewport.unproject(directTouch ? firstPoint : pointerOnScreen())
+            tappedForKeyboard(at: now)
+        }
         switch maxFingers {
         case 1:
             if rightClickArmed {
@@ -335,7 +464,21 @@ final class MetalCanvasUIView: UIView, UIKeyInput {
             }
         case 3:
             lightHaptic.impactOccurred()
-            onThreeFingerTap?()
+            if now - lastThreeTapAt < 0.4 {
+                // three-finger double-tap: zoom the picture around the fingers (or back out)
+                lastThreeTapAt = 0
+                pendingThreeTap?.cancel()
+                pendingThreeTap = nil
+                toggleViewportZoom(anchor: lastCentroid)
+            } else {
+                lastThreeTapAt = now
+                let work = DispatchWorkItem { [weak self] in
+                    self?.pendingThreeTap = nil
+                    self?.onThreeFingerTap?()
+                }
+                pendingThreeTap = work
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.3, execute: work)
+            }
         default:
             break
         }
@@ -392,8 +535,10 @@ final class MetalCanvasUIView: UIView, UIKeyInput {
     // MARK: - Keyboard (USB HID usage page 0x07)
 
     override var canBecomeFirstResponder: Bool { true }
-    override var inputAccessoryView: UIView? { hardwareKeyboard ? nil : accessoryBar }
-    var hasText: Bool { true }
+    override var inputAccessoryView: UIView? { hardwareKeyboard ? nil : keyBar }
+    /// No iOS text-editing gestures (three-finger undo swipe, edit menu, copy/paste pinch) on the canvas:
+    /// those fingers are Windows' (and the viewport zoom's).
+    override var editingInteractionConfiguration: UIEditingInteractionConfiguration { .none }
 
     // UITextInputTraits: Windows gets exactly what is typed.
     var autocorrectionType: UITextAutocorrectionType = .no
@@ -402,61 +547,184 @@ final class MetalCanvasUIView: UIView, UIKeyInput {
     var smartQuotesType: UITextSmartQuotesType = .no
     var smartDashesType: UITextSmartDashesType = .no
     var smartInsertDeleteType: UITextSmartInsertDeleteType = .no
-    var keyboardType: UIKeyboardType = .asciiCapable
+    var inlinePredictionType: UITextInlinePredictionType = .no
+    var isSecureTextEntry: Bool = false
+    /// Every keyboard (Pinyin, emoji...) once the WinKit focus agent can type what they produce; until
+    /// then the ASCII keyboard, whose keys all exist on a USB keyboard. Read when the keyboard comes up.
+    var keyboardType: UIKeyboardType {
+        get {
+            let seen = WinIOSBridge.shared.focusAgentSeenSeconds
+            return KeyboardOptions.unicodeText && seen >= 0 && seen <= 60 ? .default : .asciiCapable
+        }
+        set {}
+    }
     var keyboardAppearance: UIKeyboardAppearance = .dark
 
     @discardableResult
     override func resignFirstResponder() -> Bool {
         let r = super.resignFirstResponder()
         if r {
-            releaseStickyModifiers()
+            keys.releaseAll(keepLatches: false)
             releaseAllKeys()
+            pendingHide?.cancel()
+            pendingHide = nil
+            keyboardAutoShown = false
             setNeedsLayout()
+            updateFloatingMap()
         }
         return r
     }
 
-    func insertText(_ text: String) {
-        for ch in text {
-            guard let (usage, shift) = Self.asciiToHID(ch) else { continue }
-            sendKey(usage, withShift: shift)
-        }
+    @discardableResult
+    override func becomeFirstResponder() -> Bool {
+        let r = super.becomeFirstResponder()
+        if r { updateFloatingMap() } // the key bar has its own map
+        return r
     }
 
-    func deleteBackward() {
-        sendKey(0x2a, withShift: false) // Backspace
-    }
-
-    /// One key press with the sticky modifiers (Ctrl/Alt/Win/Shift from the bar above the keyboard).
+    /// One key press with the latched modifiers (Ctrl/Alt/Win/Shift from the bar above the keyboard).
     func sendKey(_ usage: UInt8, withShift shift: Bool) {
-        var mods = Array(stickyModifiers)
-        if shift && !mods.contains(0xe1) { mods.append(0xe1) }
-        if mods.isEmpty {
-            WinIOSBridge.shared.tapKeyHid(usage)
-        } else {
-            WinIOSBridge.shared.sendKeyCombo(withModifiers: mods.map { NSNumber(value: $0) }, key: usage)
-        }
-        releaseStickyModifiers()
-    }
-
-    func toggleStickyModifier(_ usage: UInt8) -> Bool {
-        if stickyModifiers.contains(usage) {
-            stickyModifiers.remove(usage)
-            return false
-        }
-        stickyModifiers.insert(usage)
-        return true
-    }
-
-    private func releaseStickyModifiers() {
-        guard !stickyModifiers.isEmpty else { return }
-        stickyModifiers.removeAll()
-        accessoryBar.clearModifierHighlights()
+        keys.tap(usage, extra: shift ? [WindowsKeyState.shift] : [])
     }
 
     func dismissKeyboard() {
         resignFirstResponder()
         onKeyboardDismissed?()
+    }
+
+    // MARK: - Panning for the keyboard, viewport zoom
+
+    private func configureInput() {
+        viewport.view = self
+        viewport.onChange = { [weak self] in self?.viewportChanged() }
+        keyBar.miniMap.onReturnToCaret = { [weak self] in self?.returnToCaret() }
+        let nc = NotificationCenter.default
+        nc.addObserver(self, selector: #selector(releaseAllKeys), name: UIApplication.didEnterBackgroundNotification, object: nil)
+        nc.addObserver(self, selector: #selector(keyboardFrameWillChange(_:)),
+                       name: UIResponder.keyboardWillChangeFrameNotification, object: nil)
+        nc.addObserver(self, selector: #selector(keyboardFrameWillChange(_:)),
+                       name: UIResponder.keyboardWillHideNotification, object: nil)
+        nc.addObserver(self, selector: #selector(focusReportArrived(_:)), name: .WinIOSFocusReport, object: nil)
+    }
+
+    /// The view changed size (rotation, fold): nothing stays held down in Windows, the pan stays valid.
+    private func inputLayoutChanged() {
+        guard bounds.size != lastInputSize else { return }
+        let first = lastInputSize == .zero
+        lastInputSize = bounds.size
+        if !first {
+            endPinch()
+            keys.releaseAll(keepLatches: true)
+        }
+        viewport.layoutChanged()
+        KeyboardDiagnostics.shared.viewHeight = bounds.height
+    }
+
+    /// Windows changed resolution: the fitted picture moved.
+    private func checkFramebufferSize() {
+        let fb = viewport.framebufferSize
+        if fb != lastFramebufferSize {
+            lastFramebufferSize = fb
+            viewport.layoutChanged()
+        }
+    }
+
+    /// The keyboard (with the key bar) moves: the picture slides so the caret or the tap point stays above it.
+    @objc private func keyboardFrameWillChange(_ note: Notification) {
+        guard KeyboardOptions.panInsteadOfShrink, let window, let info = note.userInfo,
+              let end = info[UIResponder.keyboardFrameEndUserInfoKey] as? CGRect else { return }
+        let duration = (info[UIResponder.keyboardAnimationDurationUserInfoKey] as? NSNumber)?.doubleValue ?? 0.25
+        let kb = convert(end, from: window.screen.coordinateSpace)
+        var overlap: CGFloat = 0
+        if isFirstResponder && note.name != UIResponder.keyboardWillHideNotification && kb.height > 1 && kb.intersects(bounds) {
+            overlap = max(0, bounds.maxY - kb.minY)
+        }
+        guard abs(overlap - viewport.keyboardOverlap) > 0.5 else { return }
+        let diag = KeyboardDiagnostics.shared
+        diag.keyboardOverlap = overlap
+        diag.log(String(format: "keyboard covers %.0f of %.0f pt", overlap, bounds.height))
+        viewport.setKeyboardOverlap(overlap, keep: overlap > 0 && KeyboardOptions.followCaret ? panTarget() : nil,
+                                    duration: duration)
+    }
+
+    private func viewportChanged() {
+        KeyboardDiagnostics.shared.zoom = viewport.zoom
+        keyBar.miniMap.setNeedsLayout()
+        updateFloatingMap()
+    }
+
+    /// The screen map over the picture: while it is zoomed and the key bar (with its own map) is not up.
+    private func updateFloatingMap() {
+        let show = viewport.isZoomed && !(isFirstResponder && !hardwareKeyboard)
+        if show && floatingMap == nil {
+            let m = MiniMapView()
+            m.viewport = viewport
+            m.onReturnToCaret = { [weak self] in self?.returnToCaret() }
+            m.caretFramebufferRect = keyBar.miniMap.caretFramebufferRect
+            m.alpha = 0
+            addSubview(m)
+            floatingMap = m
+        }
+        guard let m = floatingMap else { return }
+        let h: CGFloat = 70
+        let w = m.preferredWidth(forHeight: h)
+        m.frame = CGRect(x: bounds.maxX - safeAreaInsets.right - 12 - w, y: safeAreaInsets.top + 12, width: w, height: h)
+        m.setNeedsLayout()
+        let alpha: CGFloat = show ? 1 : 0
+        if m.alpha != alpha {
+            UIView.animate(withDuration: 0.2) { m.alpha = alpha }
+            if show { m.refreshPicture() }
+        }
+    }
+
+    /// Three-finger double-tap (or the Shortcuts menu): 2x around the point, or back to the whole screen.
+    func toggleViewportZoom(anchor: CGPoint?) {
+        mediumHaptic.impactOccurred()
+        if viewport.isZoomed {
+            viewport.resetZoom()
+        } else {
+            viewport.setZoom(2, anchor: anchor ?? CGPoint(x: bounds.midX, y: viewport.visibleRect.midY), duration: 0.22)
+        }
+        KeyboardDiagnostics.shared.log(String(format: "viewport zoom %.1f", viewport.isZoomed ? 2.0 : 1.0))
+    }
+
+    /// The map's double-tap: the caret (or the tap point) back in view.
+    private func returnToCaret() {
+        guard let t = panTarget() else { return }
+        viewport.centre(on: CGPoint(x: t.midX, y: t.midY))
+    }
+
+    /// Trackpad mode while zoomed: the picture follows the pointer once it nears an edge.
+    private func followPointer() {
+        let f = viewport.fittedRect
+        let p = CGPoint(x: f.minX + CGFloat(PointerController.shared.cursorX) * f.width,
+                        y: f.minY + CGFloat(PointerController.shared.cursorY) * f.height)
+        viewport.reveal(CGRect(x: p.x - 4, y: p.y - 4, width: 8, height: 8), band: ViewportController.followBand, duration: 0)
+    }
+
+    /// Where Windows' pointer is drawn now, on screen.
+    private func pointerOnScreen() -> CGPoint {
+        let f = viewport.fittedRect
+        return viewport.project(CGPoint(x: f.minX + CGFloat(PointerController.shared.cursorX) * f.width,
+                                        y: f.minY + CGFloat(PointerController.shared.cursorY) * f.height))
+    }
+
+    /// A tap into the text box that already has the focus raises no focus event: if none comes, and the
+    /// tap was inside that box, the keyboard comes up anyway.
+    private func tappedForKeyboard(at time: CFTimeInterval) {
+        guard KeyboardOptions.autoShow, keyboardResizesView, !hardwareKeyboard, !isFirstResponder,
+              let r = lastFocus, r.isText, r.elem != nil, let tap = lastTapPicturePoint else { return }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.45) { [weak self] in
+            // still a text box (a caret report from the click is fine; a focus change has had its say)
+            guard let self, !self.isFirstResponder, let now = self.lastFocus, now.isText, let e = now.elem,
+                  now.receivedAt < time || now.event == "caret" else { return }
+            let box = self.viewport.pictureRect(fromFramebuffer: self.scaleToFramebuffer(e, from: now.framebuffer))
+            guard box.insetBy(dx: -6, dy: -6).contains(tap) else { return }
+            self.keyboardAutoShown = true
+            KeyboardDiagnostics.shared.autoShows += 1
+            KeyboardDiagnostics.shared.log("tap in the focused text box: keyboard up")
+            self.onKeyboardRequested?()
+        }
     }
 
     override func pressesBegan(_ presses: Set<UIPress>, with event: UIPressesEvent?) {
@@ -497,6 +765,8 @@ final class MetalCanvasUIView: UIView, UIKeyInput {
     @objc func releaseAllKeys() {
         for k in keysDown { WinIOSBridge.shared.sendKeyHid(k, down: false) }
         keysDown.removeAll()
+        endPinch()
+        keys.releaseAll(keepLatches: UIApplication.shared.applicationState == .active)
     }
 
     static func asciiToHID(_ ch: Character) -> (UInt8, Bool)? {
@@ -532,132 +802,29 @@ extension MetalCanvasUIView: UIPointerInteractionDelegate {
     }
 }
 
-/// The row above the system keyboard: the keys an iOS keyboard lacks. Ctrl, Alt, Win and Shift are
-/// sticky: tap one (it lights up), then the key it should combine with.
-final class KeyAccessoryBar: UIInputView {
-    private weak var owner: MetalCanvasUIView?
-    private var modifierButtons: [UIButton] = []
+/// The Windows screen in SwiftUI. In Studio the canvas reaches under the on-screen keyboard: the picture
+/// keeps its size and slides up so the caret stays in view, instead of shrinking (HV_KBD_PAN=0: shrinks,
+/// as before). One view in both postures (no if/else), so the canvas keeps its identity and focus.
+struct MetalDisplayView: View {
+    @Binding var directTouch: Bool
+    @Binding var keyboardVisible: Bool
+    var hardwareKeyboard: Bool
+    var focusAllowed: Bool
+    var onThreeFingerTap: () -> Void
+    var rightClickArmed: Binding<Bool> = .constant(false)
+    var keyboardResizesView: Bool = true
+    var onUserInteraction: (() -> Void)? = nil
 
-    private struct Key {
-        let title: String
-        let usage: UInt8
-        let modifier: Bool
-    }
-
-    private static let keys: [Key] = [
-        Key(title: "Esc", usage: 0x29, modifier: false), Key(title: "Tab", usage: 0x2b, modifier: false),
-        Key(title: "Ctrl", usage: 0xe0, modifier: true), Key(title: "Alt", usage: 0xe2, modifier: true),
-        Key(title: "Win", usage: 0xe3, modifier: true), Key(title: "Shift", usage: 0xe1, modifier: true),
-        Key(title: "←", usage: 0x50, modifier: false), Key(title: "↓", usage: 0x51, modifier: false),
-        Key(title: "↑", usage: 0x52, modifier: false), Key(title: "→", usage: 0x4f, modifier: false),
-        Key(title: "Del", usage: 0x4c, modifier: false), Key(title: "Home", usage: 0x4a, modifier: false),
-        Key(title: "End", usage: 0x4d, modifier: false), Key(title: "PgUp", usage: 0x4b, modifier: false),
-        Key(title: "PgDn", usage: 0x4e, modifier: false),
-        Key(title: "F1", usage: 0x3a, modifier: false), Key(title: "F2", usage: 0x3b, modifier: false),
-        Key(title: "F3", usage: 0x3c, modifier: false), Key(title: "F4", usage: 0x3d, modifier: false),
-        Key(title: "F5", usage: 0x3e, modifier: false), Key(title: "F6", usage: 0x3f, modifier: false),
-        Key(title: "F7", usage: 0x40, modifier: false), Key(title: "F8", usage: 0x41, modifier: false),
-        Key(title: "F9", usage: 0x42, modifier: false), Key(title: "F10", usage: 0x43, modifier: false),
-        Key(title: "F11", usage: 0x44, modifier: false), Key(title: "F12", usage: 0x45, modifier: false),
-    ]
-
-    init(owner: MetalCanvasUIView) {
-        self.owner = owner
-        super.init(frame: CGRect(x: 0, y: 0, width: 320, height: 46), inputViewStyle: .keyboard)
-        allowsSelfSizing = false
-
-        let scroll = UIScrollView()
-        scroll.showsHorizontalScrollIndicator = false
-        scroll.translatesAutoresizingMaskIntoConstraints = false
-        let stack = UIStackView()
-        stack.axis = .horizontal
-        stack.spacing = 6
-        stack.translatesAutoresizingMaskIntoConstraints = false
-        scroll.addSubview(stack)
-
-        let hide = makeButton(title: nil, symbol: "keyboard.chevron.compact.down")
-        hide.addTarget(self, action: #selector(hideTapped), for: .touchUpInside)
-        hide.translatesAutoresizingMaskIntoConstraints = false
-        addSubview(hide)
-        addSubview(scroll)
-
-        for (i, k) in Self.keys.enumerated() {
-            let b = makeButton(title: k.title, symbol: nil)
-            b.tag = i
-            b.addTarget(self, action: #selector(keyTapped(_:)), for: .touchUpInside)
-            stack.addArrangedSubview(b)
-            if k.modifier { modifierButtons.append(b) }
-        }
-
-        NSLayoutConstraint.activate([
-            hide.trailingAnchor.constraint(equalTo: safeAreaLayoutGuide.trailingAnchor, constant: -6),
-            hide.centerYAnchor.constraint(equalTo: centerYAnchor),
-            hide.widthAnchor.constraint(equalToConstant: 44),
-            scroll.leadingAnchor.constraint(equalTo: safeAreaLayoutGuide.leadingAnchor, constant: 6),
-            scroll.trailingAnchor.constraint(equalTo: hide.leadingAnchor, constant: -6),
-            scroll.topAnchor.constraint(equalTo: topAnchor, constant: 5),
-            scroll.bottomAnchor.constraint(equalTo: bottomAnchor, constant: -5),
-            stack.leadingAnchor.constraint(equalTo: scroll.contentLayoutGuide.leadingAnchor),
-            stack.trailingAnchor.constraint(equalTo: scroll.contentLayoutGuide.trailingAnchor),
-            stack.topAnchor.constraint(equalTo: scroll.contentLayoutGuide.topAnchor),
-            stack.bottomAnchor.constraint(equalTo: scroll.contentLayoutGuide.bottomAnchor),
-            stack.heightAnchor.constraint(equalTo: scroll.frameLayoutGuide.heightAnchor),
-        ])
-    }
-
-    required init?(coder: NSCoder) { fatalError("not used") }
-
-    private func makeButton(title: String?, symbol: String?) -> UIButton {
-        var cfg = UIButton.Configuration.gray()
-        cfg.title = title
-        if let symbol { cfg.image = UIImage(systemName: symbol) }
-        cfg.contentInsets = NSDirectionalEdgeInsets(top: 6, leading: 11, bottom: 6, trailing: 11)
-        cfg.cornerStyle = .medium
-        cfg.baseForegroundColor = .label
-        cfg.titleTextAttributesTransformer = UIConfigurationTextAttributesTransformer { attrs in
-            var a = attrs
-            a.font = UIFont.systemFont(ofSize: 15, weight: .medium)
-            return a
-        }
-        return UIButton(configuration: cfg)
-    }
-
-    @objc private func keyTapped(_ sender: UIButton) {
-        guard let owner else { return }
-        let k = Self.keys[sender.tag]
-        UIDevice.current.playInputClick()
-        if k.modifier {
-            let on = owner.toggleStickyModifier(k.usage)
-            setHighlighted(sender, on)
-        } else {
-            owner.sendKey(k.usage, withShift: false)
-        }
-    }
-
-    private func setHighlighted(_ b: UIButton, _ on: Bool) {
-        var cfg = on ? UIButton.Configuration.filled() : UIButton.Configuration.gray()
-        cfg.title = b.configuration?.title
-        cfg.contentInsets = b.configuration?.contentInsets ?? .zero
-        cfg.cornerStyle = .medium
-        cfg.baseForegroundColor = on ? .white : .label
-        cfg.titleTextAttributesTransformer = b.configuration?.titleTextAttributesTransformer
-        b.configuration = cfg
-    }
-
-    func clearModifierHighlights() {
-        for b in modifierButtons { setHighlighted(b, false) }
-    }
-
-    @objc private func hideTapped() {
-        owner?.dismissKeyboard()
+    var body: some View {
+        MetalCanvasRepresentable(directTouch: $directTouch, keyboardVisible: $keyboardVisible,
+                                 hardwareKeyboard: hardwareKeyboard, focusAllowed: focusAllowed,
+                                 onThreeFingerTap: onThreeFingerTap, rightClickArmed: rightClickArmed,
+                                 keyboardResizesView: keyboardResizesView, onUserInteraction: onUserInteraction)
+            .ignoresSafeArea(keyboardResizesView && KeyboardOptions.panInsteadOfShrink ? .keyboard : [], edges: .bottom)
     }
 }
 
-extension KeyAccessoryBar: UIInputViewAudioFeedback {
-    var enableInputClicksWhenVisible: Bool { true }
-}
-
-struct MetalDisplayView: UIViewRepresentable {
+struct MetalCanvasRepresentable: UIViewRepresentable {
     @Binding var directTouch: Bool
     @Binding var keyboardVisible: Bool
     /// A hardware keyboard is attached: keep the keyboard focus on Windows by itself.
@@ -680,11 +847,19 @@ struct MetalDisplayView: UIViewRepresentable {
         return view
     }
 
+    static func dismantleUIView(_ uiView: MetalCanvasUIView, coordinator: ()) {
+        uiView.releaseAllKeys()
+    }
+
     func updateUIView(_ uiView: MetalCanvasUIView, context: Context) {
         uiView.directTouch = directTouch
         uiView.hardwareKeyboard = hardwareKeyboard
         uiView.onThreeFingerTap = onThreeFingerTap
         uiView.onUserInteraction = onUserInteraction
+        let visible = $keyboardVisible
+        uiView.onKeyboardRequested = { // a text box in Windows got the focus
+            DispatchQueue.main.async { visible.wrappedValue = true }
+        }
         uiView.rightClickArmed = rightClickArmed.wrappedValue
         let armed = rightClickArmed
         uiView.onRightClickConsumed = {

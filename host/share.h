@@ -24,4 +24,16 @@ char *hv_share_take_open_url(void);
 /* Returns 1 (once) when the guest OAuth callback relay completed an auth redirect. */
 int hv_share_take_oauth_done(void);
 
+/* ---- /.henge/focus: the WinKit focus agent in Windows (winkit/FocusAgent.cs) ---- */
+/* Called on a connection thread with each focus report the agent PUTs (a JSON object, NUL-terminated). */
+typedef void (*HvShareFocusHandler)(const char *json, size_t len, void *opaque);
+void hv_share_set_focus_handler(HvShareFocusHandler handler, void *opaque);
+/* Seconds since the focus agent was last heard from, or -1 if never. */
+long hv_share_focus_agent_seen(void);
+/* Queues UTF-8 text for the agent to type (\b = Backspace, \n = Enter). 0, or -1 when no agent is listening. */
+int hv_share_focus_send_text(const char *utf8);
+/* 1 while queued text waits for the agent, or just after it took some: keys sent another way now could
+   overtake it. */
+int hv_share_focus_text_busy(void);
+
 #endif

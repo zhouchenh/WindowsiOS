@@ -134,6 +134,60 @@ static void fb_note_present(FbPlacement pl, uint32_t sw, uint32_t sh, CGSize dsi
     os_unfair_lock_unlock(&g_stats_lock);
 }
 
+/* ---- Viewport pan/zoom (keyboard pan and viewport zoom, set by the app through the bridge) ----
+   The picture, as fitted to the drawable, is scaled by zoom about the drawable's centre and then moved by
+   (tx, ty), fractions of the drawable's width and height (y down). 1, 0, 0 shows it as fitted. Kept to
+   this block, fb_compose() and the off uniform (buffer 2): fb_place() stays the placement, this sits on top. */
+static os_unfair_lock g_view_lock = OS_UNFAIR_LOCK_INIT;
+static float g_view_zoom = 1.0f, g_view_tx = 0.0f, g_view_ty = 0.0f;
+static _Atomic uint64_t g_view_serial; /* folded into the frame hashes: a new transform redraws */
+
+void hv_fb_metal_set_view_transform(float zoom, float tx, float ty) {
+    if (!(zoom >= 1.0f)) zoom = 1.0f; /* also NaN */
+    if (zoom > 8.0f) zoom = 8.0f;
+    if (!(tx > -4.0f && tx < 4.0f)) tx = 0.0f;
+    if (!(ty > -4.0f && ty < 4.0f)) ty = 0.0f;
+    os_unfair_lock_lock(&g_view_lock);
+    int same = g_view_zoom == zoom && g_view_tx == tx && g_view_ty == ty;
+    g_view_zoom = zoom;
+    g_view_tx = tx;
+    g_view_ty = ty;
+    os_unfair_lock_unlock(&g_view_lock);
+    if (!same) atomic_fetch_add(&g_view_serial, 1);
+}
+
+static uint64_t fb_view_hash(void) { return atomic_load(&g_view_serial) * 0xc2b2ae3d27d4eb4full; }
+
+/* The pan/zoom transform on top of the display placement pl, for a drawable of dw x dh pixels. Sets the
+   vertex scale (NDC half sizes) and off (NDC centre) the quad and the cursor are drawn with, in pl->vp.
+   With no transform: pl is left as placed (whole pixels, its own viewport), scale 1 and off 0. With one:
+   the viewport becomes the whole drawable (a panned picture may leave the placed rectangle), the placed
+   picture is zoomed about the drawable's centre and moved by (tx, ty) fractions of the drawable. A pure
+   pan moves by whole drawable pixels, so nearest sampling stays exact; a zoom samples linearly. */
+static void fb_compose(FbPlacement *pl, double dw, double dh, float scale[2], float off[2]) {
+    os_unfair_lock_lock(&g_view_lock);
+    float zoom = g_view_zoom, tx = g_view_tx, ty = g_view_ty;
+    os_unfair_lock_unlock(&g_view_lock);
+    scale[0] = scale[1] = 1.0f;
+    off[0] = off[1] = 0.0f;
+    if ((zoom == 1.0f && tx == 0.0f && ty == 0.0f) || dw < 1 || dh < 1) return;
+    MTLViewport vp = pl->vp;
+    double cx = (vp.originX + vp.width / 2) / dw * 2 - 1;
+    double cy = 1 - (vp.originY + vp.height / 2) / dh * 2;
+    double px = tx * dw, py = ty * dh;
+    if (zoom == 1.0f) {
+        px = round(px);
+        py = round(py);
+    } else {
+        pl->nearest = 0;
+    }
+    scale[0] = (float)(vp.width / dw * zoom);
+    scale[1] = (float)(vp.height / dh * zoom);
+    off[0] = (float)(cx * zoom + 2 * px / dw);
+    off[1] = (float)(cy * zoom - 2 * py / dh);
+    pl->vp = (MTLViewport){0, 0, dw, dh, 0.0, 1.0};
+}
+
 /* The guest draws sRGB values (Windows' and Linux's desktops are sRGB). Tagging the layer sRGB has Core
    Animation colour-match them to the screen. An untagged layer goes to a wide-gamut (Display P3) panel
    unmanaged, its colours stretched to the panel's gamut: oversaturated. HV_NO_COLOR_MATCH=1 (an
@@ -156,11 +210,12 @@ static NSString *const kFbShaderSource =
      "    float4 pos [[position]];\n"
      "    float2 uv;\n"
      "};\n"
-     "vertex VOut fb_vs(uint vid [[vertex_id]], constant float2 &scale [[buffer(0)]], constant float4 &uvr [[buffer(1)]]) {\n"
+     "vertex VOut fb_vs(uint vid [[vertex_id]], constant float2 &scale [[buffer(0)]], constant float4 &uvr [[buffer(1)]],\n"
+     "                  constant float2 &off [[buffer(2)]]) {\n"
      "    const float2 quad[4] = { float2(-1,-1), float2(1,-1), float2(-1,1), float2(1,1) };\n"
      "    const float2 uvs[4]  = { float2(0,1),   float2(1,1),  float2(0,0),  float2(1,0) };\n"
      "    VOut o;\n"
-     "    o.pos = float4(quad[vid] * scale, 0.0, 1.0);\n"
+     "    o.pos = float4(quad[vid] * scale + off, 0.0, 1.0);\n"
      "    o.uv  = uvr.xy + uvs[vid] * uvr.zw;\n"
      "    return o;\n"
      "}\n"
@@ -365,8 +420,8 @@ static uint64_t cursor_hash(HvFbDisplay *fb) {
 }
 
 /* The hardware cursor over a frame of fw x fh pixels drawn at scale (NDC half sizes). Under lock. */
-static void draw_cursor(HvFbMetalPresenter *p, id<MTLRenderCommandEncoder> enc, const float scale[2], uint32_t fw,
-                        uint32_t fh) {
+static void draw_cursor(HvFbMetalPresenter *p, id<MTLRenderCommandEncoder> enc, const float scale[2], const float off[2],
+                        uint32_t fw, uint32_t fh) {
     uint32_t cw = 0, ch = 0;
     int32_t cx = 0, cy = 0;
     uint64_t img = p->curImgSerial;
@@ -387,8 +442,9 @@ static void draw_cursor(HvFbMetalPresenter *p, id<MTLRenderCommandEncoder> enc, 
         for (uint32_t r = 0; r < ch; r++) memcpy(full + r * 64, p->curPx + r * cw, cw * 4);
         [p->curTex replaceRegion:MTLRegionMake2D(0, 0, 64, 64) mipmapLevel:0 withBytes:full bytesPerRow:64 * 4];
     }
-    float rect[4] = {-scale[0] + 2 * scale[0] * (float)cx / fw, scale[1] - 2 * scale[1] * (float)cy / fh,
-                     -scale[0] + 2 * scale[0] * (float)(cx + 64) / fw, scale[1] - 2 * scale[1] * (float)(cy + 64) / fh};
+    float rect[4] = {off[0] - scale[0] + 2 * scale[0] * (float)cx / fw, off[1] + scale[1] - 2 * scale[1] * (float)cy / fh,
+                     off[0] - scale[0] + 2 * scale[0] * (float)(cx + 64) / fw,
+                     off[1] + scale[1] - 2 * scale[1] * (float)(cy + 64) / fh};
     [enc setRenderPipelineState:p->curPipeline];
     [enc setVertexBytes:rect length:sizeof(rect) atIndex:0];
     [enc setFragmentTexture:p->curTex atIndex:0];
@@ -422,7 +478,7 @@ static uint64_t quick_frame_hash(const uint8_t *px, uint32_t w, uint32_t h, uint
     }
     CGSize dsize = curLayer.drawableSize;
     uint64_t serial = __atomic_load_n(&fb->ovr_serial, __ATOMIC_RELAXED);
-    uint64_t hval = (serial * 0xff51afd7ed558ccdull) ^ (uint64_t)(uintptr_t)tref ^ 0x5bd1e995 ^ cursor_hash(fb);
+    uint64_t hval = (serial * 0xff51afd7ed558ccdull) ^ (uint64_t)(uintptr_t)tref ^ 0x5bd1e995 ^ cursor_hash(fb) ^ fb_view_hash();
     if (dsize.width < 4 || dsize.height < 4 ||
         (hval == lastHash && CGSizeEqualToSize(dsize, lastDrawableSize)) || fb_hold_blocks(rw, rh)) {
         os_unfair_lock_unlock(&lock);
@@ -434,7 +490,8 @@ static uint64_t quick_frame_hash(const uint8_t *px, uint32_t w, uint32_t h, uint
         return YES;
     }
     FbPlacement pl = fb_place(rw, rh, dsize.width, dsize.height);
-    static const float scale[2] = {1.0f, 1.0f};
+    float scale[2], off[2];
+    fb_compose(&pl, dsize.width, dsize.height, scale, off); /* pan/zoom on top of the placement */
     float uvr[4] = {(float)rx / tw, (float)ry / th, (float)rw / tw, (float)rh / th};
     MTLRenderPassDescriptor *rp = [MTLRenderPassDescriptor renderPassDescriptor];
     rp.colorAttachments[0].texture = drawable.texture;
@@ -447,10 +504,11 @@ static uint64_t quick_frame_hash(const uint8_t *px, uint32_t w, uint32_t h, uint
     [enc setRenderPipelineState:pipeline];
     [enc setVertexBytes:scale length:sizeof(scale) atIndex:0];
     [enc setVertexBytes:uvr length:sizeof(uvr) atIndex:1];
+    [enc setVertexBytes:off length:sizeof(off) atIndex:2];
     [enc setFragmentBytes:&pl.nearest length:sizeof(pl.nearest) atIndex:0];
     [enc setFragmentTexture:src atIndex:0];
     [enc drawPrimitives:MTLPrimitiveTypeTriangleStrip vertexStart:0 vertexCount:4];
-    draw_cursor(self, enc, scale, rw, rh);
+    draw_cursor(self, enc, scale, off, rw, rh);
     [enc endEncoding];
     [cb presentDrawable:drawable];
     [cb commit];
@@ -499,7 +557,8 @@ static uint64_t quick_frame_hash(const uint8_t *px, uint32_t w, uint32_t h, uint
         }
 
         uint64_t hval = quick_frame_hash(px, w, h, stride) ^
-                        (__atomic_load_n(&fb->ovr_serial, __ATOMIC_RELAXED) * 0xff51afd7ed558ccdull) ^ cursor_hash(fb);
+                        (__atomic_load_n(&fb->ovr_serial, __ATOMIC_RELAXED) * 0xff51afd7ed558ccdull) ^ cursor_hash(fb) ^
+                        fb_view_hash();
         BOOL sizeChanged = !CGSizeEqualToSize(dsize, lastDrawableSize);
         if ((hval == lastHash && !sizeChanged && texW == w && texH == h) || fb_hold_blocks(w, h)) {
             os_unfair_lock_unlock(&lock);
@@ -529,7 +588,8 @@ static uint64_t quick_frame_hash(const uint8_t *px, uint32_t w, uint32_t h, uint
         }
 
         FbPlacement pl = fb_place(w, h, dsize.width, dsize.height);
-        static const float scale[2] = {1.0f, 1.0f};
+        float scale[2], off[2];
+        fb_compose(&pl, dsize.width, dsize.height, scale, off); /* pan/zoom on top of the placement */
 
         MTLRenderPassDescriptor *rp = [MTLRenderPassDescriptor renderPassDescriptor];
         rp.colorAttachments[0].texture = drawable.texture;
@@ -544,10 +604,11 @@ static uint64_t quick_frame_hash(const uint8_t *px, uint32_t w, uint32_t h, uint
         [enc setVertexBytes:scale length:sizeof(scale) atIndex:0];
         static const float uvr_full[4] = {0, 0, 1, 1};
         [enc setVertexBytes:uvr_full length:sizeof(uvr_full) atIndex:1];
+        [enc setVertexBytes:off length:sizeof(off) atIndex:2];
         [enc setFragmentBytes:&pl.nearest length:sizeof(pl.nearest) atIndex:0];
         [enc setFragmentTexture:texture atIndex:0];
         [enc drawPrimitives:MTLPrimitiveTypeTriangleStrip vertexStart:0 vertexCount:4];
-        draw_cursor(self, enc, scale, w, h);
+        draw_cursor(self, enc, scale, off, w, h);
         [enc endEncoding];
         [cb presentDrawable:drawable];
         [cb commit];

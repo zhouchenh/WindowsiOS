@@ -10,7 +10,9 @@
 #include "winvm.h"
 
 #import <AVFoundation/AVFoundation.h>
+#import <ImageIO/ImageIO.h> /* the mini-map's thumbnail */
 #import <UIKit/UIKit.h>
+#include <stdatomic.h>
 #import <Metal/Metal.h>
 #include <mach/mach_time.h>
 #include <os/lock.h>
@@ -1668,6 +1670,73 @@ static void winios_type_run(NSString *text) {
 - (void)setUseSafariForGuestLinks:(BOOL)useSafariForGuestLinks {
     hv_share_set_url_handler_enabled(useSafariForGuestLinks ? 1 : 0);
     [[NSUserDefaults standardUserDefaults] setBool:useSafariForGuestLinks forKey:@"winios.safariOAuthV2"];
+}
+
+/* ---- Keyboard, text and zoom ---- */
+
+NSNotificationName const WinIOSFocusReportNotification = @"WinIOSFocusReportNotification";
+
+/* A report of the WinKit focus agent (a connection thread of share.c): decoded and posted on the main thread. */
+static void winios_focus_report(const char *json, size_t len, void *opaque) {
+    (void)opaque;
+    NSData *data = [NSData dataWithBytes:json length:len];
+    dispatch_async(dispatch_get_main_queue(), ^{
+        id obj = [NSJSONSerialization JSONObjectWithData:data options:0 error:nil];
+        if (![obj isKindOfClass:[NSDictionary class]]) return;
+        [[NSNotificationCenter defaultCenter] postNotificationName:WinIOSFocusReportNotification
+                                                            object:nil
+                                                          userInfo:@{@"report": obj}];
+    });
+}
+
+__attribute__((constructor)) static void winios_focus_register(void) {
+    hv_share_set_focus_handler(winios_focus_report, NULL);
+}
+
+- (void)setViewZoom:(double)zoom translateX:(double)tx y:(double)ty {
+    hv_fb_metal_set_view_transform((float)zoom, (float)tx, (float)ty);
+}
+
+- (BOOL)sendUnicodeText:(NSString *)text {
+    if (!_vmRunning || !text.length) return NO;
+    return hv_share_focus_send_text(text.UTF8String) == 0;
+}
+
+- (NSInteger)focusAgentSeenSeconds {
+    return hv_share_focus_agent_seen();
+}
+
+- (BOOL)unicodeTextBusy {
+    return hv_share_focus_text_busy() != 0;
+}
+
+- (void)makeScreenThumbnailMaxPixels:(NSInteger)maxPixels completion:(void (^)(CGImageRef _Nullable))completion {
+    static _Atomic int running;
+    int idle = 0;
+    if (!_vmRunning || !atomic_compare_exchange_strong(&running, &idle, 1)) {
+        completion(NULL);
+        return;
+    }
+    NSString *path = [NSTemporaryDirectory() stringByAppendingPathComponent:@"minimap.png"];
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+        CGImageRef thumb = NULL;
+        if (hv_winvm_save_png(path.fileSystemRepresentation) == 0) {
+            CGImageSourceRef src = CGImageSourceCreateWithURL((__bridge CFURLRef)[NSURL fileURLWithPath:path], NULL);
+            if (src) {
+                NSDictionary *opts = @{(id)kCGImageSourceCreateThumbnailFromImageAlways: @YES,
+                                       (id)kCGImageSourceThumbnailMaxPixelSize: @(MAX(16, maxPixels)),
+                                       (id)kCGImageSourceShouldCacheImmediately: @YES};
+                thumb = CGImageSourceCreateThumbnailAtIndex(src, 0, (__bridge CFDictionaryRef)opts);
+                CFRelease(src);
+            }
+            unlink(path.fileSystemRepresentation);
+        }
+        atomic_store(&running, 0);
+        dispatch_async(dispatch_get_main_queue(), ^{
+            completion(thumb);
+            if (thumb) CGImageRelease(thumb);
+        });
+    });
 }
 
 - (nullable NSString *)takeGuestOpenURL {

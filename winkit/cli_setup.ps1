@@ -96,3 +96,49 @@ Write-Host ''
 Write-Host 'WinKit helper installed: it starts hidden with every logon.' -ForegroundColor Green
 Write-Host 'If an older WinKit had set up the command-line mode, it is removed: restart Windows from'
 Write-Host 'Start > Power once (do not just close the app) so that Windows keeps the change.'
+
+# ==== WinKit focus agent (appended section: keyboard follows the text cursor; Chinese, accents, emoji) ====
+# FocusAgent.cs (next to this script) tells the app where Windows' keyboard focus and text cursor are, so the
+# iPhone keyboard comes up in text boxes and the picture keeps the cursor in view, and types the text a USB
+# keyboard cannot. focus.ps1 compiles it at every logon (a few seconds) and runs it hidden, like the helper.
+# It stops by itself, and takes its shortcut away, once the helper is removed (cli_setup.ps1 -Remove).
+# A file named focus_nouia in %LOCALAPPDATA%\WinKit makes it skip UI Automation (if Edge or VS Code get slow).
+$focusSrc = Join-Path $PSScriptRoot 'FocusAgent.cs'
+$focusHost = Join-Path $dir 'focus.ps1'
+$focusLink = Join-Path $startup 'WinKitFocus.lnk'
+Get-CimInstance Win32_Process -Filter "Name='powershell.exe'" -ErrorAction SilentlyContinue | Where-Object { $_.CommandLine -like '*WinKit\focus.ps1*' } |
+    ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
+if ($PSScriptRoot -and (Test-Path $focusSrc)) {
+    Copy-Item $focusSrc (Join-Path $dir 'FocusAgent.cs') -Force
+    @'
+# WinKit focus agent (written by cli_setup.ps1): compiles FocusAgent.cs and runs it. Its log: focus.log.
+$dir = Join-Path $env:LOCALAPPDATA 'WinKit'
+$log = Join-Path $dir 'focus.log'
+$link = Join-Path ([Environment]::GetFolderPath('Startup')) 'WinKitFocus.lnk'
+function Gone { Remove-Item $link, (Join-Path $dir 'FocusAgent.cs'), (Join-Path $dir 'focus.ps1') -ErrorAction SilentlyContinue }
+if (-not (Test-Path (Join-Path $dir 'agent.ps1'))) { Gone; return }   # the helper was removed: so is this
+try {
+    $refs = @()
+    foreach ($n in 'UIAutomationClient', 'UIAutomationTypes', 'WindowsBase', 'Accessibility') {
+        $a = [Reflection.Assembly]::LoadWithPartialName($n)
+        if ($a) { $refs += $a.Location }
+    }
+    $Error.Clear()
+    Add-Type -TypeDefinition ([IO.File]::ReadAllText((Join-Path $dir 'FocusAgent.cs'))) -Language CSharp -ReferencedAssemblies $refs -ErrorAction Stop
+} catch {
+    Add-Content $log ((Get-Date -Format s) + ' FocusAgent.cs did not compile:' + "`r`n" + ($Error | Select-Object -First 8 | Out-String))
+    return
+}
+try { [WinKit.FocusAgent]::Run($dir) } catch { Add-Content $log ((Get-Date -Format s) + ' stopped: ' + $_.Exception.Message) }
+if (-not (Test-Path (Join-Path $dir 'agent.ps1'))) { Gone }
+'@ | Out-File -Encoding ascii $focusHost
+    $sc = (New-Object -ComObject WScript.Shell).CreateShortcut($focusLink)
+    $sc.TargetPath = $ps
+    $sc.Arguments = '-NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File "' + $focusHost + '"'
+    $sc.WindowStyle = 7
+    $sc.Save()
+    Start-Process $ps -WindowStyle Hidden -ArgumentList ('-NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File "' + $focusHost + '"')
+    Write-Host 'WinKit focus agent installed: the iPhone keyboard follows the text cursor, and Chinese and emoji can be typed.' -ForegroundColor Green
+} else {
+    Write-Host 'FocusAgent.cs is not next to cli_setup.ps1: the keyboard will not follow the text cursor (update the WINKIT drive).' -ForegroundColor Yellow
+}
