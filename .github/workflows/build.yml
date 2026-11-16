@@ -1,0 +1,95 @@
+# SPDX-License-Identifier: GPL-2.0-or-later
+#
+# Builds the engine and its tests for macOS, the iOS static library and the iOS app (unsigned),
+# and uploads dist/AppleVM-Duo-unsigned.ipa as an artifact. The IPA has no 3D frameworks
+# (UTM's frameworks are not fetched here); see docs/building.md for a full local build.
+name: Build
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: build-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  HOMEBREW_NO_AUTO_UPDATE: "1"
+  HOMEBREW_NO_INSTALL_CLEANUP: "1"
+  HOMEBREW_NO_INSTALLED_DEPENDENTS_CHECK: "1"
+  HOMEBREW_NO_ANALYTICS: "1"
+
+jobs:
+  build:
+    name: Engine, tests and unsigned IPA
+    # GitHub's Xcode 27 image (macOS 27, arm64, Xcode 27 with the iOS 27 SDK).
+    runs-on: xcode-27
+    timeout-minutes: 90
+    steps:
+      - name: Check out
+        uses: actions/checkout@v5
+
+      - name: Toolchain
+        run: |
+          xcodebuild -version
+          echo "iOS SDK $(xcrun --sdk iphoneos --show-sdk-version)"
+          sw_vers
+
+      - name: Homebrew packages
+        run: |
+          brew install xcodegen meson ninja mtools libslirp pkgconf
+          # scripts/build_ios_deps.sh runs meson with /opt/homebrew/bin/python3.
+          [ -x /opt/homebrew/bin/python3 ] || brew install python
+
+      - name: Engine and macOS runner (make all)
+        run: make -j"$(sysctl -n hw.ncpu)" all
+
+      - name: Core tests (make test-core)
+        run: make test-core
+
+      - name: Restore iOS dependencies (libffi, glib, libslirp)
+        id: ios-deps
+        uses: actions/cache@v5
+        with:
+          path: ios/deps
+          key: ios-deps-v1-xcode27-${{ runner.arch }}-${{ hashFiles('scripts/build_ios_deps.sh') }}
+
+      - name: Build iOS dependencies (scripts/build_ios_deps.sh)
+        if: steps.ios-deps.outputs.cache-hit != 'true'
+        run: |
+          if ! scripts/build_ios_deps.sh; then
+            for f in work/ios_deps_build/*.log; do echo "::group::$f"; tail -60 "$f"; echo "::endgroup::"; done
+            exit 1
+          fi
+
+      - name: iOS engine library (make ios-lib)
+        run: make -j"$(sysctl -n hw.ncpu)" ios-lib
+
+      - name: Xcode project (xcodegen)
+        run: cd ios && xcodegen generate --spec project.yml
+
+      - name: Unsigned Release build and IPA (scripts/package_ipa.sh)
+        run: scripts/package_ipa.sh
+
+      - name: Upload the unsigned IPA
+        uses: actions/upload-artifact@v6
+        with:
+          name: AppleVM-Duo-unsigned-${{ github.sha }}
+          path: dist/AppleVM-Duo-unsigned.ipa
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Upload build logs
+        if: failure()
+        uses: actions/upload-artifact@v6
+        with:
+          name: build-logs-${{ github.sha }}
+          path: |
+            build/package/*.log
+            work/ios_deps_build/*.log
+          if-no-files-found: ignore
+          retention-days: 7

@@ -1,9 +1,13 @@
 # Build outputs & dependency staging
 build/
 work/
-ios/deps/
+ios/deps
 ios/*.xcodeproj
 ios/DerivedData/
+dist/
+
+# Personal signing settings (copy ios/Signing.example.xcconfig)
+ios/Signing.local.xcconfig
 
 # App bundles & object archives
 *.ipa
