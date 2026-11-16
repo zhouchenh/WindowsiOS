@@ -66,7 +66,9 @@ UTF-8, malformed requests, the app's listener and the helper's status.
 - What password managers mark as private is not sent: `ExcludeClipboardContentFromMonitorProcessing`,
   or `CanIncludeInClipboardHistory` = 0.
 - From the iPhone: the text goes on the clipboard (LF as CRLF) with `SetClipboardData` on the window's
-  thread. At start the iPhone's last text is taken only into an empty clipboard (as at logon), so a
+  thread, with `CanIncludeInClipboardHistory` = 0 and `CanUploadToCloudClipboard` = 0: the iPhone cannot
+  say whether the text was private (a password, say), so none of it is kept in Win+V history or uploaded
+  to the cloud clipboard. At start the iPhone's last text is taken only into an empty clipboard (as at logon), so a
   restarted helper does not replace what was copied in Windows meanwhile.
 - It runs in the user's own session, not elevated, through the scheduled task **WinKit Clipboard**: at
   logon, and every 5 minutes after that (a running helper is left alone, a stopped one is started again).

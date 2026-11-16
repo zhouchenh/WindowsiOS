@@ -13,6 +13,9 @@
 //   back; nor is the same text put there again by another program right after (a clipboard manager).
 //   Text that password managers mark as private (ExcludeClipboardContentFromMonitorProcessing,
 //   CanIncludeInClipboardHistory = 0) is not sent at all. Text only, up to 1 MB of UTF-8.
+// Privacy: the iPhone cannot say whether its text was private (a password, say), so all of it goes on
+//   Windows' clipboard with CanIncludeInClipboardHistory = 0 and CanUploadToCloudClipboard = 0: never in
+//   Win+V history or the Microsoft account's cloud clipboard.
 using System;
 using System.IO;
 using System.Net;
@@ -51,7 +54,7 @@ namespace WinKit
         [DllImport("kernel32.dll")] static extern UIntPtr GlobalSize(IntPtr mem);
 
         static MessageWindow window;
-        static uint excludeFormat, historyFormat;
+        static uint excludeFormat, historyFormat, cloudFormat;
 
         // Touched only on the window's thread.
         static uint ownSequence;   // the clipboard's sequence number right after this helper wrote it
@@ -92,6 +95,7 @@ namespace WinKit
                 AppDomain.CurrentDomain.UnhandledException += delegate(object s, UnhandledExceptionEventArgs e) { Log("fatal: " + e.ExceptionObject); };
                 excludeFormat = RegisterClipboardFormat("ExcludeClipboardContentFromMonitorProcessing");
                 historyFormat = RegisterClipboardFormat("CanIncludeInClipboardHistory");
+                cloudFormat = RegisterClipboardFormat("CanUploadToCloudClipboard");
 
                 window = new MessageWindow();
                 if (!AddClipboardFormatListener(window.Handle))
@@ -358,11 +362,22 @@ namespace WinKit
             Marshal.Copy(windows.ToCharArray(), 0, ptr, windows.Length);
             Marshal.WriteInt16(ptr, windows.Length * 2, (short)0);
             GlobalUnlock(mem);
-            if (!Open()) { GlobalFree(mem); return false; }
+            IntPtr noHistory = Dword(0), noCloud = Dword(0);
+            if (noHistory == IntPtr.Zero || noCloud == IntPtr.Zero || !Open())
+            {
+                GlobalFree(mem);
+                if (noHistory != IntPtr.Zero) GlobalFree(noHistory);
+                if (noCloud != IntPtr.Zero) GlobalFree(noCloud);
+                return false;
+            }
             bool written = false;
             try
             {
                 if (!EmptyClipboard()) { Log("write: EmptyClipboard failed: " + Marshal.GetLastWin32Error()); return false; }
+                // Not in clipboard history nor the cloud clipboard (the formats go in before the text).
+                if (historyFormat != 0 && SetClipboardData(historyFormat, noHistory) != IntPtr.Zero) noHistory = IntPtr.Zero;
+                if (cloudFormat != 0 && SetClipboardData(cloudFormat, noCloud) != IntPtr.Zero) noCloud = IntPtr.Zero;
+                if (noHistory != IntPtr.Zero || noCloud != IntPtr.Zero) Log("write: could not keep it out of clipboard history");
                 written = SetClipboardData(CF_UNICODETEXT, mem) != IntPtr.Zero; // then the system owns it
                 if (!written) Log("write: SetClipboardData failed: " + Marshal.GetLastWin32Error());
                 return written;
@@ -370,6 +385,8 @@ namespace WinKit
             finally
             {
                 if (!written) GlobalFree(mem);
+                if (noHistory != IntPtr.Zero) GlobalFree(noHistory); // not taken by the system
+                if (noCloud != IntPtr.Zero) GlobalFree(noCloud);
                 CloseClipboard();
                 if (written)
                 {
@@ -378,6 +395,18 @@ namespace WinKit
                     ownTick = Environment.TickCount;
                 }
             }
+        }
+
+        // A DWORD in movable global memory, for SetClipboardData; IntPtr.Zero without memory.
+        static IntPtr Dword(int value)
+        {
+            IntPtr m = GlobalAlloc(GMEM_MOVEABLE, new UIntPtr(4));
+            if (m == IntPtr.Zero) return IntPtr.Zero;
+            IntPtr p = GlobalLock(m);
+            if (p == IntPtr.Zero) { GlobalFree(m); return IntPtr.Zero; }
+            Marshal.WriteInt32(p, value);
+            GlobalUnlock(m);
+            return m;
         }
 
         // ---- plumbing
