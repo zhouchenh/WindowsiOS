@@ -1,0 +1,86 @@
+#!/bin/bash
+# WindowsiOS Arch Linux installer, stage 2: the installed system's first boot. Brings the system up to
+# date and installs the KDE Plasma desktop (Wayland, automatic login of user alarm) with the GPU drivers
+# (Mesa virgl for OpenGL, Venus for Vulkan), then turns itself off and restarts into the desktop.
+# Progress: the screen, /root/firstboot.log and the app (http://10.0.2.4/arch_install_status.txt).
+# Run again by hand: systemctl start winios-firstboot (it does nothing once /var/lib/winios/firstboot-done exists).
+exec > >(tee -a /root/firstboot.log /dev/tty1) 2>&1
+DONE=/var/lib/winios/firstboot-done
+[ -e $DONE ] && exit 0
+
+status() {
+    echo "[winios] $*"
+    echo "$*" > /run/winios-status
+    curl -s -m 5 -T /run/winios-status http://10.0.2.4/arch_install_status.txt >/dev/null 2>&1
+}
+
+fail() {
+    status "error $*"
+    exit 1
+}
+
+# pacman with a few tries: a mirror can be briefly out of step or slow
+pac() {
+    for i in 1 2 3; do
+        pacman "$@" && return 0
+        sleep 10
+        pacman -Syy >/dev/null 2>&1
+    done
+    return 1
+}
+
+for i in $(seq 60); do curl -s -m 3 -o /dev/null http://10.0.2.4/ && break; sleep 2; done
+status "76 preparing the package manager"
+pacman-key --init || fail "pacman-key --init"
+pacman-key --populate archlinuxarm || fail "pacman-key --populate"
+
+status "78 updating the system"
+pac -Syyu --noconfirm || fail "system update"
+
+status "84 installing the KDE Plasma desktop and the GPU drivers (the longest step)"
+pac -S --noconfirm --needed \
+    plasma-desktop plasma-workspace kwin sddm sddm-kcm konsole dolphin kscreen kinfocenter systemsettings \
+    plasma-pa plasma-nm networkmanager breeze breeze-gtk xdg-desktop-portal-kde xorg-xwayland \
+    mesa mesa-utils vulkan-virtio vulkan-tools vulkan-icd-loader \
+    noto-fonts noto-fonts-cjk noto-fonts-emoji || fail "installing the desktop"
+
+status "96 setting up the desktop"
+mkdir -p /etc/sddm.conf.d
+cat > /etc/sddm.conf.d/autologin.conf <<'EOF'
+[Autologin]
+User=alarm
+Session=plasma
+Relogin=false
+
+[General]
+DisplayServer=wayland
+EOF
+# The screen must not dim, blank or lock by itself: on the iPad that looks like a broken screen.
+install -d -o alarm -g alarm /home/alarm/.config
+cat > /home/alarm/.config/powerdevilrc <<'EOF'
+[AC][Display]
+DimDisplayWhenIdle=false
+TurnOffDisplayWhenIdle=false
+
+[AC][SuspendAndShutdown]
+AutoSuspendAction=0
+EOF
+cat > /home/alarm/.config/kscreenlockerrc <<'EOF'
+[Daemon]
+Autolock=false
+LockOnResume=false
+EOF
+chown alarm:alarm /home/alarm/.config/powerdevilrc /home/alarm/.config/kscreenlockerrc
+systemctl enable sddm
+# Plasma's network icon and the desktop programs ask NetworkManager whether they are online.
+systemctl disable systemd-networkd.socket systemd-networkd
+systemctl enable NetworkManager
+pacman -Scc --noconfirm >/dev/null 2>&1 # the downloaded packages: about 1 GB
+
+mkdir -p /var/lib/winios
+touch $DONE
+systemctl disable winios-firstboot
+status "100 done: starting the desktop"
+sync
+sleep 2
+systemctl reboot

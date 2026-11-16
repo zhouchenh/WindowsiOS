@@ -26,6 +26,9 @@ static _Atomic int nthreads;
 static struct { uintptr_t off; uint32_t n; } slots[SLOTS];
 static uint64_t total, idle, jit, other_image, unknown;
 static uintptr_t image_base;
+static uint64_t t_total[MAX_THREADS], t_busy[MAX_THREADS], t_fail[MAX_THREADS]; /* per guest CPU thread */
+#define OSLOTS 256
+static struct { const char *name; uint32_t n; } oslots[OSLOTS]; /* samples in system libraries, by symbol */
 
 static void reg(void) {
     int i = atomic_fetch_add(&nthreads, 1);
@@ -34,7 +37,16 @@ static void reg(void) {
 
 static void count_host(uintptr_t pc) {
     Dl_info info;
-    if (!dladdr((void *)pc, &info) || (uintptr_t)info.dli_fbase != image_base) { other_image++; return; }
+    if (!dladdr((void *)pc, &info) || (uintptr_t)info.dli_fbase != image_base) {
+        other_image++;
+        const char *nm = info.dli_sname ? info.dli_sname : "?";
+        uint32_t oh = (uint32_t)(((uintptr_t)nm >> 3) * 2654435761u) % OSLOTS;
+        for (int k = 0; k < 32; k++, oh = (oh + 1) % OSLOTS) {
+            if (oslots[oh].name == nm) { oslots[oh].n++; break; }
+            if (!oslots[oh].n) { oslots[oh].name = nm, oslots[oh].n = 1; break; }
+        }
+        return;
+    }
     uintptr_t off = pc - image_base;
     uint32_t h = (uint32_t)((off >> 2) * 2654435761u) % SLOTS;
     for (int k = 0; k < 64; k++, h = (h + 1) % SLOTS) {
@@ -59,6 +71,20 @@ static void dump(void) {
             busy ? 100.0 * other_image / busy : 0, (unsigned long)image_base);
     for (int i = 0; i < 40 && sorted[i].n; i++)
         fprintf(stderr, "hvprof: %5.2f%% +%#lx\n", busy ? 100.0 * sorted[i].n / busy : 0, (unsigned long)sorted[i].off);
+    int nt = atomic_load(&nthreads);
+    fprintf(stderr, "hvprof: threads %d busy:", nt);
+    for (int i = 0; i < nt && i < MAX_THREADS; i++)
+        fprintf(stderr, " [%d] %.1f%%%s", i, t_total[i] ? 100.0 * t_busy[i] / t_total[i] : 0, t_fail[i] ? " (unreadable)" : "");
+    fprintf(stderr, "\n");
+    for (int r = 0; r < 12; r++) { /* the dozen most sampled system-library symbols */
+        int best = -1;
+        for (int i = 0; i < OSLOTS; i++) if (oslots[i].n && (best < 0 || oslots[i].n > oslots[best].n)) best = i;
+        if (best < 0) break;
+        fprintf(stderr, "hvprof: other %5.2f%% %s\n", busy ? 100.0 * oslots[best].n / busy : 0, oslots[best].name);
+        oslots[best].n = 0;
+    }
+    memset(oslots, 0, sizeof oslots);
+    memset(t_total, 0, sizeof t_total); memset(t_busy, 0, sizeof t_busy); memset(t_fail, 0, sizeof t_fail);
     memset(slots, 0, sizeof slots);
     total = idle = jit = other_image = unknown = 0;
 }
@@ -75,9 +101,10 @@ static void *sampler(void *unused) {
         for (int i = 0; i < n && i < MAX_THREADS; i++) {
             thread_basic_info_data_t ti;
             mach_msg_type_number_t ni = THREAD_BASIC_INFO_COUNT;
-            if (thread_info(threads[i], THREAD_BASIC_INFO, (thread_info_t)&ti, &ni) != KERN_SUCCESS) continue;
-            total++;
+            if (thread_info(threads[i], THREAD_BASIC_INFO, (thread_info_t)&ti, &ni) != KERN_SUCCESS) { t_fail[i]++; continue; }
+            total++; t_total[i]++;
             if (ti.run_state != TH_STATE_RUNNING) { idle++; continue; }
+            t_busy[i]++;
             arm_thread_state64_t st;
             mach_msg_type_number_t sn = ARM_THREAD_STATE64_COUNT;
             if (thread_get_state(threads[i], ARM_THREAD_STATE64, (thread_state_t)&st, &sn) != KERN_SUCCESS) { unknown++; continue; }

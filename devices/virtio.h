@@ -42,8 +42,12 @@ typedef struct HvVirtio {
     HvVirtq q[HV_VIRTQ_MAX];
     uint8_t config[256];
     uint32_t config_len;
+    int msix;                        /* MSI-X offered (hv_virtio_enable_msix) */
+    uint16_t config_vec;             /* config_msix_vector, 0xffff = none */
+    uint16_t q_vec[HV_VIRTQ_MAX];    /* queue_msix_vector per queue */
     void (*notify)(struct HvVirtio *v, int q);
     void (*config_write)(struct HvVirtio *v, uint32_t off, uint64_t val, unsigned size);
+    void (*on_reset)(struct HvVirtio *v); /* optional: the driver wrote status 0 */
     void *dev;
 } HvVirtio;
 
@@ -51,10 +55,19 @@ typedef struct HvVirtio {
    modern 0x1af4:0x1040+id and may be changed afterwards. */
 void hv_virtio_init(HvVirtio *v, HvMachine *m, int device_id, uint32_t class_code, int nq, uint64_t features);
 
+/* Offer MSI-X (table in BAR 1, capability at 0x90) with `nvec` vectors. Drivers that insist
+   on MSI-X vectors (viogpudo) need it; without it the transport stays INTx only. */
+void hv_virtio_enable_msix(HvVirtio *v, uint16_t nvec);
+
+/* Shared memory region capability (virtio-gpu hostmem): `bar` must already be added. */
+void hv_virtio_add_shm_cap(HvVirtio *v, uint8_t at, uint8_t bar, uint64_t offset, uint64_t length, uint8_t id);
+
 /* 1 and an element if the driver made one available, 0 if not, -1 if the ring is broken. */
 int hv_virtq_pop(HvVirtio *v, int q, HvVirtqElem *e);
 void hv_virtq_push(HvVirtio *v, int q, const HvVirtqElem *e, uint32_t written);
 void hv_virtio_interrupt(HvVirtio *v);
+/* Device configuration changed (ISR bit 1): the driver re-reads config space. */
+void hv_virtio_config_interrupt(HvVirtio *v);
 
 /* Copy between an element's buffers and host memory, skipping `off` bytes of
    the readable (to) or writable (from) segments. Return bytes copied. */

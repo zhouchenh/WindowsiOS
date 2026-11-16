@@ -207,6 +207,15 @@ int hv_winvirt_create(HvWinVirt *b, HvMachine *m, HvCpu *cpu, int ncpus, uint64_
     if (disk0) b->nvme0 = hv_nvme_create(m, b->pcie, disk0, "WIN11IOS01");
     b->usb = hv_xhci_create(m, b->pcie);
     b->hda = hv_hda_create(m, b->pcie);
+    /* virtio-gpu after the fixed devices (they keep their slots: Windows keys devices by slot)
+       and before the optional second disk, so its own slot does not depend on that disk.
+       HV_NO_VIRTIO_GPU=1 leaves it out; HV_GPU_SIZE=WxH sets the initial preferred mode. */
+    if (!getenv("HV_NO_VIRTIO_GPU")) {
+        uint32_t gw = 1210, gh = 834;
+        const char *gs = getenv("HV_GPU_SIZE");
+        if (gs) sscanf(gs, "%ux%u", &gw, &gh);
+        b->gpu = hv_virtio_gpu_create(m, b->pcie, b->fb, gw, gh);
+    }
     if (disk1) b->nvme1 = hv_nvme_create(m, b->pcie, disk1, "WIN11INST");
     (void)enable_sound;
 

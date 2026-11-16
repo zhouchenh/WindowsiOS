@@ -32,12 +32,22 @@ int hv_winvm_run_cpu0(void);
 void hv_winvm_stop(void);
 void hv_winvm_power_button(void);
 void hv_winvm_flush_disks(void);
+/* Stops every guest CPU where it is (1) or lets them go on (0). Devices keep running: what the
+   guest already queued is finished. */
+void hv_winvm_set_paused(int paused);
+/* Feeds bytes to the guest serial console (blocks while its FIFO is full). */
+void hv_winvm_serial_send(const char *bytes, size_t n);
 
 /* Display & screenshot hooks (any thread) */
 void hv_winvm_set_display_layer(void *ca_metal_layer);
 int hv_winvm_display_size(uint32_t *w, uint32_t *h);
 uint64_t hv_winvm_display_frames(void);
 int hv_winvm_save_png(const char *path);
+/* Preferred display mode for virtio-gpu (e.g. the iPad screen in points); the guest driver
+   is told through a display-change event. No-op without virtio-gpu. */
+void hv_winvm_set_preferred_display(uint32_t w, uint32_t h);
+/* virtio-gpu status line for diagnostics; returns -1 without virtio-gpu. */
+int hv_winvm_gpu_status(char *buf, unsigned len);
 
 /* Input hooks (any thread) */
 void hv_winvm_key_hid(uint8_t usage, int down);

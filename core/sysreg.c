@@ -143,7 +143,7 @@ static int read_reg(HvCpu *cpu, uint32_t reg, uint64_t *v) {
     case R(3, 3, 14, 3, 2): *v = cpu->cntv_cval; return 0;
 
     /* PMU cycle counter: Windows 11 24H2 ntoskrnl calibrates against PMCCNTR_EL0 at boot. */
-    case R(3, 3, 9, 13, 0): *v = now * 128ull; return 0;                 /* ~3.072 GHz from 24 MHz counter */
+    case R(3, 3, 9, 13, 0): *v = now * 192ull; return 0;                 /* ~4.608 GHz from 24 MHz counter */
     }
     /* GIC CPU interface (ICC_*_EL1): CRn 12, CRm 8..12, and ICC_PMR_EL1. */
     if (reg == R(3, 0, 4, 6, 0) || ((reg >> 14) == 3 && ((reg >> 11) & 7) == 0 && ((reg >> 7) & 15) == 12 && ((reg >> 3) & 15) >= 8)) {

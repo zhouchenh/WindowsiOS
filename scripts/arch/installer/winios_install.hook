@@ -1,0 +1,5 @@
+#!/usr/bin/ash
+# mkinitcpio runtime hook: instead of mounting a root file system, run the WindowsiOS Arch installer.
+run_hook() {
+    /winios/install.sh
+}

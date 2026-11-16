@@ -299,6 +299,36 @@ int hv_machine_add_ram(HvMachine *m, uint64_t pa, uint64_t size, void *host, int
     return r->code_pages && r->page_gen && r->whint ? 0 : -1;
 }
 
+/* While the CPUs run (a device BAR backed by host memory, e.g. the virtio-gpu hostmem window):
+   the entry is filled in before nram publishes it, so a concurrent lookup sees it whole or not at
+   all. Not for main RAM. */
+int hv_machine_add_ram_live(HvMachine *m, uint64_t pa, uint64_t size, void *host, uint8_t **page_host) {
+    int n = __atomic_load_n(&m->nram, __ATOMIC_ACQUIRE);
+    if (n == HV_MAX_RAM) return -1;
+    HvRam *r = &m->ram[n];
+    memset(r, 0, sizeof *r);
+    r->pa = pa;
+    r->size = size;
+    r->host = host;
+    r->page_host = page_host;
+    size_t pages = (size + (1u << HV_TLB_PAGE_BITS) - 1) >> HV_TLB_PAGE_BITS;
+    while ((1ull << r->pages_log2) < pages) r->pages_log2++;
+    r->code_pages = calloc((size_t)1 << r->pages_log2, 1);
+    r->page_gen = calloc(pages, sizeof *r->page_gen);
+    r->whint = calloc(pages * HV_MAX_CPUS, sizeof *r->whint);
+    if (!r->code_pages || !r->page_gen || !r->whint) return -1;
+    __atomic_store_n(&m->nram, n + 1, __ATOMIC_RELEASE);
+    return n;
+}
+
+/* Moves a live region (its BAR was reprogrammed) and makes every CPU drop its TLB. */
+void hv_machine_move_ram_live(HvMachine *m, int idx, uint64_t pa) {
+    if (idx < 0 || idx >= m->nram) return;
+    __atomic_store_n(&m->ram[idx].pa, pa, __ATOMIC_RELEASE);
+    for (int i = 0; i < HV_MAX_CPUS; i++)
+        if (m->cpus[i]) hv_cpu_post(m->cpus[i], HV_REQ_TLB_ALL | HV_REQ_IJC_RESET);
+}
+
 int hv_machine_add_mmio(HvMachine *m, uint64_t pa, uint64_t size, void *opaque,
                         uint64_t (*read)(void *, uint64_t, unsigned),
                         void (*write)(void *, uint64_t, uint64_t, unsigned), const char *name) {
@@ -399,7 +429,14 @@ HvMmio *hv_mmio_lookup(HvMachine *m, uint64_t pa) {
 void *hv_phys_ptr(HvMachine *m, uint64_t pa, uint64_t len) {
     HvRam *r = hv_ram_lookup(m, pa);
     if (!r || pa + len - r->pa > r->size) return NULL;
-    return r->host + (pa - r->pa);
+    uint64_t off = pa - r->pa;
+    uint8_t *p = hv_ram_host(r, off);
+    if (r->page_host && len && (off & 0xfff) + len > 0x1000) {
+        /* across 4 KB pages of a paged window: only if they are contiguous in host memory */
+        for (uint64_t o = (off | 0xfff) + 1; o < off + len; o += 0x1000)
+            if (hv_ram_host(r, o) != p + (o - off)) return NULL;
+    }
+    return p;
 }
 
 /* MMIO is accessed in naturally sized pieces of at most 8 bytes. */
@@ -436,7 +473,8 @@ int hv_phys_write(HvMachine *m, uint64_t pa, const void *buf, unsigned len) {
                     (unsigned long long)m->watch_pa, (unsigned long long)v, len, (unsigned long long)pa,
                     (unsigned long long)m->access_pc);
         }
-        memcpy(r->host + off, buf, len);
+        uint8_t *dst = hv_phys_ptr(m, pa, len);
+        if (dst) memcpy(dst, buf, len);
         return 0;
     }
     HvMmio *d = hv_mmio_lookup(m, pa);

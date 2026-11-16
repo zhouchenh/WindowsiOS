@@ -74,7 +74,7 @@ extern uint64_t winios_brk_probe(void);
  * `_M<size>,rx` allocation takes the first-fit hole. */
 #define WINIOS_JIT_LOW_LIMIT 0x7000000000ull
 __attribute__((used, aligned(16384)))
-static uint8_t g_jit_reserve[WINIOS_JIT_DEFAULT_BYTES + (16u << 10)];
+static uint8_t g_jit_reserve[WINIOS_JIT_MAX_BYTES + (16u << 10)];
 static bool g_jit_reserve_released;
 
 static _Thread_local bool g_expecting_jit_trap;
@@ -87,19 +87,62 @@ static uint64_t g_guest_ram_bytes;
 static atomic_bool g_jit_live;
 static char g_status[256] = "Not initialized";
 
+static uint32_t g_cfg_jit_mb, g_cfg_ram_mb;
+
+void winios_jit_configure(uint32_t jit_mb, uint32_t ram_mb) {
+    g_cfg_jit_mb = jit_mb;
+    g_cfg_ram_mb = ram_mb;
+}
+
+size_t winios_jit_configured_bytes(void) {
+    size_t mb = g_cfg_jit_mb;
+    if (mb < 128 || (mb << 20) > WINIOS_JIT_MAX_BYTES) return WINIOS_JIT_DEFAULT_BYTES;
+    return mb << 20;
+}
+
+static void *g_gpu_window;
+static uint64_t g_gpu_window_bytes;
+
+void *winios_gpu_window(uint64_t *out_bytes) {
+    if (out_bytes) *out_bytes = g_gpu_window_bytes;
+    return g_gpu_window;
+}
+
 static void prealloc_ledger_exempt_ram(void) {
     if (g_guest_ram) return;
+    /* The virtio-gpu hostmem window first: without the extended-VA entitlement (not available to
+       personal teams) the address space holds about 7 GB, and guest RAM takes whatever is left. */
+    if (!g_gpu_window) {
+        static const uint64_t win_mb[] = {512, 256};
+        for (size_t i = 0; i < sizeof win_mb / sizeof win_mb[0]; i++) {
+            void *w = mmap(NULL, win_mb[i] << 20, PROT_READ | PROT_WRITE, MAP_ANON | MAP_PRIVATE, -1, 0);
+            if (w != MAP_FAILED) {
+                g_gpu_window = w;
+                g_gpu_window_bytes = win_mb[i] << 20;
+                WINIOS_LOG("reserved %llu MiB virtio-gpu hostmem window at %p", (unsigned long long)win_mb[i], w);
+                break;
+            }
+        }
+    }
     uint64_t phys_mem = 0;
     size_t len = sizeof phys_mem;
     sysctlbyname("hw.memsize", &phys_mem, &len, NULL, 0);
     uint64_t phys_mb = phys_mem >> 20;
     /* Size Guest RAM to fit comfortably within iOS 36-bit user VA ceiling alongside TXM JIT RX/RW + JIT tables */
-    static const uint64_t candidates_mb[] = {4608, 4096, 3584, 3072, 2560, 2048};
+    static const uint64_t candidates_mb[] = {16384, 14336, 12288, 10240, 8192, 7680, 7168, 6656, 6144, 5888, 5632, 5376, 5120, 4608, 4096, 3584, 3072, 2560, 2048};
     for (size_t i = 0; i < sizeof(candidates_mb) / sizeof(candidates_mb[0]); i++) {
         uint64_t mb = candidates_mb[i];
         if (phys_mb > 0 && mb + 2560 > phys_mb) continue;
+        if (g_cfg_ram_mb >= 1024 && mb > g_cfg_ram_mb) continue; /* the user's cap */
         uint8_t *p = hv_alloc_no_footprint(mb << 20);
         if (p) {
+            /* Leave address space for the 3D stack (virglrenderer, DXMT, Metal heaps): ~1 GB. */
+            void *room = mmap(NULL, 1024ull << 20, PROT_NONE, MAP_ANON | MAP_PRIVATE, -1, 0);
+            if (room == MAP_FAILED) {
+                vm_deallocate(mach_task_self(), (vm_address_t)p, mb << 20);
+                continue;
+            }
+            munmap(room, 1024ull << 20);
             g_guest_ram = p;
             g_guest_ram_bytes = mb << 20;
             WINIOS_LOG("pre-allocated %llu MiB ledger-exempt Guest RAM at %p",
@@ -161,11 +204,11 @@ size_t winios_available_memory_bytes(void) {
 }
 
 static void release_low_hold(size_t bytes) {
-    if (g_jit_reserve_released || bytes > WINIOS_JIT_DEFAULT_BYTES) return;
+    if (g_jit_reserve_released || bytes > WINIOS_JIT_MAX_BYTES) return;
     vm_address_t start = ((vm_address_t)g_jit_reserve + 16383) & ~(vm_address_t)16383;
-    kern_return_t kr = vm_deallocate(mach_task_self(), start, WINIOS_JIT_DEFAULT_BYTES);
+    kern_return_t kr = vm_deallocate(mach_task_self(), start, WINIOS_JIT_MAX_BYTES);
     WINIOS_LOG("released low __DATA hold at %#lx (%zu MiB): %s",
-               (unsigned long)start, WINIOS_JIT_DEFAULT_BYTES >> 20, mach_error_string(kr));
+               (unsigned long)start, WINIOS_JIT_MAX_BYTES >> 20, mach_error_string(kr));
     g_jit_reserve_released = true;
 }
 

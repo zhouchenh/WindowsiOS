@@ -12,6 +12,17 @@
 
 #include "fb_display.h"
 
+/* The display's frame rate (Settings > Refresh rate): frames go out at most this often. */
+static _Atomic int g_target_fps = 60;
+
+void hv_fb_metal_set_fps(int fps) {
+    if (fps < 10) fps = 10;
+    if (fps > 240) fps = 240;
+    atomic_store(&g_target_fps, fps);
+}
+
+int hv_fb_metal_fps(void) { return atomic_load(&g_target_fps); }
+
 static NSString *const kFbShaderSource =
     @"#include <metal_stdlib>\n"
      "using namespace metal;\n"
@@ -19,18 +30,28 @@ static NSString *const kFbShaderSource =
      "    float4 pos [[position]];\n"
      "    float2 uv;\n"
      "};\n"
-     "vertex VOut fb_vs(uint vid [[vertex_id]], constant float2 &scale [[buffer(0)]]) {\n"
+     "vertex VOut fb_vs(uint vid [[vertex_id]], constant float2 &scale [[buffer(0)]], constant float4 &uvr [[buffer(1)]]) {\n"
      "    const float2 quad[4] = { float2(-1,-1), float2(1,-1), float2(-1,1), float2(1,1) };\n"
      "    const float2 uvs[4]  = { float2(0,1),   float2(1,1),  float2(0,0),  float2(1,0) };\n"
      "    VOut o;\n"
      "    o.pos = float4(quad[vid] * scale, 0.0, 1.0);\n"
-     "    o.uv  = uvs[vid];\n"
+     "    o.uv  = uvr.xy + uvs[vid] * uvr.zw;\n"
      "    return o;\n"
      "}\n"
      "fragment float4 fb_fs(VOut in [[stage_in]], texture2d<float> tex [[texture(0)]]) {\n"
      "    constexpr sampler s(mag_filter::linear, min_filter::linear, address::clamp_to_edge);\n"
      "    float4 c = tex.sample(s, in.uv);\n"
      "    return float4(c.rgb, 1.0);\n"
+     "}\n"
+     "vertex VOut cur_vs(uint vid [[vertex_id]], constant float4 &r [[buffer(0)]]) {\n"
+     "    VOut o;\n"
+     "    o.pos = float4((vid & 1) ? r.z : r.x, (vid & 2) ? r.y : r.w, 0.0, 1.0);\n"
+     "    o.uv  = float2((vid & 1) ? 1.0 : 0.0, (vid & 2) ? 0.0 : 1.0);\n"
+     "    return o;\n"
+     "}\n"
+     "fragment float4 cur_fs(VOut in [[stage_in]], texture2d<float> tex [[texture(0)]]) {\n"
+     "    constexpr sampler s(mag_filter::nearest, min_filter::linear, address::clamp_to_zero);\n"
+     "    return tex.sample(s, in.uv);\n"
      "}\n";
 
 @interface HvFbMetalPresenter : NSObject {
@@ -41,9 +62,17 @@ static NSString *const kFbShaderSource =
     id<MTLDevice> device;
     id<MTLCommandQueue> queue;
     id<MTLRenderPipelineState> pipeline;
+    id<MTLRenderPipelineState> curPipeline; /* the hardware cursor, blended over the frame */
+    id<MTLTexture> curTex;
+    uint64_t curImgSerial;
+    uint32_t curPx[64 * 64];
     id<MTLTexture> texture;
     uint32_t texW, texH;
     dispatch_source_t timer;
+#if TARGET_OS_IPHONE
+    CADisplayLink *link; /* iOS: frames go out on the screen's own refresh (vsync), on linkThread */
+    NSThread *linkThread;
+#endif
     _Atomic(uint64_t) framesPresented;
     uint64_t lastHash;
     CGSize lastDrawableSize;
@@ -51,6 +80,10 @@ static NSString *const kFbShaderSource =
 - (instancetype)initWithDisplay:(HvFbDisplay *)display;
 - (void)setTargetLayer:(CAMetalLayer *)newLayer;
 - (void)tick;
+- (BOOL)presentTexture;
+#if TARGET_OS_IPHONE
++ (void)applyRate:(CADisplayLink *)l;
+#endif
 @end
 
 @implementation HvFbMetalPresenter
@@ -70,6 +103,16 @@ static NSString *const kFbShaderSource =
                 pd.fragmentFunction = [lib newFunctionWithName:@"fb_fs"];
                 pd.colorAttachments[0].pixelFormat = MTLPixelFormatBGRA8Unorm;
                 pipeline = [device newRenderPipelineStateWithDescriptor:pd error:&err];
+                MTLRenderPipelineDescriptor *cd = [[MTLRenderPipelineDescriptor alloc] init];
+                cd.vertexFunction = [lib newFunctionWithName:@"cur_vs"];
+                cd.fragmentFunction = [lib newFunctionWithName:@"cur_fs"];
+                cd.colorAttachments[0].pixelFormat = MTLPixelFormatBGRA8Unorm;
+                cd.colorAttachments[0].blendingEnabled = YES; /* premultiplied alpha (KMS cursor planes) */
+                cd.colorAttachments[0].sourceRGBBlendFactor = MTLBlendFactorOne;
+                cd.colorAttachments[0].destinationRGBBlendFactor = MTLBlendFactorOneMinusSourceAlpha;
+                cd.colorAttachments[0].sourceAlphaBlendFactor = MTLBlendFactorOne;
+                cd.colorAttachments[0].destinationAlphaBlendFactor = MTLBlendFactorOneMinusSourceAlpha;
+                curPipeline = [device newRenderPipelineStateWithDescriptor:cd error:&err];
             }
         }
     }
@@ -90,6 +133,17 @@ static NSString *const kFbShaderSource =
         if ([NSThread isMainThread]) cfg();
         else dispatch_async(dispatch_get_main_queue(), cfg);
 
+#if TARGET_OS_IPHONE
+        /* A free-running 60 Hz timer drifts against the screen: frames then reach it at uneven
+           intervals. The display link calls once per refresh instead, capped at 60 per second. */
+        if (!linkThread) {
+            linkThread = [[NSThread alloc] initWithTarget:self selector:@selector(linkMain) object:nil];
+            linkThread.name = @"fbmetal-vsync";
+            linkThread.qualityOfService = NSQualityOfServiceUserInteractive;
+            [linkThread start];
+        }
+        if (link) link.paused = NO;
+#else
         if (!timer) {
             dispatch_queue_t q = dispatch_queue_create("me.ammaar.windowsios.fbmetal", DISPATCH_QUEUE_SERIAL);
             timer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, q);
@@ -100,11 +154,88 @@ static NSString *const kFbShaderSource =
             });
             dispatch_resume(timer);
         }
+#endif
     } else if (!layer && timer) {
         dispatch_source_cancel(timer);
         timer = nil;
     }
+#if TARGET_OS_IPHONE
+    if (!layer && link) link.paused = YES;
+#endif
     os_unfair_lock_unlock(&lock);
+}
+
+#if TARGET_OS_IPHONE
+- (void)linkMain {
+    @autoreleasepool {
+        CADisplayLink *l = [CADisplayLink displayLinkWithTarget:self selector:@selector(onLink:)];
+        [HvFbMetalPresenter applyRate:l];
+        [l addToRunLoop:[NSRunLoop currentRunLoop] forMode:NSDefaultRunLoopMode];
+        os_unfair_lock_lock(&lock);
+        link = l;
+        l.paused = (layer == nil);
+        os_unfair_lock_unlock(&lock);
+        for (;;) {
+            @autoreleasepool {
+                [[NSRunLoop currentRunLoop] runMode:NSDefaultRunLoopMode beforeDate:[NSDate distantFuture]];
+            }
+        }
+    }
+}
+
++ (void)applyRate:(CADisplayLink *)l {
+    int fps = atomic_load(&g_target_fps);
+    if (@available(iOS 15.0, *)) l.preferredFrameRateRange = CAFrameRateRangeMake(fps, fps, fps);
+    else l.preferredFramesPerSecond = fps;
+}
+
+- (void)onLink:(CADisplayLink *)l {
+    /* a changed setting: the link follows it here, on its own thread */
+    int fps = atomic_load(&g_target_fps);
+    BOOL differs;
+    if (@available(iOS 15.0, *)) differs = (int)l.preferredFrameRateRange.preferred != fps;
+    else differs = l.preferredFramesPerSecond != fps;
+    if (differs) [HvFbMetalPresenter applyRate:l];
+    [self tick];
+}
+#endif
+
+/* What the cursor looks like now, folded into the frame hashes: moving it alone redraws. */
+static uint64_t cursor_hash(HvFbDisplay *fb) {
+    uint64_t serial = 0;
+    int vis = hv_fb_display_cursor_get(fb, NULL, NULL, NULL, NULL, NULL, NULL, &serial);
+    return (serial * 0x9e3779b97f4a7c15ull) ^ (uint64_t)vis;
+}
+
+/* The hardware cursor over a frame of fw x fh pixels drawn at scale (NDC half sizes). Under lock. */
+static void draw_cursor(HvFbMetalPresenter *p, id<MTLRenderCommandEncoder> enc, const float scale[2], uint32_t fw,
+                        uint32_t fh) {
+    uint32_t cw = 0, ch = 0;
+    int32_t cx = 0, cy = 0;
+    uint64_t img = p->curImgSerial;
+    if (!p->curPipeline || !fw || !fh ||
+        !hv_fb_display_cursor_get(p->fb, p->curPx, &p->curImgSerial, &cw, &ch, &cx, &cy, NULL) || !cw || !ch)
+        return;
+    if (!p->curTex || img != p->curImgSerial) {
+        if (!p->curTex) {
+            MTLTextureDescriptor *td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm
+                                                                                          width:64
+                                                                                         height:64
+                                                                                      mipmapped:NO];
+            td.usage = MTLTextureUsageShaderRead;
+            p->curTex = [p->device newTextureWithDescriptor:td];
+        }
+        static uint32_t full[64 * 64];
+        memset(full, 0, sizeof full);
+        for (uint32_t r = 0; r < ch; r++) memcpy(full + r * 64, p->curPx + r * cw, cw * 4);
+        [p->curTex replaceRegion:MTLRegionMake2D(0, 0, 64, 64) mipmapLevel:0 withBytes:full bytesPerRow:64 * 4];
+    }
+    float rect[4] = {-scale[0] + 2 * scale[0] * (float)cx / fw, scale[1] - 2 * scale[1] * (float)cy / fh,
+                     -scale[0] + 2 * scale[0] * (float)(cx + 64) / fw, scale[1] - 2 * scale[1] * (float)(cy + 64) / fh};
+    [enc setRenderPipelineState:p->curPipeline];
+    [enc setVertexBytes:rect length:sizeof(rect) atIndex:0];
+    [enc setFragmentTexture:p->curTex atIndex:0];
+    [enc drawPrimitives:MTLPrimitiveTypeTriangleStrip vertexStart:0 vertexCount:4];
 }
 
 static uint64_t quick_frame_hash(const uint8_t *px, uint32_t w, uint32_t h, uint32_t stride) {
@@ -121,8 +252,62 @@ static uint64_t quick_frame_hash(const uint8_t *px, uint32_t w, uint32_t h, uint
     return hash ? hash : 1;
 }
 
+- (BOOL)presentTexture {
+    void *tref = NULL;
+    uint32_t tw = 0, th = 0, rx = 0, ry = 0, rw = 0, rh = 0;
+    if (hv_fb_display_get_texture(fb, &tref, &tw, &th, &rx, &ry, &rw, &rh) != 0) return NO;
+    id<MTLTexture> src = (__bridge_transfer id<MTLTexture>)tref;
+    os_unfair_lock_lock(&lock);
+    CAMetalLayer *curLayer = layer;
+    if (!curLayer || !device || !pipeline || !queue) {
+        os_unfair_lock_unlock(&lock);
+        return YES;
+    }
+    CGSize dsize = curLayer.drawableSize;
+    uint64_t serial = __atomic_load_n(&fb->ovr_serial, __ATOMIC_RELAXED);
+    uint64_t hval = (serial * 0xff51afd7ed558ccdull) ^ (uint64_t)(uintptr_t)tref ^ 0x5bd1e995 ^ cursor_hash(fb);
+    if (dsize.width < 4 || dsize.height < 4 ||
+        (hval == lastHash && CGSizeEqualToSize(dsize, lastDrawableSize))) {
+        os_unfair_lock_unlock(&lock);
+        return YES;
+    }
+    id<CAMetalDrawable> drawable = [curLayer nextDrawable];
+    if (!drawable) {
+        os_unfair_lock_unlock(&lock);
+        return YES;
+    }
+    float dstAspect = (float)(dsize.width / dsize.height);
+    float srcAspect = (float)rw / (float)rh;
+    float scale[2] = {1.0f, 1.0f};
+    if (dstAspect > srcAspect) scale[0] = srcAspect / dstAspect;
+    else scale[1] = dstAspect / srcAspect;
+    float uvr[4] = {(float)rx / tw, (float)ry / th, (float)rw / tw, (float)rh / th};
+    MTLRenderPassDescriptor *rp = [MTLRenderPassDescriptor renderPassDescriptor];
+    rp.colorAttachments[0].texture = drawable.texture;
+    rp.colorAttachments[0].loadAction = MTLLoadActionClear;
+    rp.colorAttachments[0].clearColor = MTLClearColorMake(0, 0, 0, 1);
+    rp.colorAttachments[0].storeAction = MTLStoreActionStore;
+    id<MTLCommandBuffer> cb = [queue commandBuffer];
+    id<MTLRenderCommandEncoder> enc = [cb renderCommandEncoderWithDescriptor:rp];
+    [enc setRenderPipelineState:pipeline];
+    [enc setVertexBytes:scale length:sizeof(scale) atIndex:0];
+    [enc setVertexBytes:uvr length:sizeof(uvr) atIndex:1];
+    [enc setFragmentTexture:src atIndex:0];
+    [enc drawPrimitives:MTLPrimitiveTypeTriangleStrip vertexStart:0 vertexCount:4];
+    draw_cursor(self, enc, scale, rw, rh);
+    [enc endEncoding];
+    [cb presentDrawable:drawable];
+    [cb commit];
+    lastHash = hval;
+    lastDrawableSize = dsize;
+    atomic_fetch_add_explicit(&framesPresented, 1, memory_order_relaxed);
+    os_unfair_lock_unlock(&lock);
+    return YES;
+}
+
 - (void)tick {
     @autoreleasepool {
+        if ([self presentTexture]) return;
         const uint8_t *px = NULL;
         uint32_t w = 0, h = 0, stride = 0;
         if (hv_fb_display_get_frame(fb, &px, &w, &h, &stride) != 0) return;
@@ -140,7 +325,8 @@ static uint64_t quick_frame_hash(const uint8_t *px, uint32_t w, uint32_t h, uint
             return;
         }
 
-        uint64_t hval = quick_frame_hash(px, w, h, stride);
+        uint64_t hval = quick_frame_hash(px, w, h, stride) ^
+                        (__atomic_load_n(&fb->ovr_serial, __ATOMIC_RELAXED) * 0xff51afd7ed558ccdull) ^ cursor_hash(fb);
         BOOL sizeChanged = !CGSizeEqualToSize(dsize, lastDrawableSize);
         if (hval == lastHash && !sizeChanged && texW == w && texH == h) {
             os_unfair_lock_unlock(&lock);
@@ -188,8 +374,11 @@ static uint64_t quick_frame_hash(const uint8_t *px, uint32_t w, uint32_t h, uint
         id<MTLRenderCommandEncoder> enc = [cb renderCommandEncoderWithDescriptor:rp];
         [enc setRenderPipelineState:pipeline];
         [enc setVertexBytes:scale length:sizeof(scale) atIndex:0];
+        static const float uvr_full[4] = {0, 0, 1, 1};
+        [enc setVertexBytes:uvr_full length:sizeof(uvr_full) atIndex:1];
         [enc setFragmentTexture:texture atIndex:0];
         [enc drawPrimitives:MTLPrimitiveTypeTriangleStrip vertexStart:0 vertexCount:4];
+        draw_cursor(self, enc, scale, w, h);
         [enc endEncoding];
         [cb presentDrawable:drawable];
         [cb commit];
@@ -227,17 +416,79 @@ uint64_t hv_fb_metal_frames(HvFbDisplay *fb) {
     return atomic_load_explicit(&p->framesPresented, memory_order_relaxed);
 }
 
+/* The 3D scanout is a GPU texture (possibly private storage): copy it into a shared one and read that. */
+static uint8_t *copy_texture_pixels(HvFbDisplay *fb, uint32_t *ow, uint32_t *oh) {
+    void *tref = NULL;
+    uint32_t tw = 0, th = 0, rx = 0, ry = 0, rw = 0, rh = 0;
+    if (hv_fb_display_get_texture(fb, &tref, &tw, &th, &rx, &ry, &rw, &rh) != 0) return NULL;
+    id<MTLTexture> src = (__bridge_transfer id<MTLTexture>)tref;
+    HvFbMetalPresenter *p = (__bridge HvFbMetalPresenter *)fb->metal;
+    id<MTLDevice> dev = src.device;
+    id<MTLCommandQueue> q = (p && p->queue && p->device == dev) ? p->queue : [dev newCommandQueue];
+    if (!q || !rw || !rh) return NULL;
+    MTLTextureDescriptor *td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:src.pixelFormat
+                                                                                  width:rw
+                                                                                 height:rh
+                                                                              mipmapped:NO];
+    td.storageMode = MTLStorageModeShared;
+    td.usage = MTLTextureUsageShaderRead;
+    id<MTLTexture> dst = [dev newTextureWithDescriptor:td];
+    if (!dst) return NULL;
+    id<MTLCommandBuffer> cb = [q commandBuffer];
+    id<MTLBlitCommandEncoder> blit = [cb blitCommandEncoder];
+    [blit copyFromTexture:src sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(rx, ry, 0)
+               sourceSize:MTLSizeMake(rw, rh, 1) toTexture:dst destinationSlice:0 destinationLevel:0
+        destinationOrigin:MTLOriginMake(0, 0, 0)];
+    [blit endEncoding];
+    [cb commit];
+    [cb waitUntilCompleted];
+    if (cb.status != MTLCommandBufferStatusCompleted) return NULL;
+    uint8_t *px = malloc((size_t)rw * rh * 4);
+    if (!px) return NULL;
+    [dst getBytes:px bytesPerRow:rw * 4 fromRegion:MTLRegionMake2D(0, 0, rw, rh) mipmapLevel:0];
+    MTLPixelFormat f = src.pixelFormat;
+    if (f == MTLPixelFormatRGBA8Unorm || f == MTLPixelFormatRGBA8Unorm_sRGB) /* to BGRA for the encoder below */
+        for (size_t i = 0; i < (size_t)rw * rh; i++) {
+            uint8_t t = px[i * 4];
+            px[i * 4] = px[i * 4 + 2];
+            px[i * 4 + 2] = t;
+        }
+    *ow = rw;
+    *oh = rh;
+    return px;
+}
+
 int hv_fb_save_png(HvFbDisplay *fb, const char *path) {
     if (!fb || !path) return -1;
     const uint8_t *px = NULL;
     uint32_t w = 0, h = 0, stride = 0;
-    if (hv_fb_display_get_frame(fb, &px, &w, &h, &stride) != 0) return -1;
+    uint8_t *texpx = NULL;
+    @autoreleasepool {
+        texpx = copy_texture_pixels(fb, &w, &h);
+    }
+    if (texpx) stride = w * 4;
+    else if (hv_fb_display_get_frame(fb, &px, &w, &h, &stride) != 0) return -1;
 
     @autoreleasepool {
         size_t total = (size_t)stride * h;
-        uint8_t *copy = malloc(total);
+        uint8_t *copy = texpx ? texpx : malloc(total);
         if (!copy) return -1;
-        memcpy(copy, px, total);
+        if (!texpx) memcpy(copy, px, total);
+        { /* the hardware cursor, as the screen shows it */
+            static uint32_t cpx[64 * 64];
+            uint64_t none = ~0ull;
+            uint32_t cw = 0, ch = 0;
+            int32_t cx = 0, cy = 0;
+            if (hv_fb_display_cursor_get(fb, cpx, &none, &cw, &ch, &cx, &cy, NULL))
+                for (uint32_t r = 0; r < ch; r++)
+                    for (uint32_t c = 0; c < cw; c++) {
+                        int64_t X = (int64_t)cx + c, Y = (int64_t)cy + r;
+                        if (X < 0 || Y < 0 || X >= w || Y >= h) continue;
+                        const uint8_t *sp = (const uint8_t *)&cpx[r * cw + c];
+                        uint8_t *dp = copy + (size_t)Y * stride + (size_t)X * 4;
+                        for (int k = 0; k < 3; k++) dp[k] = (uint8_t)(sp[k] + dp[k] * (255 - sp[3]) / 255);
+                    }
+        }
         /* Ensure alpha byte is 0xff (XRGB8888 leaves X=0x00) */
         for (uint32_t y = 0; y < h; y++) {
             uint8_t *row = copy + (size_t)y * stride;

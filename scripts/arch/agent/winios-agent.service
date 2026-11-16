@@ -1,0 +1,11 @@
+[Unit]
+Description=WindowsiOS host job runner
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+ExecStart=/usr/local/bin/winios-agent
+Restart=always
+
+[Install]
+WantedBy=multi-user.target

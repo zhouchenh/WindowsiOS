@@ -98,7 +98,7 @@ PANTHER_UNATTEND_XML = r"""<?xml version="1.0" encoding="utf-8"?>
 <unattend xmlns="urn:schemas-microsoft-com:unattend" xmlns:wcm="http://schemas.microsoft.com/WMIConfig/2002/State">
   <settings pass="specialize">
     <component name="Microsoft-Windows-Shell-Setup" processorArchitecture="arm64" publicKeyToken="31bf3856ad364e35" language="neutral" versionScope="nonSxS">
-      <ComputerName>IPHONE-DUO</ComputerName>
+      <ComputerName>Apple-VM</ComputerName>
       <TimeZone>Eastern Standard Time</TimeZone>
     </component>
     <component name="Microsoft-Windows-Deployment" processorArchitecture="arm64" publicKeyToken="31bf3856ad364e35" language="neutral" versionScope="nonSxS">
@@ -309,11 +309,11 @@ def main():
         f.truncate(32 * 1024 * 1024 * 1024)
 
     # Phase 1: Boot WinPE -> partition -> DISM unsplit install.wim -> offline reg + unattend -> bcdboot -> wpeutil shutdown
-    run_winvm_phase("phase1_dism", ["--disk1", str(INST_IMG)], WORK / "prov_phase1.png", max_minutes=40)
+    run_winvm_phase("phase1_dism", ["--disk1", str(INST_IMG)], WORK / "prov_phase1.png", max_minutes=150)
     shutil.copyfile(VARS_FD, WORK / "vars_post_dism.fd")
 
     # Phase 2: Boot installed Windows 11 Pro ARM64 -> specialize -> reboot -> oobeSystem -> AutoLogon Ammaar -> clean shutdown
-    run_winvm_phase("phase2_oobe", [], WORK / "prov_phase2.png", max_minutes=60)
+    run_winvm_phase("phase2_oobe", [], WORK / "prov_phase2.png", max_minutes=240)
     shutil.copyfile(VARS_FD, WORK / "vars_clean.fd")
     print("SUCCESS: Windows 11 Pro ARM64 provisioned and cleanly shut down!", flush=True)
 

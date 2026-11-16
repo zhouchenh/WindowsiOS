@@ -22,7 +22,19 @@ typedef struct HvRam {
        were more. When the page becomes code only those are dropped, not a whole
        TLB scanned. */
     uint64_t *whint;
+    /* Optional, per 4 KB page: where that page lives in host memory (NULL: host + offset as usual).
+       A device window whose pages come from separate host allocations (virtio-gpu hostmem blobs,
+       mapped at 4 KB offsets while host pages are 16 KB). Read through hv_ram_host(). */
+    uint8_t **page_host;
 } HvRam;
+
+static inline uint8_t *hv_ram_host(const HvRam *r, uint64_t off) {
+    if (r->page_host) {
+        uint8_t *p = __atomic_load_n(&r->page_host[off >> 12], __ATOMIC_ACQUIRE);
+        if (p) return p + (off & 0xfff);
+    }
+    return r->host + off;
+}
 
 typedef struct HvMmio {
     uint64_t pa, size;
@@ -257,6 +269,7 @@ typedef struct HvMachine {
     pthread_mutex_t stw_mu;
     pthread_cond_t stw_cv;
     int stw_active;
+    int paused; /* the host asked every CPU to wait (iOS: the app left the foreground); see wait_while_paused */
     pthread_mutex_t big_mu;
     pthread_cond_t big_cv;
     uint64_t big_next, big_serving;
@@ -288,6 +301,8 @@ int hv_machine_add_mmio(HvMachine *m, uint64_t pa, uint64_t size, void *opaque,
                         void (*write)(void *, uint64_t, uint64_t, unsigned), const char *name);
 
 HvRam *hv_ram_lookup(HvMachine *m, uint64_t pa);
+int hv_machine_add_ram_live(HvMachine *m, uint64_t pa, uint64_t size, void *host, uint8_t **page_host);
+void hv_machine_move_ram_live(HvMachine *m, int idx, uint64_t pa);
 /* Drop the translations made from the RAM page holding pa (it was written, or the guest invalidated it). */
 void hv_invalidate_code(HvMachine *m, uint64_t pa);
 void hv_ret_clear(HvCpu *cpu);

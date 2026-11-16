@@ -819,6 +819,24 @@ static void wait_while_off(HvCpu *cpu) {
     hv_big_lock(m);
 }
 
+/* The host paused the machine (on iOS: the app is not in front, where the system refuses GPU work
+   and everything the guest draws would be lost). Parked like a CPU that is off, until hv_cpu_wake
+   after the flag clears. */
+static void wait_while_paused(HvCpu *cpu) {
+    HvMachine *m = cpu->m;
+    HvPerCpu *p = cpu->pc_state;
+    hv_big_unlock(m);
+    park(cpu);
+    pthread_mutex_lock(&p->wake_mu);
+    while (__atomic_load_n(&m->paused, __ATOMIC_ACQUIRE) && !cpu->halted) {
+        p->wake_pending = 0;
+        pthread_cond_wait(&p->wake_cv, &p->wake_mu);
+    }
+    pthread_mutex_unlock(&p->wake_mu);
+    unpark(cpu);
+    hv_big_lock(m);
+}
+
 /* Dropping every translation: the CPU that finds a flush pending waits until
    all the others have parked (at this barrier, asleep or off), flushes, and
    lets them go. Nobody holds a lock while waiting here. */
@@ -920,6 +938,12 @@ static int run_loop(HvCpu *cpu, int one) {
             wait_while_off(cpu); /* comes back after CPU_ON, reset to its entry point */
             pending_chain = NULL;
             last_reason = HV_EXIT_EXCEPTION;
+            continue;
+        }
+        if (__atomic_load_n(&m->paused, __ATOMIC_RELAXED)) {
+            wait_while_paused(cpu);
+            pending_chain = NULL;
+            prev_b = NULL;
             continue;
         }
         /* Someone asked the CPU to leave (the 1 ms kicker, a device, an invalidation): service devices now. */

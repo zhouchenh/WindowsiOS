@@ -164,6 +164,8 @@ final class HingeObserverViewController: UIViewController {
         guard !didInstallHinge else { return }
         didInstallHinge = true
         guard NSClassFromString("UIHingeInteraction") != nil else { return }
+        // UIHingeInteraction is only in the foldable-device SDK; build with -D WINIOS_HINGE to enable.
+        #if WINIOS_HINGE
         if #available(iOS 27.1, *) {
             let interaction = UIHingeInteraction { [weak self] _, update in
                 guard let self else { return }
@@ -179,6 +181,7 @@ final class HingeObserverViewController: UIViewController {
             }
             view.addInteraction(interaction)
         }
+        #endif
     }
 }
 

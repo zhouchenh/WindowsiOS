@@ -40,6 +40,10 @@ typedef void (^WinIOSStateCallback)(void);
 - (void)bindMetalLayer:(nullable CAMetalLayer *)layer;
 
 - (void)updateScreenSize:(CGSize)size scale:(CGFloat)scale;
+/// Size (points) of the view Windows is drawn in; becomes the virtio-gpu preferred mode.
+- (void)updateDisplayViewSize:(CGSize)size;
+/// virtio-gpu preferred mode in native pixels (sharp, more CPU) instead of points. Persisted.
+@property (nonatomic) BOOL hiDPIDisplay;
 - (void)updateHingeStatus:(NSInteger)status angleDegrees:(double)angleDegrees;
 
 - (void)sendTabletNormalizedX:(double)x y:(double)y buttons:(uint8_t)buttons wheel:(int8_t)wheel;
@@ -53,6 +57,12 @@ typedef void (^WinIOSStateCallback)(void);
 - (void)pressPowerButton;
 - (void)flushDisks;
 - (void)stopVM;
+/* Refresh rate of the machine's screen (global, any time). */
+- (void)setDisplayFrameRate:(NSInteger)fps;
+/* A new Arch Linux machine that installs itself (see winios_bridge.m); nil when ready, else why not. */
+- (nullable NSString *)prepareArchInstallWithSizeGB:(NSUInteger)sizeGB;
+- (nullable NSString *)archInstallStatus;
+- (BOOL)archInstallPending;
 
 @end
 

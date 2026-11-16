@@ -1554,9 +1554,20 @@ static int translate_sysreg_inline(Emit *e, uint32_t insn, uint64_t pc) {
     case SR(3, 3, 9, 13, 0): { /* PMCCNTR_EL0: read on every Windows 11 KiSwapContext */
         if (!read) return 0;
         if (rt == 31) return 1;
+        /* Scale the 24 MHz mach_absolute_time counter, not raw CNTVCT_EL0: on
+           newer chips (M4/M5, A17+) CNTVCT_EL0 runs at 1 GHz and Windows would
+           calibrate a 128 GHz CPU. Same register choice as translate_counter. */
+        static int type = -1;
+        if (type < 0) type = *(volatile uint8_t *)(uintptr_t)COMMPAGE_TIMEBASE_TYPE;
+        if (type == 0) return 0; /* helper: mach_absolute_time() * 192 */
         int r = is_stolen(rt) ? 15 : rt;
-        put(e, 0xd53be040u | (uint32_t)r);                        /* mrs xr, cntvct_el0 */
-        put(e, 0xd379e000u | (uint32_t)r << 5 | (uint32_t)r);     /* lsl xr, xr, #7 (~3.072 GHz) */
+        if (type == 1) put(e, 0xd5033fdfu);                       /* isb */
+        put(e, (type == 1 ? 0xd53be040u : type == 2 ? 0xd53be0c0u : 0xd53cfac0u) | (uint32_t)r);
+        put_lit(e, 6, COMMPAGE_TIMEBASE_OFFSET);
+        put(e, LDR_X(6, 6, 0));
+        put(e, ADD_LSL(r, r, 6, 0));
+        put(e, 0xd37ae400u | (uint32_t)r << 5 | (uint32_t)r);     /* lsl xr, xr, #6 */
+        put(e, ADD_LSL(r, r, r, 1));                              /* x192: ~4.608 GHz */
         if (r != rt) put(e, STR_X(r, 28, slot_of(rt)));
         return 1;
     }

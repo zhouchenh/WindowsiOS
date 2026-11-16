@@ -1,0 +1,22 @@
+#!/bin/bash
+# WindowsiOS: when the app made the disk bigger, grow the root partition and its ext4 file system to
+# fill it. Runs at every boot (winios-growroot.service) and does nothing when there is no new space.
+set -u
+mnt=${1:-/}                                                           # testing: another mount point
+src=$(findmnt -no SOURCE "$mnt") || exit 0
+part=/dev/$(lsblk -no KNAME "$src") || exit 0
+disk=/dev/$(lsblk -no PKNAME "$part" | head -1)
+num=$(cat /sys/class/block/$(basename "$part")/partition 2>/dev/null) || exit 0
+[ -b "$disk" ] && [ -n "$num" ] || exit 0
+sec=$(cat /sys/class/block/$(basename "$disk")/size)                  # disk, 512-byte sectors
+start=$(cat /sys/class/block/$(basename "$part")/start)
+psize=$(cat /sys/class/block/$(basename "$part")/size)
+# a partition is last in this layout; leave the 33 sectors of the backup GPT, plus alignment slack
+free=$(( sec - 34 - (start + psize) ))
+if [ "$free" -lt 4096 ]; then exit 0; fi
+echo "winios-growroot: $part ends $free sectors before the end of $disk: growing it"
+sfdisk -q --relocate gpt-bak-std "$disk"                               # backup GPT to the new end
+echo ", +" | sfdisk -q --no-reread --force -N "$num" "$disk"
+partx -u -n "$num" "$disk"                                            # the kernel learns the new size (mounted is fine)
+resize2fs "$part"
+echo "winios-growroot: $(df -h "$mnt" | tail -1)"

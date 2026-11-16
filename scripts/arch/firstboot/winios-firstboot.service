@@ -1,0 +1,15 @@
+[Unit]
+Description=WindowsiOS: first boot of a new installation (KDE Plasma desktop and GPU drivers)
+After=network-online.target winios-growroot.service
+Wants=network-online.target
+Before=getty@tty1.service
+ConditionPathExists=!/var/lib/winios/firstboot-done
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/winios-firstboot
+TimeoutSec=infinity
+RemainAfterExit=no
+
+[Install]
+WantedBy=multi-user.target

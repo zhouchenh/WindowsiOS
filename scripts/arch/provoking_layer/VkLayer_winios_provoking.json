@@ -1,0 +1,13 @@
+{
+    "file_format_version": "1.0.0",
+    "layer": {
+        "name": "VK_LAYER_WINIOS_provoking_vertex",
+        "type": "GLOBAL",
+        "library_path": "/usr/lib/libVkLayer_winios_provoking.so",
+        "api_version": "1.4.0",
+        "implementation_version": "1",
+        "description": "WindowsiOS: reports VK_EXT_provoking_vertex (last vertex) so ANGLE offers OpenGL ES 3",
+        "enable_environment": { "WINIOS_FAKE_PROVOKING_VERTEX": "1" },
+        "disable_environment": { "WINIOS_NO_FAKE_PROVOKING_VERTEX": "1" }
+    }
+}

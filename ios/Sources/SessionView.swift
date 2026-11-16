@@ -1,664 +1,658 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 import SwiftUI
 import UIKit
+import UniformTypeIdentifiers
 
+/// Chinese when the device language is Chinese, English otherwise.
+func L(_ zh: String, _ en: String) -> String {
+    (Locale.preferredLanguages.first ?? "en").hasPrefix("zh") ? zh : en
+}
+
+/// The whole app: the Windows screen edge to edge, one small floating toolbar, a launch page while
+/// Windows is not running, and a settings sheet.
 struct SessionView: View {
     @ObservedObject var vm: VMViewModel
-    private let uiHaptic = UIImpactFeedbackGenerator(style: .light)
+    @State private var showPowerConfirm = false
 
     var body: some View {
-        GeometryReader { geo in
-            let size = geo.size
-            let laptopActive = vm.isLaptopLayoutActive(for: size)
+        ZStack(alignment: .top) {
+            Color.black.ignoresSafeArea()
 
-            ZStack {
-                Color(red: 0.02, green: 0.025, blue: 0.04).ignoresSafeArea()
+            MetalDisplayView(
+                directTouch: $vm.directTouch,
+                keyboardVisible: $vm.systemKeyboardVisible,
+                hardwareKeyboard: vm.hardwareKeyboard,
+                focusAllowed: vm.isVMRunning && !vm.showSettings && vm.activeSafariURL == nil,
+                onThreeFingerTap: { withAnimation(.snappy(duration: 0.2)) { vm.controlBarVisible.toggle() } }
+            )
+            .ignoresSafeArea(.container, edges: [.bottom, .horizontal])
+            .opacity(vm.isVMRunning ? 1 : 0)
 
-                // Invisible UIKit host for iOS 27.1 UIHingeInteraction & system edge-gesture deferral
-                HingeSensorView { statusRaw, angleDeg in
-                    vm.updateHinge(statusRaw: statusRaw, angleDegrees: angleDeg, viewportSize: size)
-                }
-                .frame(width: 0, height: 0)
-                .allowsHitTesting(false)
-
-                if laptopActive {
-                    surfaceLaptopClamshellLayout(geo: geo)
-                        .transition(.opacity)
-                } else {
-                    surfaceStudioOpenLayout(geo: geo)
-                        .transition(.opacity)
-                }
-
-                if !vm.isVMRunning {
-                    surfaceHeroBootOverlay(viewportSize: size, laptopActive: laptopActive)
-                        .padding(20)
-                        .frame(
-                            maxWidth: .infinity,
-                            maxHeight: laptopActive ? size.height * 0.50 : .infinity,
-                            alignment: .center
-                        )
-                        .frame(maxHeight: .infinity, alignment: laptopActive ? .top : .center)
-                }
-            }
-            .onChange(of: size) { _, newSize in
-                WinIOSBridge.shared.updateScreenSize(newSize, scale: UIScreen.main.scale)
-            }
-            .sheet(item: $vm.activeSafariURL) { item in
-                SafariSheet(url: item.url)
-                    .ignoresSafeArea()
-                    .preferredColorScheme(.dark)
+            if vm.isVMRunning {
+                toolbar
+                    .padding(.top, 6)
+                    .transition(.move(edge: .top).combined(with: .opacity))
+            } else {
+                LaunchPage(vm: vm)
             }
         }
-        .ignoresSafeArea()
         .statusBarHidden(true)
         .persistentSystemOverlays(.hidden)
         .defersSystemGestures(on: .all)
+        .onAppear {
+            WinIOSBridge.shared.updateScreenSize(UIScreen.main.bounds.size, scale: UIScreen.main.scale)
+        }
+        .sheet(item: $vm.activeSafariURL) { item in
+            SafariSheet(url: item.url).ignoresSafeArea()
+        }
+        .sheet(isPresented: $vm.showSettings) {
+            SettingsSheet(vm: vm)
+        }
+        .confirmationDialog(L("电源", "Power"), isPresented: $showPowerConfirm, titleVisibility: .visible) {
+            Button(L("关机（通知 Windows）", "Shut down (ask Windows)")) { WinIOSBridge.shared.pressPowerButton() }
+            Button(L("强制关闭虚拟机", "Force stop the VM"), role: .destructive) {
+                WinIOSBridge.shared.flushDisks()
+                WinIOSBridge.shared.stopVM()
+            }
+            Button(L("取消", "Cancel"), role: .cancel) {}
+        } message: {
+            Text(L("强制关闭相当于直接断电，未保存的内容会丢失。",
+                   "Force stop is like pulling the plug: unsaved work is lost."))
+        }
+        .alert(L("Windows 里还没有装小助手", "The helper is not installed in Windows"), isPresented: $vm.guestHelperMissing) {
+            Button(L("改用模拟键盘输入", "Type the command instead")) { vm.installClaudeCodeByTyping() }
+            Button(L("取消", "Cancel"), role: .cancel) {}
+        } message: {
+            Text(L("自动运行脚本需要 WinKit 的后台小助手。在 Windows 里运行一次 WINKIT 盘上的 START.bat（或 cli_setup.ps1）就会装好，之后点这里不用再输入任何命令。刚开机的话请等十几秒再试。",
+                   "Running scripts by themselves needs WinKit's background helper. Run START.bat (or cli_setup.ps1) from the WINKIT drive in Windows once; after that nothing has to be typed. Right after Windows starts, wait a few seconds and try again."))
+        }
     }
 
-    // MARK: - 1. Sleek Midnight-Sapphire Surface Laptop Ultra Clamshell Mode (Folded)
+    // MARK: - Floating toolbar
 
     @ViewBuilder
-    private func surfaceLaptopClamshellLayout(geo: GeometryProxy) -> some View {
-        let totalW = geo.size.width
-        let totalH = geo.size.height
-        let lidH = (totalH * 0.50).rounded(.down)
-        let deckH = max(180.0, totalH - lidH)
-        let topCameraBezel = max(geo.safeAreaInsets.top > 20 ? geo.safeAreaInsets.top - 8 : 9.0, 9.0)
+    private var toolbar: some View {
+        if vm.controlBarVisible {
+            HStack(spacing: 2) {
+                if !vm.hardwareKeyboard { // with a hardware keyboard attached there is nothing to bring up
+                    barButton(vm.systemKeyboardVisible ? "keyboard.fill" : "keyboard", L("键盘", "Keyboard"),
+                              active: vm.systemKeyboardVisible) {
+                        vm.systemKeyboardVisible.toggle()
+                    }
+                }
+                barButton(vm.directTouch ? "hand.point.up.left.fill" : "rectangle.and.hand.point.up.left",
+                          vm.directTouch ? L("直接触摸", "Direct touch") : L("触控板", "Trackpad"),
+                          active: vm.directTouch) {
+                    vm.directTouch.toggle()
+                }
+                barButton("square.grid.2x2.fill", L("Win 键", "Windows key")) {
+                    WinIOSBridge.shared.sendWindowsKey()
+                }
+                if !vm.isLinux { // runs through the Windows-side helper
+                    Menu {
+                        Button("Claude Code", systemImage: "terminal") { vm.installClaudeCode() }
+                    } label: {
+                        barIcon("sparkles", active: false)
+                    }
+                    .accessibilityLabel(L("安装工具", "Install tools"))
+                }
+                Menu {
+                    Section(L("快捷键", "Shortcuts")) {
+                        Button("Ctrl + Alt + Del", systemImage: "lock") { WinIOSBridge.shared.sendCtrlAltDel() }
+                        Button(L("任务管理器", "Task Manager"), systemImage: "waveform.path.ecg") { vm.sendTaskManager() }
+                        Button("Alt + Tab", systemImage: "rectangle.on.rectangle") { WinIOSBridge.shared.sendAltTab() }
+                        Button("Esc", systemImage: "escape") { WinIOSBridge.shared.sendEscape() }
+                    }
+                    Section {
+                        Button(L("设置", "Settings"), systemImage: "gearshape") { vm.showSettings = true }
+                        Button(L("电源…", "Power…"), systemImage: "power") { showPowerConfirm = true }
+                    }
+                } label: {
+                    barIcon("ellipsis.circle", active: false)
+                }
+                .accessibilityLabel(L("更多", "More"))
+                Divider().frame(height: 20).padding(.horizontal, 2)
+                barButton("chevron.up", L("收起工具栏", "Hide toolbar")) {
+                    withAnimation(.snappy(duration: 0.2)) { vm.controlBarVisible = false }
+                }
+            }
+            .padding(.horizontal, 6)
+            .padding(.vertical, 4)
+            .background(.ultraThinMaterial, in: Capsule())
+            .overlay(Capsule().strokeBorder(.white.opacity(0.12)))
+            .shadow(color: .black.opacity(0.35), radius: 10, y: 3)
+        } else {
+            // A small handle so the toolbar can always be brought back (a three-finger tap does it too).
+            Button {
+                withAnimation(.snappy(duration: 0.2)) { vm.controlBarVisible = true }
+            } label: {
+                Image(systemName: "chevron.down")
+                    .font(.system(size: 12, weight: .bold))
+                    .foregroundStyle(.white.opacity(0.75))
+                    .frame(width: 44, height: 18)
+                    .background(.ultraThinMaterial, in: Capsule())
+                    .contentShape(Rectangle().inset(by: -10))
+            }
+            .accessibilityLabel(L("显示工具栏", "Show toolbar"))
+            .opacity(0.7)
+        }
+    }
 
-        VStack(spacing: 0) {
-            // TOP 50%: Razor-Bezel Obsidian-Glass Surface Display Lid
-            ZStack {
-                // Anodized Midnight-Obsidian Lid Chassis + Diamond-Cut Outer Rim
-                RoundedRectangle(cornerRadius: 12, style: .continuous)
-                    .fill(
-                        LinearGradient(
-                            colors: [
-                                Color(red: 0.038, green: 0.046, blue: 0.072),
-                                Color(red: 0.020, green: 0.024, blue: 0.038),
-                            ],
-                            startPoint: .top,
-                            endPoint: .bottom
-                        )
-                    )
-                    .overlay(
-                        RoundedRectangle(cornerRadius: 12, style: .continuous)
-                            .strokeBorder(
-                                LinearGradient(
-                                    colors: [
-                                        Color(red: 0.64, green: 0.75, blue: 0.96).opacity(0.28),
-                                        Color(red: 0.45, green: 0.56, blue: 0.78).opacity(0.10),
-                                        Color.black.opacity(0.60),
-                                    ],
-                                    startPoint: .top,
-                                    endPoint: .bottom
-                                ),
-                                lineWidth: 0.85
-                            )
-                    )
+    private func barIcon(_ symbol: String, active: Bool) -> some View {
+        Image(systemName: symbol)
+            .font(.system(size: 17, weight: .medium))
+            .foregroundStyle(active ? Color.accentColor : .white)
+            .frame(width: 42, height: 36)
+            .contentShape(Rectangle())
+    }
+
+    private func barButton(_ symbol: String, _ label: String, active: Bool = false, action: @escaping () -> Void) -> some View {
+        Button {
+            UIImpactFeedbackGenerator(style: .light).impactOccurred()
+            action()
+        } label: {
+            barIcon(symbol, active: active)
+        }
+        .accessibilityLabel(label)
+    }
+}
+
+// MARK: - Machine list (left column)
+
+/// A machine's icon: a rounded tile in its colour with its mark (Arch: the Arch Linux logo).
+struct MachineIcon: View {
+    let id: String
+    let symbol: String
+    let size: CGFloat
+
+    var body: some View {
+        RoundedRectangle(cornerRadius: size * 0.23, style: .continuous)
+            .fill(id == "Arch" ? Color(red: 0.09, green: 0.58, blue: 0.82).gradient : Color.blue.gradient)
+            .frame(width: size, height: size)
+            .overlay {
+                if id == "Arch" {
+                    ArchLogoShape().fill(.white, style: FillStyle(eoFill: true)).padding(size * 0.18)
+                } else {
+                    Image(systemName: symbol).font(.system(size: size * 0.48)).foregroundStyle(.white)
+                }
+            }
+    }
+}
+
+/// The Arch Linux logo mark (from archlinux.org/art, archlinux-logo-white-scalable.svg; Arch Linux
+/// trademark policy applies), drawn as a shape: fill it with any colour, at any size, keeping its proportions.
+struct ArchLogoShape: Shape {
+    static let aspect: CGFloat = 0.99981 // width / height
+
+    func path(in rect: CGRect) -> Path {
+        let s = min(rect.width / 166.156, rect.height / 166.188)
+        let ox = rect.midX - 166.156 * s / 2, oy = rect.midY - 166.188 * s / 2
+        func p(_ x: CGFloat, _ y: CGFloat) -> CGPoint { CGPoint(x: ox + (x - 22.750) * s, y: oy + (y - 16.625) * s) }
+        var path = Path()
+        path.move(to: p(105.812, 16.625))
+        path.addCurve(to: p(85.719, 64.219), control1: p(98.416, 34.760), control2: p(93.954, 46.623))
+        path.addCurve(to: p(107.031, 82.844), control1: p(90.768, 69.571), control2: p(96.966, 75.804))
+        path.addCurve(to: p(83.312, 69.281), control1: p(96.210, 78.391), control2: p(88.829, 73.920))
+        path.addCurve(to: p(22.750, 182.812), control1: p(72.773, 91.274), control2: p(56.260, 122.602))
+        path.addCurve(to: p(88.531, 154.656), control1: p(49.088, 167.607), control2: p(69.504, 158.233))
+        path.addCurve(to: p(87.281, 143.375), control1: p(87.714, 151.142), control2: p(87.250, 147.341))
+        path.addLine(to: p(87.312, 142.531))
+        path.addCurve(to: p(106.906, 113.562), control1: p(87.730, 125.657), control2: p(96.508, 112.681))
+        path.addCurve(to: p(124.969, 145.719), control1: p(117.304, 114.444), control2: p(125.387, 128.845))
+        path.addCurve(to: p(123.906, 154.781), control1: p(124.890, 148.894), control2: p(124.532, 151.948))
+        path.addCurve(to: p(188.906, 182.812), control1: p(142.727, 158.463), control2: p(162.925, 167.813))
+        path.addCurve(to: p(174.844, 156.781), control1: p(183.783, 173.381), control2: p(179.211, 164.879))
+        path.addCurve(to: p(146.156, 137.000), control1: p(167.965, 151.450), control2: p(160.791, 144.511))
+        path.addCurve(to: p(169.031, 146.000), control1: p(156.215, 139.614), control2: p(163.417, 142.629))
+        path.addCurve(to: p(105.812, 16.625), control1: p(124.633, 63.338), control2: p(121.038, 52.354))
+        path.closeSubpath()
+        return path
+    }
+}
+
+
+private struct MachineSidebar: View {
+    @ObservedObject var vm: VMViewModel
+
+    var body: some View {
+        List(selection: Binding<String?>(
+            get: { vm.machine },
+            set: { if let m = $0, !vm.isUnpacking, vm.importStatus == nil, !vm.isVMRunning { vm.machine = m } }
+        )) {
+            Section(L("虚拟机", "Virtual machines")) {
+                ForEach(VMViewModel.machines) { m in
+                    HStack(spacing: 12) {
+                        MachineIcon(id: m.id, symbol: m.symbol, size: 44)
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text(m.title).font(.headline)
+                            Text(vm.machineSubtitle(m.id)).font(.caption).foregroundStyle(.secondary)
+                        }
+                    }
+                    .padding(.vertical, 4)
+                    .tag(m.id)
+                }
+            }
+        }
+        .navigationTitle("Apple VM")
+    }
+}
+
+// MARK: - Launch page (Windows not running)
+
+private struct LaunchPage: View {
+    @ObservedObject var vm: VMViewModel
+
+    @State private var showImporter = false
+    @State private var pendingImport: [URL] = []
+    @State private var confirmReplace = false
+    @State private var confirmDelete = false
+    @State private var deleteError: String? = nil
+
+    private var ready: Bool { vm.isJITLive && vm.hasMachineFiles && !vm.isUnpacking && vm.importStatus == nil }
+
+    var body: some View {
+        // Like UTM: the machines on the left, the chosen one on the right (on a phone: the list, then the machine).
+        NavigationSplitView {
+            MachineSidebar(vm: vm)
+        } detail: {
+            detail
+        }
+        .navigationSplitViewStyle(.balanced)
+    }
+
+    private var detail: some View {
+        GeometryReader { geo in
+        ScrollView {
+            VStack(spacing: 22) {
+                VStack(spacing: 10) {
+                    MachineIcon(id: vm.machine, symbol: vm.isLinux ? "terminal.fill" : "square.grid.2x2.fill", size: 72)
+                    Text(vm.machineTitle)
+                        .font(.largeTitle.weight(.semibold))
+                    Text(vm.vmStatusText)
+                        .font(.footnote)
+                        .foregroundStyle(.secondary)
+                        .multilineTextAlignment(.center)
+                }
 
                 VStack(spacing: 0) {
-                    // Top Micro-Bezel with Windows Hello Studio Camera + IR Sensor Array
-                    ZStack {
-                        HStack(spacing: 7) {
-                            Circle()
-                                .fill(Color(red: 0.10, green: 0.12, blue: 0.18))
-                                .frame(width: 3.5, height: 3.5)
-                            ZStack {
-                                Circle()
-                                    .fill(Color(red: 0.05, green: 0.07, blue: 0.12))
-                                    .frame(width: 5.5, height: 5.5)
-                                    .overlay(Circle().strokeBorder(Color.white.opacity(0.16), lineWidth: 0.4))
-                                Circle()
-                                    .fill(Color(red: 0.45, green: 0.65, blue: 1.0).opacity(0.55))
-                                    .frame(width: 1.6, height: 1.6)
-                                    .offset(x: -0.8, y: -0.8)
-                            }
-                            Circle()
-                                .fill(vm.isJITLive ? Color.white.opacity(0.32) : Color.orange.opacity(0.6))
-                                .frame(width: 2.4, height: 2.4)
+                    checkRow(
+                        ok: vm.isJITLive,
+                        title: "JIT",
+                        detail: vm.isJITLive
+                            ? L("已开启", "Enabled")
+                            : L("请通过 StikDebug 开启 JIT", "Please enable JIT with StikDebug")
+                    ) {
+                        if !vm.isJITLive {
+                            Button(L("用 StikDebug 开启", "Enable with StikDebug")) { vm.requestStikDebugJIT() }
+                                .buttonStyle(.bordered)
                         }
                     }
-                    .frame(height: topCameraBezel)
-
-                    // Edge-to-Edge PixelSense-Style Display Glass
-                    MetalDisplayView(
-                        trackpadMode: $vm.trackpadMode,
-                        rightClickArmed: $vm.rightClickArmed,
-                        keyboardVisible: .constant(false),
-                        onThreeFingerTap: {
-                            withAnimation(.spring(response: 0.28, dampingFraction: 0.88)) {
-                                vm.postureMode = .fullScreen
+                    Divider().padding(.leading, 52)
+                    checkRow(
+                        ok: vm.hasMachineFiles,
+                        title: L("系统文件", "System files"),
+                        detail: vm.hasMachineFiles
+                            ? L("已就绪", "Ready")
+                            : vm.isLinux
+                            ? L("点“安装镜像”，选好系统盘大小，App 会从 Arch Linux ARM 官方源下载系统，并自动装好 KDE Plasma 桌面和 GPU 驱动（OpenGL：virgl，Vulkan：Venus）。需要 JIT 和网络，下载约 2.3 GB。",
+                                "Tap Install, pick the system disk size, and the app downloads the system from the official Arch Linux ARM servers and sets up the KDE Plasma desktop with the GPU drivers (OpenGL: virgl, Vulkan: Venus). Needs JIT and a network; about 2.3 GB is downloaded.")
+                            : L("需要以下文件，点“导入镜像”一次全部选中：\n• code.fd（UEFI 固件）\n• vars.fd（固件设置）\n• windows11.hvsparse 或 windows11.img（系统盘）\n驱动和修复脚本（WINKIT 盘）App 已自带，不用导入。",
+                                "These files are needed; tap Import and select them all at once:\n• code.fd (UEFI firmware)\n• vars.fd (firmware settings)\n• windows11.hvsparse or windows11.img (system disk)\nThe drivers and setup scripts (the WINKIT drive) come with the app.")
+                    ) {
+                        if vm.isLinux {
+                            // Arch is installed by the app itself, not imported
+                            if !vm.hasMachineFiles && vm.archInstallStatus == nil {
+                                Menu {
+                                    ForEach(VMViewModel.archInstallSizes, id: \.self) { gb in
+                                        Button(L("系统盘 ", "System disk ") + "\(gb) GB" + (gb == 32 ? L("（推荐）", " (recommended)") : "")) {
+                                            vm.installArch(sizeGB: gb)
+                                        }
+                                    }
+                                } label: {
+                                    Label(L("安装镜像", "Install"), systemImage: "arrow.down.circle")
+                                }
+                                .buttonStyle(.bordered)
+                                .disabled(!vm.isJITLive || vm.isVMRunning)
                             }
-                        }
-                    )
-                    .clipShape(RoundedRectangle(cornerRadius: 5.5, style: .continuous))
-                    .overlay(
-                        RoundedRectangle(cornerRadius: 5.5, style: .continuous)
-                            .strokeBorder(Color.white.opacity(0.07), lineWidth: 0.5)
-                    )
-                    .padding(.horizontal, 6)
-
-                    // Whisper-Minimal Lower Display Chin (zero toolbar clutter!)
-                    ZStack {
-                        HStack(spacing: 5) {
-                            WindowsLogoMark(size: 7.5, color: Color.white.opacity(0.22))
-                            Text("SURFACE")
-                                .font(.system(size: 7.5, weight: .semibold))
-                                .tracking(2.2)
-                                .foregroundStyle(Color.white.opacity(0.22))
-                        }
-
-                        HStack {
-                            Spacer()
-                            // Discreet posture switch micro-trigger in bottom-right bezel corner
-                            Button {
-                                uiHaptic.impactOccurred(intensity: 0.5)
-                                vm.cyclePostureMode(viewportSize: geo.size)
-                            } label: {
-                                Text(vm.hingeAngleDegrees.map { String(format: "%.0f°", $0) } ?? vm.postureMode.rawValue.uppercased())
-                                    .font(.system(size: 8.0, weight: .medium, design: .monospaced))
-                                    .foregroundStyle(Color.white.opacity(0.28))
-                                    .padding(.horizontal, 6)
-                                    .padding(.vertical, 1.5)
+                            if let err = vm.archInstallError {
+                                Text(err).font(.footnote).foregroundStyle(.red)
+                                    .fixedSize(horizontal: false, vertical: true)
                             }
-                            .buttonStyle(.plain)
+                        } else if let status = vm.importStatus {
+                            HStack(spacing: 8) {
+                                ProgressView()
+                                Text(status).font(.footnote).foregroundStyle(.secondary)
+                            }
+                        } else if !vm.isUnpacking && !vm.hasMachineFiles { // once ready, nothing more to import
+                            Button(L("导入镜像", "Import image"), systemImage: "square.and.arrow.down") { showImporter = true }
+                                .buttonStyle(.bordered)
                         }
-                        .padding(.horizontal, 10)
+                        if let err = vm.importError {
+                            Text(err).font(.footnote).foregroundStyle(.red)
+                                .fixedSize(horizontal: false, vertical: true)
+                        }
                     }
-                    .frame(height: 15)
-                }
-            }
-            .frame(width: totalW, height: lidH)
-
-            // BOTTOM 50%: Midnight-Sapphire CNC Aluminum Surface Keyboard + Haptic Glass Touchpad Deck
-            LaptopDeckView(vm: vm)
-                .frame(width: totalW, height: deckH)
-        }
-        .frame(width: totalW, height: totalH)
-    }
-
-    // MARK: - 2. Open / Unfolded Surface Book Studio Mode (180° Flat Inner / Landscape Canvas)
-
-    @ViewBuilder
-    private func surfaceStudioOpenLayout(geo: GeometryProxy) -> some View {
-        let w = geo.size.width
-        let h = geo.size.height
-        let isPortrait = h > w
-        let safeTop = max(geo.safeAreaInsets.top + 8.0, isPortrait ? 54.0 : 12.0)
-        let safeBottom = max(geo.safeAreaInsets.bottom + 8.0, 12.0)
-
-        ZStack {
-            // Sculpted Obsidian-Sapphire Studio Backdrop (eliminates dead-flat black letterbox bars!)
-            studioObsidianBackdrop(size: geo.size)
-
-            if isPortrait {
-                // Unfolded Portrait Studio Canvas: Framed PixelSense Display + Sleek Studio Telemetry & Quick Deck
-                VStack(spacing: 14) {
-                    Spacer(minLength: safeTop + (vm.controlBarVisible ? 44 : 8))
-
-                    // Precision Diamond-Cut Framed Display
-                    framedStudioDisplay(
-                        maxWidth: w - 20,
-                        maxHeight: min((w - 20) * 0.76, h * 0.64)
-                    )
-
-                    // Subtle Monospaced Hardware Spec Strip + Studio Quick Pad
-                    surfaceStudioFooterStrip(viewportSize: geo.size)
-                        .padding(.horizontal, 18)
-
-                    Spacer(minLength: safeBottom)
-                }
-            } else {
-                // Landscape Open Canvas: Maximum Edge-to-Edge Framed Display
-                framedStudioDisplay(
-                    maxWidth: w - 16,
-                    maxHeight: h - 14
-                )
-            }
-
-            // Floating Smoked-Obsidian Surface Command Pill
-            VStack {
-                if vm.controlBarVisible {
-                    surfaceStudioCommandPill(viewportSize: geo.size)
-                        .padding(.top, safeTop)
-                        .padding(.horizontal, 14)
-                        .transition(.move(edge: .top).combined(with: .opacity))
-                } else {
-                    HStack {
-                        Spacer()
-                        Button {
-                            uiHaptic.impactOccurred()
-                            withAnimation(.spring(response: 0.25, dampingFraction: 0.86)) {
-                                vm.controlBarVisible = true
-                            }
-                        } label: {
-                            HStack(spacing: 6) {
-                                Circle()
-                                    .fill(vm.isJITLive ? Color.white.opacity(0.85) : Color.orange)
-                                    .frame(width: 5, height: 5)
-                                WindowsLogoMark(size: 10, color: .white.opacity(0.90))
-                            }
-                            .padding(.horizontal, 12)
-                            .padding(.vertical, 8)
-                            .background(Color(red: 0.05, green: 0.065, blue: 0.11).opacity(0.82), in: Capsule())
-                            .overlay(
-                                Capsule()
-                                    .strokeBorder(Color(red: 0.72, green: 0.82, blue: 1.0).opacity(0.24), lineWidth: 0.65)
-                            )
+                    if vm.isLinux && vm.archInstallStatus != nil {
+                        Divider().padding(.leading, 52)
+                        ArchInstallRow(vm: vm)
+                    }
+                    if vm.isUnpacking {
+                        Divider().padding(.leading, 52)
+                        VStack(alignment: .leading, spacing: 8) {
+                            Text(L("正在解包 Windows 磁盘…", "Unpacking the Windows disk…"))
+                                .font(.subheadline.weight(.medium))
+                            ProgressView(value: vm.unpackProgress)
+                            Text("\(Int(vm.unpackProgress * 100))%")
+                                .font(.caption.monospacedDigit())
+                                .foregroundStyle(.secondary)
                         }
-                        .buttonStyle(.plain)
-                        .padding(.top, safeTop)
-                        .padding(.trailing, 16)
+                        .padding(16)
                     }
                 }
-                Spacer()
-            }
-        }
-    }
+                .background(Color(.secondarySystemBackground), in: RoundedRectangle(cornerRadius: 16, style: .continuous))
 
-    private func studioObsidianBackdrop(size: CGSize) -> some View {
-        ZStack {
-            LinearGradient(
-                colors: [
-                    Color(red: 0.024, green: 0.030, blue: 0.050),
-                    Color(red: 0.012, green: 0.015, blue: 0.026),
-                    Color(red: 0.030, green: 0.038, blue: 0.064),
-                ],
-                startPoint: .topLeading,
-                endPoint: .bottomTrailing
-            )
-
-            // Subtle sculpted metallic light ribbon behind the display
-            EllipticalGradient(
-                colors: [
-                    Color(red: 0.20, green: 0.28, blue: 0.46).opacity(0.22),
-                    Color(red: 0.08, green: 0.12, blue: 0.22).opacity(0.06),
-                    Color.clear,
-                ],
-                center: .init(x: 0.5, y: 0.44),
-                startRadiusFraction: 0.05,
-                endRadiusFraction: 0.62
-            )
-        }
-        .ignoresSafeArea()
-    }
-
-    private func framedStudioDisplay(maxWidth: CGFloat, maxHeight: CGFloat) -> some View {
-        let fbAspect: CGFloat = (vm.fbWidth > 0 && vm.fbHeight > 0)
-            ? CGFloat(vm.fbWidth) / CGFloat(vm.fbHeight)
-            : (4.0 / 3.0)
-        let fittedW = min(maxWidth, maxHeight * fbAspect)
-        let fittedH = fittedW / fbAspect
-
-        return ZStack {
-            RoundedRectangle(cornerRadius: 11, style: .continuous)
-                .fill(Color.black)
-                .shadow(color: .black.opacity(0.75), radius: 26, x: 0, y: 12)
-
-            MetalDisplayView(
-                trackpadMode: $vm.trackpadMode,
-                rightClickArmed: $vm.rightClickArmed,
-                keyboardVisible: $vm.systemKeyboardVisible,
-                onThreeFingerTap: {
-                    withAnimation(.spring(response: 0.25, dampingFraction: 0.86)) {
-                        vm.controlBarVisible.toggle()
-                    }
-                }
-            )
-            .clipShape(RoundedRectangle(cornerRadius: 8.5, style: .continuous))
-            .padding(3.5)
-        }
-        .frame(width: fittedW + 7, height: fittedH + 7)
-        .overlay(
-            RoundedRectangle(cornerRadius: 11, style: .continuous)
-                .strokeBorder(
-                    LinearGradient(
-                        colors: [
-                            Color(red: 0.72, green: 0.82, blue: 1.0).opacity(0.32),
-                            Color(red: 0.44, green: 0.54, blue: 0.74).opacity(0.12),
-                        ],
-                        startPoint: .topLeading,
-                        endPoint: .bottomTrailing
-                    ),
-                    lineWidth: 0.85
-                )
-        )
-    }
-
-    private func surfaceStudioFooterStrip(viewportSize: CGSize) -> some View {
-        VStack(spacing: 10) {
-            HStack {
-                Text("DEVICE_NAME = SURFACE_DUO_ULTRA")
-                    .font(.system(size: 9.5, weight: .medium, design: .monospaced))
-                    .tracking(1.1)
-                    .foregroundStyle(Color(red: 0.72, green: 0.80, blue: 0.95).opacity(0.55))
-
-                Spacer()
-
-                HStack(spacing: 5) {
-                    Circle()
-                        .fill(vm.isJITLive ? Color.white.opacity(0.75) : Color.orange)
-                        .frame(width: 4.5, height: 4.5)
-                    Text("WIN11 ARM64 · 4.5 GB")
-                        .font(.system(size: 9.5, weight: .medium, design: .monospaced))
-                        .foregroundStyle(Color.white.opacity(0.45))
-                }
-            }
-
-            // Quick Studio Action Strip for Portrait Open Mode
-            HStack(spacing: 8) {
-                studioQuickTile(title: "Laptop Deck", icon: "laptopcomputer", prominent: true) {
-                    withAnimation(.spring(response: 0.28, dampingFraction: 0.88)) {
-                        vm.postureMode = .laptop
-                        vm.systemKeyboardVisible = false
-                    }
-                    SceneOrientationController.alignForLaptopPostureIfLandscape(size: viewportSize)
-                }
-
-                studioQuickTile(title: "Antigravity", icon: "sparkles") {
-                    vm.launchGuestAntigravity()
-                }
-
-                studioQuickTile(title: "Paint", icon: "paintbrush.pointed") {
-                    vm.launchGuestPaint()
-                }
-
-                studioQuickTile(title: "Edge Web", icon: "globe") {
-                    vm.launchGuestEdgeBrowser()
-                }
-
-                studioQuickTile(title: "Explorer", icon: "folder") {
-                    WinIOSBridge.shared.sendKeyCombo(withModifiers: [NSNumber(value: 0xe3)], key: 0x08)
-                }
-
-                studioQuickTile(title: "Keyboard", icon: "keyboard", active: vm.systemKeyboardVisible) {
-                    vm.systemKeyboardVisible.toggle()
-                }
-            }
-        }
-        .padding(.horizontal, 14)
-        .padding(.vertical, 12)
-        .background(
-            RoundedRectangle(cornerRadius: 14, style: .continuous)
-                .fill(Color(red: 0.055, green: 0.070, blue: 0.115).opacity(0.72))
-                .overlay(
-                    RoundedRectangle(cornerRadius: 14, style: .continuous)
-                        .strokeBorder(Color(red: 0.68, green: 0.78, blue: 0.98).opacity(0.16), lineWidth: 0.65)
-                )
-        )
-    }
-
-    private func studioQuickTile(
-        title: String,
-        icon: String,
-        active: Bool = false,
-        prominent: Bool = false,
-        action: @escaping () -> Void
-    ) -> some View {
-        Button {
-            uiHaptic.impactOccurred(intensity: 0.6)
-            action()
-        } label: {
-            VStack(spacing: 5) {
-                Image(systemName: icon)
-                    .font(.system(size: 13.5, weight: .medium))
-                Text(title)
-                    .font(.system(size: 10, weight: .medium))
-                    .lineLimit(1)
-            }
-            .foregroundStyle(
-                active || prominent
-                    ? Color(red: 0.05, green: 0.07, blue: 0.11)
-                    : Color(red: 0.92, green: 0.95, blue: 1.0)
-            )
-            .frame(maxWidth: .infinity)
-            .padding(.vertical, 9)
-            .background(
-                RoundedRectangle(cornerRadius: 9, style: .continuous)
-                    .fill(
-                        active || prominent
-                            ? Color(red: 0.88, green: 0.93, blue: 1.0)
-                            : Color(red: 0.10, green: 0.13, blue: 0.20).opacity(0.85)
-                    )
-            )
-            .overlay(
-                RoundedRectangle(cornerRadius: 9, style: .continuous)
-                    .strokeBorder(Color.white.opacity(active || prominent ? 0.0 : 0.10), lineWidth: 0.5)
-            )
-        }
-        .buttonStyle(.plain)
-    }
-
-    // MARK: - Smoked-Obsidian Surface Studio Floating Command Pill
-
-    private func surfaceStudioCommandPill(viewportSize: CGSize) -> some View {
-        ScrollView(.horizontal, showsIndicators: false) {
-            HStack(spacing: 6) {
-                // Authentic 4-pane Start button
                 Button {
-                    uiHaptic.impactOccurred(intensity: 0.65)
-                    WinIOSBridge.shared.sendWindowsKey()
+                    vm.startOrRetry()
                 } label: {
-                    HStack(spacing: 6) {
-                        WindowsLogoMark(size: 10.5, color: Color(red: 0.05, green: 0.07, blue: 0.11))
-                        Text("Start")
-                            .font(.system(size: 11.5, weight: .semibold))
-                            .foregroundStyle(Color(red: 0.05, green: 0.07, blue: 0.11))
-                    }
-                    .padding(.horizontal, 11)
-                    .padding(.vertical, 6.5)
-                    .background(Color(red: 0.90, green: 0.94, blue: 1.0), in: Capsule())
+                    Text(L("启动 ", "Start ") + vm.machineTitle)
+                        .font(.headline)
+                        .frame(maxWidth: .infinity)
+                        .padding(.vertical, 6)
                 }
-                .buttonStyle(.plain)
+                .buttonStyle(.borderedProminent)
+                .disabled(!ready)
 
-                studioPillItem(icon: "laptopcomputer", label: "Laptop") {
-                    withAnimation(.spring(response: 0.28, dampingFraction: 0.88)) {
-                        vm.postureMode = .laptop
-                        vm.systemKeyboardVisible = false
-                    }
-                    SceneOrientationController.alignForLaptopPostureIfLandscape(size: viewportSize)
-                }
+                Text(vm.jitStatusText)
+                    .font(.caption2)
+                    .foregroundStyle(.tertiary)
+                    .multilineTextAlignment(.center)
 
-                studioPillItem(icon: "sparkles", label: "Antigravity") {
-                    vm.launchGuestAntigravity()
-                }
-
-                studioPillItem(icon: "paintbrush.pointed", label: "Paint") {
-                    vm.launchGuestPaint()
-                }
-
-                studioPillItem(icon: "globe", label: "Edge") {
-                    vm.launchGuestEdgeBrowser()
-                }
-
-                studioPillItem(
-                    icon: vm.useSafariForOAuth ? "safari" : "network",
-                    label: vm.useSafariForOAuth ? "OAuth: Safari" : "OAuth: Edge",
-                    active: vm.useSafariForOAuth
-                ) {
-                    vm.toggleOAuthBrowserMode()
-                }
-
-                studioPillItem(icon: "keyboard", label: "Keys", active: vm.systemKeyboardVisible) {
-                    vm.systemKeyboardVisible.toggle()
-                }
-
-                studioPillItem(
-                    icon: vm.trackpadMode ? "rectangle.and.hand.point.up.left" : "hand.tap",
-                    label: vm.trackpadMode ? "Trackpad" : "Touch",
-                    active: vm.trackpadMode
-                ) {
-                    vm.trackpadMode.toggle()
-                }
-
-                studioPillItem(icon: "computermouse", label: "R-Click", active: vm.rightClickArmed) {
-                    vm.rightClickArmed.toggle()
-                }
-
-                studioPillItem(icon: "waveform.path.ecg", label: "Task Mgr") {
-                    WinIOSBridge.shared.sendKeyCombo(withModifiers: [NSNumber(value: 0xe0), NSNumber(value: 0xe1)], key: 0x29)
-                }
-
-                studioPillItem(icon: "power", label: "") {
-                    WinIOSBridge.shared.pressPowerButton()
-                }
-
-                studioPillItem(icon: "chevron.up", label: "") {
-                    withAnimation(.spring(response: 0.25, dampingFraction: 0.86)) {
-                        vm.controlBarVisible = false
+                if vm.hasAnyMachineFiles {
+                    Button(L("删除", "Delete"), systemImage: "trash", role: .destructive) { confirmDelete = true }
+                        .buttonStyle(.bordered)
+                        .disabled(vm.isVMRunning || vm.isUnpacking || vm.importStatus != nil)
+                    if let deleteError {
+                        Text(deleteError).font(.footnote).foregroundStyle(.red)
                     }
                 }
             }
-            .padding(.horizontal, 9)
-            .padding(.vertical, 6.5)
-            .background(
-                Capsule()
-                    .fill(Color(red: 0.045, green: 0.058, blue: 0.096).opacity(0.88))
-            )
-            .background(.ultraThinMaterial, in: Capsule())
-            .overlay(
-                Capsule()
-                    .strokeBorder(Color(red: 0.72, green: 0.82, blue: 1.0).opacity(0.22), lineWidth: 0.65)
-            )
-            .shadow(color: .black.opacity(0.55), radius: 14, x: 0, y: 6)
+            .frame(maxWidth: 460)
+            .padding(.horizontal, 20)
+            .padding(.vertical, 24)
+            // centred on the screen; scrolls only when it does not fit (small phones, landscape)
+            .frame(maxWidth: .infinity, minHeight: geo.size.height, alignment: .center)
+        }
+        }
+        .background(Color(.systemBackground).ignoresSafeArea())
+        .navigationTitle(vm.machineTitle)
+        .navigationBarTitleDisplayMode(.inline)
+        .toolbar {
+            ToolbarItem(placement: .primaryAction) {
+                Button(L("设置", "Settings"), systemImage: "gearshape") { vm.showSettings = true }
+            }
+        }
+        .fileImporter(isPresented: $showImporter, allowedContentTypes: [.item], allowsMultipleSelection: true) { result in
+            guard case .success(let urls) = result, !urls.isEmpty else { return }
+            let replacesDisk = urls.contains { VMViewModel.importTarget(for: $0).map(VMViewModel.isDiskTarget) ?? false }
+            if replacesDisk && vm.hasWindowsDisk {
+                pendingImport = urls
+                confirmReplace = true
+            } else {
+                vm.importFiles(urls)
+            }
+        }
+        .confirmationDialog(L("删除 \(vm.machineTitle)？", "Delete \(vm.machineTitle)?"),
+                            isPresented: $confirmDelete, titleVisibility: .visible) {
+            Button(L("删除", "Delete"), role: .destructive) { deleteError = vm.deleteMachine() }
+            Button(L("取消", "Cancel"), role: .cancel) {}
+        } message: {
+            Text(L("系统盘、固件和设置都会被删除（约 ", "The system disk, firmware and settings are deleted (about ")
+                 + ByteCountFormatter.string(fromByteCount: Int64(vm.machineFilesBytes), countStyle: .file)
+                 + L("），里面的所有数据都无法恢复。", "). Everything in it is lost and cannot be recovered."))
+        }
+        .confirmationDialog(L("替换现有的 Windows 磁盘？", "Replace the current Windows disk?"),
+                            isPresented: $confirmReplace, titleVisibility: .visible) {
+            Button(L("替换", "Replace"), role: .destructive) { vm.importFiles(pendingImport); pendingImport = [] }
+            Button(L("取消", "Cancel"), role: .cancel) { pendingImport = [] }
+        } message: {
+            Text(L("现在这个 Windows 里的所有数据会被删除，无法恢复。", "Everything in the current Windows will be deleted. This cannot be undone."))
         }
     }
 
-    private func studioPillItem(
-        icon: String,
-        label: String,
-        active: Bool = false,
-        action: @escaping () -> Void
-    ) -> some View {
-        Button {
-            uiHaptic.impactOccurred(intensity: 0.6)
-            action()
-        } label: {
-            HStack(spacing: 4.5) {
-                Image(systemName: icon)
-                    .font(.system(size: 11.5, weight: .medium))
-                if !label.isEmpty {
-                    Text(label)
-                        .font(.system(size: 11.5, weight: .medium))
-                }
+    private func checkRow<Trailing: View>(ok: Bool, title: String, detail: String,
+                                          @ViewBuilder trailing: () -> Trailing) -> some View {
+        HStack(alignment: .top, spacing: 12) {
+            Image(systemName: ok ? "checkmark.circle.fill" : "exclamationmark.circle.fill")
+                .font(.title3)
+                .foregroundStyle(ok ? .green : .orange)
+                .frame(width: 24)
+            VStack(alignment: .leading, spacing: 6) {
+                Text(title).font(.subheadline.weight(.semibold))
+                Text(detail).font(.footnote).foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+                trailing()
             }
-            .foregroundStyle(
-                active
-                    ? Color(red: 0.05, green: 0.07, blue: 0.11)
-                    : Color(red: 0.92, green: 0.95, blue: 1.0)
-            )
-            .padding(.horizontal, label.isEmpty ? 9 : 10.5)
-            .padding(.vertical, 6.5)
-            .background(
-                Capsule().fill(
-                    active
-                        ? Color(red: 0.86, green: 0.92, blue: 1.0)
-                        : Color.white.opacity(0.07)
-                )
-            )
+            Spacer(minLength: 0)
         }
-        .buttonStyle(.plain)
+        .padding(16)
     }
+}
 
-    // MARK: - 3. SURFACE_LAPTOP_ULTRA Boot / Portal Hero Overlay
+// MARK: - Settings
 
-    private func surfaceHeroBootOverlay(viewportSize: CGSize, laptopActive: Bool) -> some View {
-        VStack(spacing: laptopActive ? 11 : 16) {
-            HStack(spacing: 9) {
-                WindowsLogoMark(size: laptopActive ? 14 : 17, color: .white)
-                Text("SURFACE LAPTOP ULTRA")
-                    .font(.system(size: laptopActive ? 13.5 : 15.5, weight: .semibold, design: .monospaced))
-                    .tracking(2.0)
-                    .foregroundStyle(.white)
-            }
+private struct SettingsSheet: View {
+    @ObservedObject var vm: VMViewModel
+    @Environment(\.dismiss) private var dismiss
 
-            Text("DEVICE_NAME = IPHONE_DUO_ARM64")
-                .font(.system(size: 10, weight: .regular, design: .monospaced))
-                .tracking(1.4)
-                .foregroundStyle(Color(red: 0.72, green: 0.82, blue: 1.0).opacity(0.65))
-
-            Text(vm.vmStatusText)
-                .font(.system(size: 12, weight: .regular))
-                .foregroundStyle(.white.opacity(0.82))
-                .multilineTextAlignment(.center)
-
-            if vm.isUnpacking {
-                ProgressView(value: vm.unpackProgress, total: 1.0)
-                    .tint(.white)
-                    .frame(maxWidth: 260)
-            }
-
-            HStack(spacing: 14) {
-                HStack(spacing: 5) {
-                    Circle()
-                        .fill(vm.isJITLive ? Color.white : Color.orange)
-                        .frame(width: 5.5, height: 5.5)
-                    Text(vm.isJITLive ? "TXM JIT LIVE" : vm.jitStatusText.uppercased())
-                        .font(.system(size: 10, weight: .medium, design: .monospaced))
-                        .foregroundStyle(.white.opacity(0.80))
-                }
-
-                Text("·")
-                    .foregroundStyle(.white.opacity(0.35))
-
-                Text("\(vm.availableMemoryMB) MB HEADROOM")
-                    .font(.system(size: 10, weight: .medium, design: .monospaced))
-                    .foregroundStyle(.white.opacity(0.60))
-            }
-
-            if !vm.isUnpacking {
-                HStack(spacing: 10) {
-                    if !vm.isJITLive {
-                        Button {
-                            vm.requestStikDebugJIT()
-                        } label: {
-                            Text("ENABLE JIT")
-                                .font(.system(size: 11, weight: .semibold, design: .monospaced))
-                                .tracking(1.0)
-                                .foregroundStyle(.white)
-                                .padding(.horizontal, 14)
-                                .padding(.vertical, 9)
-                                .background(Color.white.opacity(0.12), in: RoundedRectangle(cornerRadius: 8, style: .continuous))
-                                .overlay(RoundedRectangle(cornerRadius: 8, style: .continuous).strokeBorder(Color.white.opacity(0.24), lineWidth: 0.6))
+    var body: some View {
+        NavigationStack {
+            Form {
+                Section {
+                    if vm.isLinux {
+                        LabeledContent("OpenGL", value: "virgl")
+                        LabeledContent("Vulkan", value: "Venus")
+                    } else {
+                        Toggle(L("3D 加速（DirectX 11）", "3D acceleration (DirectX 11)"), isOn: Binding(
+                            get: { vm.gpu3DEnabled },
+                            set: { vm.setGPU3D($0) }
+                        ))
+                    }
+                    Picker(L("刷新率", "Refresh rate"), selection: $vm.frameRate) {
+                        ForEach(VMViewModel.frameRateChoices, id: \.self) { hz in
+                            Text("\(hz) Hz").tag(hz)
                         }
-                        .buttonStyle(.plain)
                     }
+                    Toggle(L("高分辨率（HiDPI）", "High resolution (HiDPI)"), isOn: Binding(
+                        get: { vm.hiDPIDisplay },
+                        set: { _ in vm.toggleHiDPIDisplay() }
+                    ))
+                } header: {
+                    Text(L("显示", "Display"))
+                } footer: {
+                    Text(vm.isLinux
+                         ? L("Arch Linux 的 GPU 加速始终开启：OpenGL 走 virgl，Vulkan 走 Venus（驱动随系统装好）。高分辨率在下次启动时生效。刷新率是全局设置，虚拟机下次启动时生效。",
+                             "GPU acceleration is always on for Arch Linux: OpenGL through virgl, Vulkan through Venus (the drivers come with the system). High resolution applies at the next start. The refresh rate is global and applies when the machine next starts.")
+                         : L("3D 需要先在 Windows 里装好 3D 驱动（运行 WINKIT 盘里的 START.bat）。如果开启后黑屏，在这里关掉再重启 App。这两项在下次启动 Windows 时生效。刷新率只影响 iPad 上的画面刷新：Windows 的显卡驱动只支持 60 Hz，Windows 里始终是 60 Hz。",
+                             "3D needs the 3D driver installed in Windows first (run START.bat on the WINKIT disk). If the screen stays black after turning it on, turn it off here and restart the app. Both apply the next time Windows starts. The refresh rate only changes how often the iPad draws the screen: the Windows display driver only takes 60 Hz, so Windows itself stays at 60 Hz."))
+                }
 
-                    Button {
-                        vm.startOrRetry()
-                    } label: {
-                        Text(vm.isJITLive ? "BOOT WINDOWS 11" : "RETRY BOOT")
-                            .font(.system(size: 11, weight: .semibold, design: .monospaced))
-                            .tracking(1.1)
-                            .foregroundStyle(Color(red: 0.04, green: 0.05, blue: 0.09))
-                            .padding(.horizontal, 16)
-                            .padding(.vertical, 9)
-                            .background(Color(red: 0.92, green: 0.95, blue: 1.0), in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+                Section {
+                    Picker(L("触摸屏幕时", "Touching the screen"), selection: $vm.directTouch) {
+                        Text(L("触控板", "Trackpad")).tag(false)
+                        Text(L("直接触摸", "Direct touch")).tag(true)
                     }
-                    .buttonStyle(.plain)
+                    .pickerStyle(.segmented)
+                } header: {
+                    Text(L("触控", "Touch"))
+                } footer: {
+                    Text(vm.directTouch
+                        ? L("轻点 = 在手指位置左键 · 双指轻点或长按 = 右键 · 单指拖动 = 拖拽 · 双指滑动 = 滚动 · 三指轻点 = 显示/隐藏工具栏",
+                            "Tap = left click where you touch · Two-finger tap or long press = right click · Drag = drag · Two-finger slide = scroll · Three-finger tap = toolbar")
+                        : L("单指滑动 = 移动光标 · 单指轻点 = 左键 · 双指轻点 = 右键 · 双指滑动 = 滚动 · 轻点后立刻按住拖动（或长按后拖动）= 拖拽 · 三指轻点 = 显示/隐藏工具栏",
+                            "Slide = move pointer · Tap = left click · Two-finger tap = right click · Two-finger slide = scroll · Tap then hold and move (or long press, then move) = drag · Three-finger tap = toolbar"))
+                }
+
+                Section {
+                    if !vm.isLinux {
+                        HStack {
+                            Text(L("CPU 名称", "CPU name"))
+                            TextField("Apple Silicon", text: $vm.cpuName)
+                                .multilineTextAlignment(.trailing)
+                                .autocorrectionDisabled()
+                                .onSubmit { vm.saveCPUName() }
+                        }
+                    }
+                    Toggle(L("JIT 就绪后自动启动 ", "Start ") + vm.machineTitle + L("", " automatically once JIT is on"), isOn: $vm.autoStart)
+                    if !vm.isLinux {
+                        Toggle(L("Windows 里的登录链接用 Safari 打开", "Open sign-in links from Windows in Safari"), isOn: Binding(
+                            get: { vm.useSafariForOAuth },
+                            set: { _ in vm.toggleOAuthBrowserMode() }
+                        ))
+                    }
+                } header: {
+                    Text(L("系统", "System"))
+                } footer: {
+                    if !vm.isLinux {
+                        Text(L("CPU 名称是 Windows 里显示的处理器名字，下次启动生效。", "The CPU name is what Windows shows for the processor; applies at the next start."))
+                    }
+                }
+
+                Section {
+                    NavigationLink(L("高级设置", "Advanced")) { AdvancedSettings(vm: vm) }
+                }
+
+                Section(L("状态", "Status")) {
+                    LabeledContent(L("虚拟机", "Machine"), value: vm.vmStatusText)
+                    LabeledContent("JIT", value: vm.isJITLive ? L("已开启", "On") : L("未开启", "Off"))
+                    LabeledContent(L("画面", "Screen"),
+                                   value: vm.fbWidth > 0 ? "\(vm.fbWidth) × \(vm.fbHeight)" : "-")
+                    LabeledContent(L("显卡", "Graphics"), value: vm.gpuStatusSummary)
+                    LabeledContent(L("外接键盘", "Hardware keyboard"),
+                                   value: vm.hardwareKeyboard ? L("已连接", "Connected") : L("未连接", "Not connected"))
+                }
+            }
+            .navigationTitle(vm.machineTitle + L(" 设置", " Settings"))
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .confirmationAction) {
+                    Button(L("完成", "Done")) {
+                        vm.saveCPUName()
+                        dismiss()
+                    }
                 }
             }
         }
-        .padding(laptopActive ? 18 : 26)
-        .frame(maxWidth: 420)
-        .background(
-            RoundedRectangle(cornerRadius: 16, style: .continuous)
-                .fill(Color(red: 0.04, green: 0.052, blue: 0.088).opacity(0.92))
-        )
-        .overlay(
-            RoundedRectangle(cornerRadius: 16, style: .continuous)
-                .strokeBorder(
-                    LinearGradient(
-                        colors: [
-                            Color(red: 0.74, green: 0.84, blue: 1.0).opacity(0.32),
-                            Color(red: 0.40, green: 0.50, blue: 0.72).opacity(0.10),
-                        ],
-                        startPoint: .topLeading,
-                        endPoint: .bottomTrailing
-                    ),
-                    lineWidth: 0.8
-                )
-        )
-        .shadow(color: .black.opacity(0.70), radius: 24, x: 0, y: 10)
+        .onDisappear { vm.saveCPUName() }
+    }
+}
+
+/// Arch Linux without an image to import: the app installs it (download, desktop, GPU drivers), and shows how far it is.
+private struct ArchInstallRow: View {
+    @ObservedObject var vm: VMViewModel
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            if let status = vm.archInstallStatus {
+                Text(L("正在安装 Arch Linux", "Installing Arch Linux")).font(.subheadline.weight(.medium))
+                if status.hasPrefix("error") {
+                    Text(status).font(.footnote).foregroundStyle(.red).fixedSize(horizontal: false, vertical: true)
+                } else {
+                    ProgressView(value: vm.archInstallPercent ?? 0)
+                    Text(vm.archInstallMessage).font(.caption).foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+                Text(L("全部自动完成，期间虚拟机会重启一次。可以随时打开虚拟机画面查看。总共下载约 2.3 GB。",
+                       "Runs by itself; the machine restarts once on the way. Open the machine's screen any time to watch. About 2.3 GB is downloaded."))
+                    .font(.caption2).foregroundStyle(.tertiary).fixedSize(horizontal: false, vertical: true)
+            }
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(16)
+    }
+}
+
+/// The machine's system disk: its size, and growing it.
+private struct DiskSizeSection: View {
+    @ObservedObject var vm: VMViewModel
+    @State private var pending: Int? = nil
+    @State private var message: String? = nil
+
+    var body: some View {
+        Section {
+            if let bytes = vm.diskSizeBytes {
+                let gb = Double(bytes) / Double(1 << 30)
+                LabeledContent(L("系统盘容量", "System disk"), value: String(format: "%.0f GB", gb))
+                Menu {
+                    ForEach(VMViewModel.diskSizeChoices.filter { Double($0) > gb + 0.5 }, id: \.self) { size in
+                        Button("\(size) GB") { pending = size }
+                    }
+                } label: {
+                    Text(L("扩容…", "Make it bigger…"))
+                }
+                .disabled(vm.isVMRunning)
+            } else {
+                LabeledContent(L("系统盘容量", "System disk"), value: L("无", "None"))
+            }
+            if let message { Text(message).foregroundStyle(.secondary) }
+        } footer: {
+            Text(vm.isLinux
+                 ? L("只能扩大。新增空间在写入前不占用设备存储。Arch 下次开机时会自动把根分区扩展到整个磁盘。虚拟机运行时不能改。",
+                     "Can only grow. The new space takes no room on the device until it is written to. Arch grows its root partition to fill the disk by itself at the next boot. Not while the virtual machine runs.")
+                 : L("只能扩大。新增空间在写入前不占用设备存储。扩容后在 Windows 的“磁盘管理”里对 C 盘选“扩展卷”（C 盘后面若有恢复分区，需先删掉它）。虚拟机运行时不能改。",
+                     "Can only grow. The new space takes no room on the device until it is written to. Afterwards extend C: in Windows Disk Management (Extend Volume; a recovery partition right after C: has to go first). Not while the virtual machine runs."))
+        }
+        .confirmationDialog(L("把系统盘扩到 \(pending ?? 0) GB？", "Grow the system disk to \(pending ?? 0) GB?"),
+                            isPresented: Binding(get: { pending != nil }, set: { if !$0 { pending = nil } }),
+                            titleVisibility: .visible) {
+            Button(L("扩容", "Grow")) {
+                if let size = pending { message = vm.growDisk(toGB: size) ?? L("已扩到 \(size) GB。", "Now \(size) GB.") }
+                pending = nil
+            }
+            Button(L("取消", "Cancel"), role: .cancel) { pending = nil }
+        } message: {
+            Text(L("扩容后不能再缩小。", "It cannot be made smaller again."))
+        }
+    }
+}
+
+private struct AdvancedSettings: View {
+    @ObservedObject var vm: VMViewModel
+
+    var body: some View {
+        Form {
+            Section {
+                Picker(L("内存", "Memory"), selection: $vm.ramLimitMB) {
+                    Text(L("自动", "Automatic")).tag(0)
+                    ForEach(VMViewModel.ramChoices, id: \.self) { mb in
+                        Text("\(mb / 1024) GB").tag(mb)
+                    }
+                }
+            } footer: {
+                Text(L("给虚拟机的内存上限（Windows 和 Arch Linux 共用）。“自动”会用设备能给的最大值（最多 16 GB，并给系统留出约 2.5 GB）。设备给不了所选大小时会自动降一档。",
+                       "The most memory the virtual machine gets (shared by Windows and Arch Linux). Automatic uses as much as the device allows (up to 16 GB, leaving about 2.5 GB for iOS). If the device cannot give the chosen size, the next smaller one is used."))
+            }
+
+            DiskSizeSection(vm: vm)
+
+            Section {
+                Picker(L("JIT 缓存", "JIT cache"), selection: $vm.jitCacheMB) {
+                    ForEach(VMViewModel.jitCacheChoices, id: \.self) { mb in
+                        Text(mb == 256 ? "256 MB (" + L("默认", "default") + ")" : "\(mb) MB").tag(mb == 256 ? 0 : mb)
+                    }
+                }
+            } footer: {
+                Text(L("翻译后代码的缓存。实测 256 MB 最顺：缓存更大时清空次数少，但系统改写代码时的停顿更长（768 MB 约 0.15 秒，256 MB 约 0.03 秒），开 JIT 也更慢。改动在下次启动 App 后生效。",
+                       "Cache for translated code. 256 MB measured smoothest: a bigger cache is flushed less often, but the pause when the system rewrites code gets longer (about 0.15 s at 768 MB, 0.03 s at 256 MB) and enabling JIT takes longer. Takes effect the next time the app starts."))
+            }
+
+            Section {
+                LabeledContent(L("当前", "Now"), value: vm.jitStatusText)
+            } footer: {
+                Text(L("这两项在开启 JIT 时就定下来了：修改后要完全关闭 App 再重新打开才生效。",
+                       "Both are fixed when JIT is enabled: after a change, close the app completely and open it again."))
+            }
+        }
+        .navigationTitle(L("高级设置", "Advanced"))
+        .navigationBarTitleDisplayMode(.inline)
     }
 }

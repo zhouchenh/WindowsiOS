@@ -81,7 +81,14 @@ static void on_ill(int sig, siginfo_t *info, void *ctx) {
     sigaction(sig, prior, NULL);
 }
 
+/* The iOS sampling profiler (host/prof_ios.c, HV_PROF_IOS): every guest CPU thread registers itself. */
+void (*hv_prof_register)(void);
+#if TARGET_OS_IPHONE
+void hv_prof_ios_start(void);
+#endif
+
 static void prepare_cpu_thread(void) {
+    if (hv_prof_register) hv_prof_register();
     static __thread int done;
     if (done) return;
     done = 1;
@@ -135,6 +142,14 @@ int hv_winvm_display_size(uint32_t *w, uint32_t *h) {
 uint64_t hv_winvm_display_frames(void) {
     HvFbDisplay *fb = atomic_load_explicit(&display_fb, memory_order_acquire);
     return fb ? hv_fb_metal_frames(fb) : 0;
+}
+
+int hv_winvm_gpu_status(char *buf, unsigned len) {
+    return hv_virtio_gpu_describe(board.gpu, buf, len);
+}
+
+void hv_winvm_set_preferred_display(uint32_t w, uint32_t h) {
+    hv_virtio_gpu_set_preferred(board.gpu, w, h);
 }
 
 int hv_winvm_save_png(const char *path) {
@@ -260,11 +275,20 @@ static void join_secondaries(void) {
     }
 }
 
+void hv_winvm_set_paused(int paused) {
+    __atomic_store_n(&m.paused, paused ? 1 : 0, __ATOMIC_RELEASE);
+    if (paused) hv_machine_kick_all(&m);
+    else for (int i = 0; i < ncpus; i++) hv_cpu_wake(&cpus[i]);
+}
+
 void hv_winvm_flush_disks(void) {
     if (disk0.fd >= 0) hv_disk_sync(&disk0);
 }
 
 int hv_winvm_run_cpu0(void) {
+#if TARGET_OS_IPHONE
+    hv_prof_ios_start(); /* before the CPU threads start, so they all register */
+#endif
     prepare_cpu_thread();
     for (;;) {
         int r = hv_run(&cpus[0]);
@@ -299,6 +323,7 @@ int hv_winvm_run_cpu0(void) {
                 board.flash1->status = 0x80;
             }
             if (board.fb) board.fb->active = 0;
+            hv_virtio_gpu_reset(board.gpu);
             hv_winvirt_reset_cpu(&board);
             m.flush_pending = 1;
             spawn_secondaries();
@@ -345,6 +370,19 @@ void hv_winvm_stop(void) {
 
 void hv_winvm_power_button(void) {
     hv_winvirt_power_button(&board);
+}
+
+/* Bytes typed into the guest's serial console (Linux: its login on ttyAMA0). Waits while the
+   UART's receive FIFO is full; the guest drains it at its own pace. */
+void hv_winvm_serial_send(const char *bytes, size_t n) {
+    if (!board.uart) return;
+    for (size_t i = 0; i < n && !atomic_load_explicit(&stop_requested, memory_order_relaxed);) {
+        hv_dev_lock(&m);
+        int ok = hv_pl011_receive(board.uart, (uint8_t)bytes[i]);
+        hv_dev_unlock(&m);
+        if (ok) i++;
+        else usleep(2000);
+    }
 }
 
 void hv_winvm_key_hid(uint8_t usage, int down) {

@@ -728,13 +728,23 @@ static void build_smbios(HvFwCfg *fw, int ncpus, uint64_t ram_size) {
         };
         b_put(&t, uuid, 16);
         b_u8(&t, 6); /* Wake-up Type: Power Switch */
-        b_u8(&t, 0); /* SKU */
+        /* SKU: a word from the host to the guest that needs no driver or network (HV_SMBIOS_SKU).
+           Windows shows it at HKLM\HARDWARE\DESCRIPTION\System\BIOS\SystemSKU; the app sets
+           WINIOS-CLI for its command-line-only mode (dist/WinKit/files/cli_setup.ps1 acts on it). */
+        const char *sku = getenv("HV_SMBIOS_SKU");
+        if (sku && (!*sku || strlen(sku) > 48)) sku = NULL;
+        b_u8(&t, sku ? 6 : 0); /* SKU */
         b_u8(&t, 5); /* Family */
-        b_put(&t, "Apple / WindowsiOS\0", 19);
-        b_put(&t, "iPhone Duo ARM64 PC\0", 20);
+        b_put(&t, "Apple VM\0", 9); /* Manufacturer */
+        { /* Product Name: the device it runs on (HV_SMBIOS_PRODUCT, set by the app), e.g. "iPad Pro 11-inch (M5)" */
+            const char *product = getenv("HV_SMBIOS_PRODUCT");
+            if (!product || !*product || strlen(product) > 60) product = "WindowsiOS Virtual Machine";
+            b_put(&t, product, strlen(product) + 1);
+        }
         b_put(&t, "1.0\0", 4);
         b_put(&t, "DUO-WIN11-ARM64\0", 16);
         b_put(&t, "WindowsiOS\0", 11);
+        if (sku) b_put(&t, sku, strlen(sku) + 1);
         b_u8(&t, 0);
     }
 
@@ -757,8 +767,12 @@ static void build_smbios(HvFwCfg *fw, int ncpus, uint64_t ram_size) {
         b_u8(&t, 0);
         b_u8(&t, 0);
         b_u8(&t, 0);
-        b_put(&t, "Apple\0", 6);
-        b_put(&t, "iPhone19,4\0", 11);
+        b_put(&t, "Apple VM\0", 9); /* Manufacturer */
+        { /* Version: the device's model identifier (HV_SMBIOS_MODEL), e.g. "iPad17,1" */
+            const char *model = getenv("HV_SMBIOS_MODEL");
+            if (!model || !*model || strlen(model) > 30) model = "Apple";
+            b_put(&t, model, strlen(model) + 1);
+        }
         b_u8(&t, 0);
     }
 
@@ -775,8 +789,8 @@ static void build_smbios(HvFwCfg *fw, int ncpus, uint64_t ram_size) {
         b_u8(&t, 3);
         b_u8(&t, 0x8b);
         b_u16(&t, 100U);
-        b_u16(&t, 4000U);
-        b_u16(&t, 3600U);
+        b_u16(&t, 4608U);
+        b_u16(&t, 4608U);
         b_u8(&t, 0x41);
         b_u8(&t, 1);
         b_u16(&t, 0xffffU);
@@ -792,7 +806,11 @@ static void build_smbios(HvFwCfg *fw, int ncpus, uint64_t ram_size) {
         b_u16(&t, 0x0101U);
         b_put(&t, "SOC0\0", 5);
         b_put(&t, "Apple / ARM\0", 12);
-        b_put(&t, "Apple A20 Pro (WindowsiOS JIT)\0", 31);
+        {   /* Processor Version: what Windows shows as the CPU name. HV_CPU_NAME overrides it. */
+            const char *cpu_name = getenv("HV_CPU_NAME");
+            if (!cpu_name || !*cpu_name || strlen(cpu_name) > 60) cpu_name = "Apple Silicon";
+            b_put(&t, cpu_name, strlen(cpu_name) + 1);
+        }
         b_u8(&t, 0);
     }
 

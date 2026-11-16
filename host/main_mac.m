@@ -151,6 +151,12 @@ static void *cmd_file_thread(void *arg) {
             hv_winvm_key_hid(0x15, 0);
             usleep(30000);
             hv_winvm_key_hid(0xe3, 0);
+        } else if (!strncmp(line, "fbsource ", 9)) {
+            HvWinVirt *bd = hv_winvm_board();
+            if (bd && bd->fb) bd->fb->force = !strcmp(line + 9, "ramfb") ? 1 : !strcmp(line + 9, "gpu") ? 2 : 0;
+        } else if (!strncmp(line, "gpusize ", 8)) {
+            unsigned gw = 0, gh = 0;
+            if (sscanf(line + 8, "%ux%u", &gw, &gh) == 2) hv_winvm_set_preferred_display(gw, gh);
         } else if (!strcmp(line, "enter")) {
             hv_winvm_key_hid(0x28, 1);
             usleep(50000);

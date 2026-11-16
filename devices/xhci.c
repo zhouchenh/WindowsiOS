@@ -337,6 +337,14 @@ static int control(HvXhci *x, HvXhciSlot *sl, const uint8_t setup[8], uint8_t *o
     return len;
 }
 
+/* A halted endpoint's context names the TRB it stopped at, as hardware does: Linux reads it back to
+   find the stalled TD and move the ring past it (Set TR Dequeue). Left stale, the next transfer
+   on the endpoint never ran (USB devices failed to enumerate under Linux). */
+static void halt_deq(HvXhci *x, int slot, uint64_t trb_at, int ccs) {
+    uint64_t deq = trb_at | (uint64_t)(ccs & 1);
+    wr(x, out_ctx(x, slot) + 32ull * 1 + 8, &deq, 8);
+}
+
 static void run_ep0(HvXhci *x, int slot) {
     HvXhciSlot *sl = &x->slots[slot];
     HvXhciRing *r = &sl->ep[1];
@@ -368,6 +376,7 @@ static void run_ep0(HvXhci *x, int slot) {
             if (stalled) {
                 if (xlog()) fprintf(stderr, "xhci port %d: EP0 STALL on DATA want=%u\n", sl->port, want);
                 transfer_event(x, at, CC_STALL, want, slot, 1);
+                halt_deq(x, slot, at, r->ccs);
                 set_ep_state(x, slot, 1, 2); /* EP_STATE_HALTED */
                 sl->ep_running[1] = 0;
                 return;
@@ -402,6 +411,7 @@ static void run_ep0(HvXhci *x, int slot) {
             if (stalled) {
                 if (xlog()) fprintf(stderr, "xhci port %d: EP0 STALL on STATUS\n", sl->port);
                 transfer_event(x, at, CC_STALL, 0, slot, 1);
+                halt_deq(x, slot, at, r->ccs);
                 set_ep_state(x, slot, 1, 2); /* EP_STATE_HALTED */
                 sl->ep_running[1] = 0;
                 return;

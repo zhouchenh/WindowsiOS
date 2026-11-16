@@ -1,0 +1,16 @@
+#!/bin/bash
+# WindowsiOS helper for Arch: runs the jobs the app puts in its shared folder (http://10.0.2.4/linux_job.txt:
+# an id line, then shell commands) as root and uploads their output (linux_out.txt). The Linux counterpart
+# of the Windows helper. Off: systemctl disable --now winios-agent
+u=http://10.0.2.4
+last=$(curl -s --max-time 5 $u/linux_job.txt | head -1)
+while true; do
+    sleep 1.5
+    t=$(curl -s --max-time 5 $u/linux_job.txt) || continue
+    id=$(head -1 <<<"$t"); cmd=$(tail -n +2 <<<"$t")
+    if [ -n "$id" ] && [ "$id" != "$last" ] && [ -n "$cmd" ]; then
+        last=$id
+        out=$(timeout 1800 bash -c "$cmd" 2>&1)
+        printf '%s\n%s\n' "$id" "$out" | curl -s --max-time 30 -T - $u/linux_out.txt
+    fi
+done

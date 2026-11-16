@@ -1,0 +1,11 @@
+[Unit]
+Description=Grow the root file system to fill a disk the WindowsiOS app made bigger
+After=local-fs.target
+ConditionPathExists=/usr/local/sbin/winios-growroot
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/winios-growroot
+
+[Install]
+WantedBy=multi-user.target
