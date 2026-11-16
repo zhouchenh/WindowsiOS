@@ -23,7 +23,7 @@ MAC_FRAMEWORKS = -framework Cocoa -framework Foundation -framework QuartzCore -f
                  -framework AudioToolbox
 
 CORE_TESTS = $(B)/test_classify $(B)/test_jit_region $(B)/test_operands $(B)/test_jit $(B)/test_mem \
-             $(B)/test_mmu $(B)/test_exc
+             $(B)/test_mmu $(B)/test_exc $(B)/test_share_clip
 
 all: $(CORE_TESTS) $(B)/hvsparse $(B)/winvm
 
@@ -56,6 +56,9 @@ $(B)/test_operands: tests/test_operands.c tests/operand_cases.s $(B)/operands.o
 	$(CC) $(CFLAGS) $^ -o $@
 $(B)/test_mmu: tests/test_mmu.c $(ENGINE)
 	$(CC) $(CFLAGS) tests/test_mmu.c $(ENGINE) -o $@
+# The shared clipboard (host/share.c) over its socket, under the address and UB sanitizers.
+$(B)/test_share_clip: tests/test_share_clip.c host/share.c host/share.h | $(B)
+	$(CC) $(CFLAGS) -fsanitize=address,undefined -fno-sanitize-recover=all tests/test_share_clip.c host/share.c -o $@
 
 # Guest DNS proxy against a stand-in resolver (no network needed).
 $(B)/test_dns_lifecycle: tests/test_dns_lifecycle.c $(B)/dns_proxy.o
