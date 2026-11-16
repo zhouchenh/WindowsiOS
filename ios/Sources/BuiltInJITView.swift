@@ -17,7 +17,8 @@ struct JITEnableButton: View {
                                               : L("用 StikDebug 开启", "Enable with StikDebug")) {
             jit.enable()
         }
-        .disabled(jit.busy)
+        // Not while the setup's Prepare or Reset DDI runs either: the helper's disk image cache is shared.
+        .disabled(jit.busy || jit.helperBusy)
     }
 }
 

@@ -237,6 +237,13 @@ final class JITSetup: ObservableObject {
             jitLog("JIT is being turned on already; not asking again")
             return
         }
+        // Prepare and Reset DDI run in a helper process of their own, and every helper process works on
+        // the same Developer Disk Image cache: an enable alongside would mount the image while the other
+        // downloads or deletes it.
+        guard !helperBusy else {
+            jitLog("Prepare or Reset DDI is still running; not enabling now")
+            return
+        }
         error = nil
         refreshPairingStatus()
         if resolvedMethod == .builtIn {
@@ -387,6 +394,13 @@ final class JITSetup: ObservableObject {
     /// then asks the script to detach, which ends the helper's request). `attempt` counts tries on
     /// cellular (JITRetryPolicy).
     private func enableBuiltIn(attempt: Int = 1) {
+        // Back from LocalDevVPN, or a retry: Prepare or Reset DDI may have been started meanwhile, and
+        // they share the helper's Developer Disk Image cache (enable() says more).
+        guard !helperBusy else {
+            fail(L("“准备”或“重置开发者磁盘映像”还在进行，请等它完成后再开启 JIT。",
+                   "Prepare or Reset Developer Disk Image is still running. Wait for it to finish, then enable JIT."))
+            return
+        }
         guard let pairing = try? JITPairingFileStore.data() else {
             fail(L("请先配对本机，或导入它的配对文件。", "Pair this device or import its pairing file first."))
             refreshPairingStatus()
