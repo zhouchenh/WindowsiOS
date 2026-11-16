@@ -90,7 +90,7 @@ static int init_rest(HvMachine *m) {
     /* Henge 5d4e092 and ba9392e: a TLBI of one page (here or from another CPU) drops only that 4 KB page from the
        stashed TLB entries of switched-out processes (all of the ASID's when the page may be part of a large one), and
        a process switch puts stashed entries back with one fence. */
-    knob_env(HV_K_STASHVA, 0);
+    knob_env(HV_K_STASHVA, 1); /* on unless its variable says 0 */
     /* Henge aaba70b, 1ed86bd, 17e9ed9: another CPU's TLBI of a page done from here lets through walks of pages far
        enough from it (hv_walks_elsewhere) instead of counting every walk meanwhile as a race to wait for. */
     knob_env(HV_K_WALKLOG, 0);
