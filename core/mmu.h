@@ -86,7 +86,7 @@ void hv_ucode_add(HvCpu *cpu, uint64_t va); /* a user target was cached in this 
 void hv_tlb_protect_code(HvCpu *cpu, const uint8_t *host_page);
 void hv_tlb_protect_code_page(HvCpu *cpu, struct HvRam *ram, uint64_t pg); /* the same, through the page's write hints */
 
-/* Translates for a C access of `len` bytes that stays inside one 16 KB page,
+/* Translates for a C access of `len` bytes that stays inside one (4 KB) TLB page,
    filling the TLB when the page is ordinary RAM. Returns 0 and sets *pa, or the
    fault status code. */
 uint32_t hv_mmu_access(HvCpu *cpu, uint64_t va, HvAccess acc, int el, uint64_t *pa);

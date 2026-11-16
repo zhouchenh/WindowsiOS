@@ -269,6 +269,10 @@ _Static_assert(offsetof(HvCpu, spsel) == HV_CPU_SPSEL, "HvCpu layout");
 _Static_assert(offsetof(HvCpu, sp_el1) == HV_CPU_SP_EL1, "HvCpu layout");
 _Static_assert(offsetof(HvCpu, ijc_tab) == HV_CPU_IJC_TAB, "HvCpu layout");
 _Static_assert(HV_IJC_TABLES == 16, "ijc_tab has one pointer per table");
+_Static_assert(HV_TLB_SIZE * 4 <= 65536, "TLB codes (user_fills, kernel_fills, stash slots) are 16 bits");
+_Static_assert(HV_TLB_PAGE_BITS == 12, "the Windows core's TLB, its logs, filters and the ports from Henge (16 KB) assume 4 KB pages");
+_Static_assert(HV_ASID_LOG <= 65536 && sizeof(((HvCpu *)0)->asid_base) / sizeof(uint64_t) == 65536, "every 16-bit ASID");
+_Static_assert(offsetof(HvCpu, asid_base) > HV_CPU_RET_TAB, "asid_base is C-only, past what translated code addresses");
 _Static_assert(sizeof(HvTlbEntry) == 32, "TLB entries are indexed with lsl #5");
 
 /* Why the last block returned to the dispatcher. */

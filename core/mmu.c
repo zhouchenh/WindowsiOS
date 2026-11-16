@@ -427,7 +427,7 @@ void hv_tlb_flush_user_range(HvCpu *cpu, uint64_t va, uint64_t len) {
 
 /* A big range of kernel VAs. A full flush here also dropped every process's entries and both halves of the branch
    caches, and macOS 27 sends ranges like this hundreds of times a second (a phone running it did 120-260 full flushes a
-   second, Sequoia none). Up to 64 MB page by page, as small ranges are; past that, a scan for kernel entries in the range
+   second, Sequoia none). Up to 4096 pages (16 MB of 4 KB pages) page by page, as small ranges are; past that, a scan for kernel entries in the range
    and the kernel half of the branch caches. */
 void hv_tlb_flush_kernel_range(HvCpu *cpu, uint64_t va, uint64_t len) {
     if (cpu->m && cpu->m->stats_interval) cpu->m->stats.kernel_ranges++;
@@ -482,8 +482,8 @@ void hv_tlb_protect_code(HvCpu *cpu, const uint8_t *host_page) {
         }
 }
 
-/* Forget one salt's cached targets in one 16 KB page. A page's 4096 possible
-   targets have 4096 known slots in each table, so only those are looked at. */
+/* Forget one salt's cached targets in one TLB page (4 KB). A page's 1024 possible
+   targets have 1024 known slots in each table (two ways), so only those are looked at. */
 /* local: cpu itself (it may empty the page's hint slot afterwards). */
 static void ijc_clear_page(HvCpu *cpu, uint64_t page, int kernel, uint64_t salt, int local) {
     HvPerCpu *m = cpu->pc_state;
@@ -726,7 +726,7 @@ static void write_guard(HvCpu *cpu, HvRam *ram, uint64_t pg, uint32_t code, HvTl
 }
 
 /* HV_KVA_HIST (measuring, for a kernel fastmem window): which kernel VAs get TLB fills, per GB from the bottom of xnu's
-   kernel VA space, and how many distinct 16 KB pages. hv_kva_hist_dump writes it out. */
+   kernel VA space, and how many distinct TLB pages. hv_kva_hist_dump writes it out. */
 #define KVA_GBS 2048 /* buckets: 2048 of 1 GB from 0xfffffe0000000000 by default; HV_KVA_BASE (hex) and HV_KVA_SHIFT move and widen them */
 static uint64_t KVA_BASE = 0xfffffe0000000000ull;
 static int kva_shift = 30;
@@ -1357,7 +1357,7 @@ void hv_tlb_switch_user(HvCpu *cpu, uint64_t old, uint64_t now) {
                fence and checked after it). Which page is kept from the copy in the TLB, not read again from the
                stash, where another CPU's drop may be clearing tags meanwhile. */
             int batch = hv_knob[HV_K_STASHVA];
-            static __thread struct { HvRam *ram; uint64_t pg; uint16_t code; } pend[HV_STASH_CAP];
+            uint16_t pend[HV_STASH_CAP]; /* slots of the writable ones (2 KB of stack) */
             uint32_t npend = 0;
             for (uint32_t j = 0; j < r->n; j++) {
                 const HvTlbEntry *from = &r->ent[j];
@@ -1366,22 +1366,30 @@ void hv_tlb_switch_user(HvCpu *cpu, uint64_t old, uint64_t now) {
                 HvTlbEntry *e = &cpu->tlb[0] + r->slot[j];
                 *e = *from;
                 cpu->user_fills[cpu->nuser_fills++] = r->slot[j];
-                if (e->write_tag != HV_TLB_INVALID) {
-                    const uint8_t *host = (const uint8_t *)(uintptr_t)(e->write_tag + HV_TLB_ADJ + e->addend);
+                /* Read once: another CPU's drop may be making it invalid meanwhile (then nothing is left to guard). */
+                uint64_t wt = __atomic_load_n(&e->write_tag, __ATOMIC_RELAXED);
+                if (wt != HV_TLB_INVALID) {
+                    const uint8_t *host = (const uint8_t *)(uintptr_t)(wt + HV_TLB_ADJ + e->addend);
                     HvRam *ram = ram_of_host(m, host);
                     uint64_t pg = ram ? (uint64_t)(host - ram->host) >> HV_TLB_PAGE_BITS : 0;
                     if (!ram) e->write_tag = HV_TLB_INVALID;
                     else if (!batch) write_guard(cpu, ram, pg, r->slot[j], e);
                     else {
                         write_hint(cpu, ram, pg, r->slot[j]);
-                        pend[npend].ram = ram, pend[npend].pg = pg, pend[npend++].code = r->slot[j];
+                        pend[npend++] = r->slot[j];
                     }
                 }
             }
             if (npend) __atomic_thread_fence(__ATOMIC_SEQ_CST);
-            for (uint32_t q = 0; q < npend; q++)
-                if (__atomic_load_n(&pend[q].ram->code_pages[pend[q].pg], __ATOMIC_RELAXED))
-                    (&cpu->tlb[0] + pend[q].code)->write_tag = HV_TLB_INVALID;
+            for (uint32_t q = 0; q < npend; q++) { /* the page again from the TLB entry: invalid by now needs no check */
+                HvTlbEntry *e = &cpu->tlb[0] + pend[q];
+                uint64_t wt = __atomic_load_n(&e->write_tag, __ATOMIC_RELAXED);
+                if (wt == HV_TLB_INVALID) continue;
+                const uint8_t *host = (const uint8_t *)(uintptr_t)(wt + HV_TLB_ADJ + e->addend);
+                HvRam *ram = ram_of_host(m, host);
+                if (!ram || __atomic_load_n(&ram->code_pages[(uint64_t)(host - ram->host) >> HV_TLB_PAGE_BITS], __ATOMIC_RELAXED))
+                    e->write_tag = HV_TLB_INVALID;
+            }
             if (m->stats_interval) m->stats.stash_hits++;
             if (m->stats_interval) m->stats.stash_entries += r->n;
             break;
