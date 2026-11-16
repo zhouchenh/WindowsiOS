@@ -107,7 +107,9 @@ time, unless the person chose Allow for it. So:
   until checked again.
 - To allow it: iOS Settings › Apple VM › Paste from Other Apps › Allow. The item appears once the app has
   read the clipboard at least once.
-- "Paste into Windows after sending" presses Ctrl+V once Windows has the text (see above).
+- "Paste into Windows after tapping Paste" presses Ctrl+V once Windows has the text (see above), only
+  after the paste button: never after an automatic send on returning to the app, which would type
+  whatever was copied on the iPhone into the focused window (a command line, say) without a tap.
 - "Sent to Windows" confirms; when the helper is not running the app says so (the text still waits in
   the slot and the helper takes it when it starts into an empty clipboard).
 

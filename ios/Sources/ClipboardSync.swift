@@ -157,10 +157,11 @@ final class ClipboardSync: ObservableObject {
     // MARK: - iPhone → Windows
 
     /// From the system paste button: the person chose to paste, nothing is asked. Always sent, even when
-    /// the shared clipboard holds this text already (Windows may have copied a picture since).
+    /// the shared clipboard holds this text already (Windows may have copied a picture since), and pasted
+    /// in Windows if that is on: only here, never after an automatic send, which no one asked to type.
     func sendToWindows(_ text: String) {
         knownChangeCount = UIPasteboard.general.changeCount
-        send(text, force: true)
+        send(text, force: true, paste: pasteAfterSend)
     }
 
     private func sendOnActivationIfAllowed() {
@@ -176,10 +177,10 @@ final class ClipboardSync: ObservableObject {
         } else if text == nil {
             pastePermission = .denied
         }
-        if let text { send(text, force: false) }
+        if let text { send(text, force: false, paste: false) }
     }
 
-    private func send(_ text: String, force: Bool) {
+    private func send(_ text: String, force: Bool, paste: Bool) {
         guard !text.isEmpty else { return }
         guard text.utf8.count <= Self.maxBytes else {
             show(L("内容太大（超过 1 MB），没有发送", "Too large for Windows (over 1 MB): not sent"), symbol: "exclamationmark.triangle")
@@ -192,7 +193,7 @@ final class ClipboardSync: ObservableObject {
             return
         }
         show(L("已发送到 Windows", "Sent to Windows"), symbol: "arrow.up.doc.on.clipboard")
-        if pasteAfterSend { pasteWhenWindowsHasIt(seq, deadline: Date().addingTimeInterval(2.5)) }
+        if paste { pasteWhenWindowsHasIt(seq, deadline: Date().addingTimeInterval(2.5)) }
     }
 
     /// Ctrl+V once the helper has put seq on Windows' clipboard (it asks for the next one only then).

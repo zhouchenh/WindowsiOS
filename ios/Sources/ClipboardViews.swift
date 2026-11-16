@@ -54,7 +54,7 @@ struct ClipboardSettingsSection: View {
                     }
                 }
             }
-            Toggle(L("发送后在 Windows 里粘贴（Ctrl+V）", "Paste into Windows after sending"), isOn: $sync.pasteAfterSend)
+            Toggle(L("点粘贴按钮后在 Windows 里粘贴（Ctrl+V）", "Paste into Windows after tapping Paste"), isOn: $sync.pasteAfterSend)
             HStack {
                 Text(L("粘贴到 Windows", "Paste to Windows"))
                 Spacer()
