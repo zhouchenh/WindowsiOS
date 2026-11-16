@@ -49,6 +49,10 @@
 	<true/>
 	<key>LSSupportsOpeningDocumentsInPlace</key>
 	<true/>
+	<key>NSBonjourServices</key>
+	<array>
+		<string>_applevm._tcp</string>
+	</array>
 	<key>NSLocalNetworkUsageDescription</key>
 	<string>Lets other devices on your network or VPN connect to Windows through port forwards you set up (for example SSH or Remote Desktop).</string>
 	<key>NSMicrophoneUsageDescription</key>
