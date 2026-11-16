@@ -861,6 +861,7 @@ static NSString *winios_unpack_resource(NSString *name, NSString *dst) {
         .stats_interval = getenv("HV_STATS") ? atoi(getenv("HV_STATS")) : 0, /* seconds between engine stats lines on stderr */
     };
 
+    [self usePortForwardsOfMachineDirectory:dir]; /* portfwd hook: this machine's saved forwards open with its network */
     char err[256] = {0};
     if (hv_winvm_create(&cfg, err, sizeof err) != 0) {
         _vmStatus = [NSString stringWithFormat:@"VM create failed: %s", err];
@@ -1225,6 +1226,87 @@ static void winios_type_run(NSString *text) {
 
 - (BOOL)takeGuestOAuthDone {
     return hv_share_take_oauth_done() != 0;
+}
+
+@end
+
+/* ---- port forwards (portfwd) ---- */
+
+#include "net_slirp.h"
+
+@interface WinIOSBridge (PortForwardingMachine) /* implemented in the class itself, above */
+- (NSString *)machineDirectory;
+@end
+
+@implementation WinIOSBridge (PortForwarding)
+
+- (void)usePortForwardsOfMachineDirectory:(NSString *)dir {
+    NSString *path = [dir stringByAppendingPathComponent:@"port_forwards.json"];
+    hv_net_fwd_set_store(path.fileSystemRepresentation); /* the same path again does nothing */
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        /* iOS may take a suspended app's listening sockets away: open the forwards again on the way back. */
+        [[NSNotificationCenter defaultCenter] addObserverForName:UIApplicationWillEnterForegroundNotification
+                                                          object:nil
+                                                           queue:nil
+                                                      usingBlock:^(NSNotification *note) {
+                                                          (void)note;
+                                                          hv_net_fwd_reopen();
+                                                      }];
+    });
+}
+
+/* While no machine runs, the forwards shown are the selected machine's (it may have changed on the launch page). */
+- (void)usePortForwardsOfCurrentMachine {
+    if (!self.isVMRunning) [self usePortForwardsOfMachineDirectory:[self machineDirectory]];
+}
+
+static NSString *winios_take_json(char *s, NSString *fallback) {
+    if (!s) return fallback;
+    NSString *r = [NSString stringWithUTF8String:s] ?: fallback;
+    free(s);
+    return r;
+}
+
+- (NSString *)portForwardsJSON {
+    [self usePortForwardsOfCurrentMachine];
+    return winios_take_json(hv_net_fwd_list_json(), @"{\"running\":false,\"rules\":[]}");
+}
+
+- (nullable NSString *)savePortForwardWithID:(NSString *)forwardID
+                                        name:(NSString *)name
+                                   protocols:(NSInteger)protocols
+                                    hostPort:(NSInteger)hostPort
+                                   guestPort:(NSInteger)guestPort
+                                       scope:(NSInteger)scope
+                                     enabled:(BOOL)enabled {
+    [self usePortForwardsOfCurrentMachine];
+    HvFwdRule r = {0};
+    snprintf(r.id, sizeof r.id, "%s", forwardID.UTF8String ?: "");
+    snprintf(r.name, sizeof r.name, "%s", name.UTF8String ?: "");
+    r.proto = (int)protocols;
+    r.host_port = (int)MAX(MIN(hostPort, 70000), -1);
+    r.guest_port = (int)MAX(MIN(guestPort, 70000), -1);
+    r.scope = (int)scope;
+    r.enabled = enabled ? 1 : 0;
+    char err[160] = {0};
+    if (hv_net_fwd_put(&r, HV_FWD_SAVED, err, sizeof err) != 0) return [NSString stringWithUTF8String:err] ?: @"failed";
+    NSLog(@"portfwd: saved \"%s\" %s %d -> %d scope %d %s", r.name, r.proto == 3 ? "tcp+udp" : r.proto == 2 ? "udp" : "tcp",
+          r.host_port, r.guest_port, r.scope, r.enabled ? "on" : "off");
+    return nil;
+}
+
+- (BOOL)removePortForwardWithID:(NSString *)forwardID {
+    [self usePortForwardsOfCurrentMachine];
+    return hv_net_fwd_remove(forwardID.UTF8String ?: "", 0) == 0;
+}
+
+- (NSString *)portForwardAddressesJSON {
+    return winios_take_json(hv_net_fwd_addresses_json(), @"{\"lan\":[],\"vpn\":[]}");
+}
+
+- (void)refreshPortForwards {
+    hv_net_fwd_refresh();
 }
 
 @end

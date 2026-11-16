@@ -38,7 +38,11 @@ targets:
         CADisableMinimumFrameDurationOnPhone: true
         UIViewControllerBasedStatusBarAppearance: false
         NSMicrophoneUsageDescription: "Windows uses the microphone for voice input and audio recording."
+        # Port forwards open to the local network (Settings > Port forwarding, PortForwardingView.swift). The
+        # Bonjour type is only browsed to learn whether Local Network access was granted; nothing is advertised.
         NSLocalNetworkUsageDescription: "Lets other devices on your network or VPN connect to Windows through port forwards you set up (for example SSH or Remote Desktop)."
+        NSBonjourServices:
+          - _applevm._tcp
         # applevm:// brings the app back from LocalDevVPN (localdevvpn://enable?scheme=applevm);
         # applevm://enable-jit asks StikDebug for JIT (JITSetup.swift)
         CFBundleURLTypes:

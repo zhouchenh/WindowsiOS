@@ -11,6 +11,9 @@
    Windows prefers IPv4 for names that have both (RFC 6724: ULA source, global destination).
    docs/networking.md has the whole picture.
 
+   Port forwards (TCP and UDP, from this device's loopback, every interface or the VPN's address into the guest)
+   are rules kept in a table and applied on the network thread: see "port forwards" below.
+
    libslirp is not thread-safe, so it lives on one thread with its sockets and
    timers. Frames the guest sends are queued to it (and the thread woken through
    a pipe); frames for the guest are queued the other way and handed to the
@@ -23,13 +26,17 @@
 #include <arpa/inet.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <ifaddrs.h>
+#include <net/if.h>
 #include <netinet/in.h>
+#include <netinet/tcp.h>
 #include <poll.h>
 #include <pthread.h>
 #include <libslirp.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 #include <sys/socket.h>
 #include <time.h>
 #include <unistd.h>
@@ -73,121 +80,6 @@ static char share_socket[256];
 #define V6_PREFIX "fd2d:7064:6c3f:2::"
 #define V6_HOST V6_PREFIX "2"
 #define V6_DNS V6_PREFIX "3"
-
-typedef struct FwdReq {
-    int host_port, guest_port;
-} FwdReq;
-static pthread_mutex_t fwd_mu = PTHREAD_MUTEX_INITIALIZER;
-static FwdReq pending_fwds[32];
-static int npending_fwds;
-static int active_fwds[64];
-static int nactive_fwds;
-
-typedef struct V6ConnPair {
-    int a, b;
-} V6ConnPair;
-
-static void *v6_pump_thread(void *arg) {
-    V6ConnPair p = *(V6ConnPair *)arg;
-    free(arg);
-    uint8_t buf[16384];
-    struct pollfd fds[2] = {{p.a, POLLIN, 0}, {p.b, POLLIN, 0}};
-    while (poll(fds, 2, 120000) > 0) {
-        for (int i = 0; i < 2; i++) {
-            int src = i == 0 ? p.a : p.b;
-            int dst = i == 0 ? p.b : p.a;
-            if (fds[i].revents & (POLLIN | POLLHUP | POLLERR)) {
-                ssize_t n = recv(src, buf, sizeof buf, 0);
-                if (n <= 0) goto done;
-                size_t off = 0;
-                while (off < (size_t)n) {
-                    ssize_t w = send(dst, buf + off, (size_t)n - off, 0);
-                    if (w <= 0) goto done;
-                    off += (size_t)w;
-                }
-            }
-        }
-    }
-done:
-    close(p.a);
-    close(p.b);
-    return NULL;
-}
-
-typedef struct V6AcceptArg {
-    int listen_fd;
-    int port;
-} V6AcceptArg;
-
-static void *v6_accept_thread(void *arg) {
-    V6AcceptArg a = *(V6AcceptArg *)arg;
-    free(arg);
-    for (;;) {
-        int cfd = accept(a.listen_fd, NULL, NULL);
-        if (cfd < 0) {
-            if (errno == EINTR) continue;
-            break;
-        }
-        int v4 = socket(AF_INET, SOCK_STREAM, 0);
-        if (v4 < 0) { close(cfd); continue; }
-        struct sockaddr_in dst = {0};
-        dst.sin_family = AF_INET;
-        dst.sin_port = htons((uint16_t)a.port);
-        inet_pton(AF_INET, "127.0.0.1", &dst.sin_addr);
-        if (connect(v4, (struct sockaddr *)&dst, sizeof dst) != 0) {
-            close(cfd);
-            close(v4);
-            continue;
-        }
-        V6ConnPair *pair = malloc(sizeof *pair);
-        if (!pair) { close(cfd); close(v4); continue; }
-        pair->a = cfd;
-        pair->b = v4;
-        pthread_t pt;
-        if (pthread_create(&pt, NULL, v6_pump_thread, pair) == 0) pthread_detach(pt);
-        else { free(pair); close(cfd); close(v4); }
-    }
-    close(a.listen_fd);
-    return NULL;
-}
-
-static void start_ipv6_loopback_bridge(int port) {
-    int lfd = socket(AF_INET6, SOCK_STREAM, 0);
-    if (lfd < 0) return;
-    int one = 1;
-    setsockopt(lfd, IPPROTO_IPV6, IPV6_V6ONLY, &one, sizeof one);
-    setsockopt(lfd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof one);
-    struct sockaddr_in6 addr = {0};
-    addr.sin6_family = AF_INET6;
-    addr.sin6_port = htons((uint16_t)port);
-    addr.sin6_addr = in6addr_loopback;
-    if (bind(lfd, (struct sockaddr *)&addr, sizeof addr) != 0 || listen(lfd, 16) != 0) {
-        close(lfd);
-        return;
-    }
-    V6AcceptArg *a = malloc(sizeof *a);
-    if (!a) { close(lfd); return; }
-    a->listen_fd = lfd;
-    a->port = port;
-    pthread_t t;
-    if (pthread_create(&t, NULL, v6_accept_thread, a) == 0) pthread_detach(t);
-    else { free(a); close(lfd); }
-}
-
-void hv_net_add_hostfwd(int host_port, int guest_port) {
-    if (host_port < 1024 || host_port > 65535 || guest_port < 1 || guest_port > 65535) return;
-    pthread_mutex_lock(&fwd_mu);
-    int dup = 0;
-    for (int i = 0; i < npending_fwds; i++)
-        if (pending_fwds[i].host_port == host_port) dup = 1;
-    if (!dup && npending_fwds < 32)
-        pending_fwds[npending_fwds++] = (FwdReq){host_port, guest_port};
-    pthread_mutex_unlock(&fwd_mu);
-    if (wake_pipe[1] > 0) {
-        char c = 0;
-        (void)!write(wake_pipe[1], &c, 1);
-    }
-}
 
 void hv_net_set_share_socket(const char *path) {
     snprintf(share_socket, sizeof share_socket, "%s", path ? path : "");
@@ -337,10 +229,1278 @@ static const SlirpCb callbacks = {
     .unregister_poll_socket = unregister_poll_socket,
 };
 
+/* ---- port forwards ----
+
+   A forward is a rule: protocol(s), a port on the device, a port in the guest and who can connect (net_slirp.h).
+   Rules live in a table any thread may change (fwd_mu); the network thread owns libslirp, so it alone opens and
+   closes the listeners, comparing what each rule wants with what it has (fwd_reconcile). It does so when told
+   (fwd_changed), and every few seconds to follow the VPN's address and to retry forwards that failed.
+
+   IPv4 is libslirp's own host forward, on 127.0.0.1, 0.0.0.0 or the VPN's address. libslirp cannot take an IPv6
+   connection to the guest's IPv4 address, so IPv6 ([::1], [::], the VPN's IPv6 address) is a small relay of our
+   own (Bridge) that hands each TCP connection, or each UDP peer's datagrams, to the IPv4 listener. The guest then
+   sees those as coming from 10.0.2.2. Saved rules are a JSON file in the machine's folder (fwd_save). */
+
+#define MAX_RULES 64
+#define MAX_SESSION_RULES 32
+#define FWD_PERIOD_MS 3000
+#define UDP_PEERS 32
+#define UDP_IDLE_MS 120000
+
+typedef struct Bridge {
+    int udp;
+    int fd; /* the IPv6 socket */
+    int stop[2];
+    struct sockaddr_in target; /* libslirp's IPv4 listener */
+    pthread_t thread;
+} Bridge;
+
+typedef struct Applied { /* what is open for a rule: network thread only */
+    int on;
+    int proto, host_port, guest_port;
+    struct in_addr a4;
+    int tcp4, udp4;
+    int has6;
+    struct in6_addr a6;
+    Bridge *tcp6, *udp6;
+} Applied;
+
+typedef struct Rule {
+    int used, removed, session;
+    int dirty;       /* changed since the network thread last looked */
+    int reopen;      /* close and open again (hv_net_fwd_reopen) */
+    uint64_t serial; /* which use of the slot */
+    HvFwdRule cfg;
+    /* state, from the network thread */
+    char state[12], code[16], msg[160], warn[160];
+    char listen[4][64];
+    int nlisten;
+    Applied ap; /* network thread only */
+} Rule;
+
+static pthread_mutex_t fwd_mu = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t fwd_cond = PTHREAD_COND_INITIALIZER;
+static Rule rules[MAX_RULES];
+static int net_running;
+static uint64_t fwd_change_gen, fwd_done_gen, rule_serial;
+static char store_path[1024];
+static uint64_t store_seq;
+static pthread_mutex_t save_mu = PTHREAD_MUTEX_INITIALIZER;
+static uint64_t saved_seq;
+
+static void wake_net(void) {
+    if (wake_pipe[1] > 0) {
+        char c = 0;
+        (void)!write(wake_pipe[1], &c, 1);
+    }
+}
+
+/* fwd_mu held. */
+static void fwd_changed_locked(void) {
+    fwd_change_gen++;
+}
+
+static const char *proto_name(int proto) {
+    return proto == HV_FWD_BOTH ? "tcp+udp" : proto == HV_FWD_UDP ? "udp" : "tcp";
+}
+static const char *scope_name(int scope) {
+    return scope == HV_FWD_LAN ? "lan" : scope == HV_FWD_VPN ? "vpn" : "loopback";
+}
+
+/* ---- a growing string ---- */
+
+typedef struct Buf {
+    char *p;
+    size_t n, cap;
+} Buf;
+
+static void bput(Buf *b, const char *s, size_t n) {
+    if (b->n + n + 1 > b->cap) {
+        size_t cap = b->cap ? b->cap : 256;
+        while (b->n + n + 1 > cap) cap *= 2;
+        char *p = realloc(b->p, cap);
+        if (!p) return;
+        b->p = p, b->cap = cap;
+    }
+    memcpy(b->p + b->n, s, n);
+    b->n += n;
+    b->p[b->n] = 0;
+}
+static void bstr(Buf *b, const char *s) { bput(b, s, strlen(s)); }
+static void bint(Buf *b, long v) {
+    char t[24];
+    snprintf(t, sizeof t, "%ld", v);
+    bstr(b, t);
+}
+static void bjson(Buf *b, const char *s) { /* a JSON string */
+    bput(b, "\"", 1);
+    for (const unsigned char *p = (const unsigned char *)s; *p; p++) {
+        if (*p == '"' || *p == '\\') {
+            char e[2] = {'\\', (char)*p};
+            bput(b, e, 2);
+        } else if (*p < 0x20) {
+            char e[8];
+            snprintf(e, sizeof e, "\\u%04x", *p);
+            bstr(b, e);
+        } else {
+            bput(b, (const char *)p, 1);
+        }
+    }
+    bput(b, "\"", 1);
+}
+
+/* ---- reading JSON: just what the rules file and the guest's requests need ---- */
+
+typedef struct JP {
+    const char *p, *end;
+} JP;
+
+static void jws(JP *j) {
+    while (j->p < j->end && (*j->p == ' ' || *j->p == '\t' || *j->p == '\n' || *j->p == '\r')) j->p++;
+}
+static int jlit(JP *j, const char *lit) {
+    size_t n = strlen(lit);
+    if ((size_t)(j->end - j->p) < n || memcmp(j->p, lit, n)) return 0;
+    j->p += n;
+    return 1;
+}
+static void utf8(char *out, size_t cap, size_t *o, unsigned cp) {
+    char t[4];
+    size_t n;
+    if (cp < 0x80) t[0] = (char)cp, n = 1;
+    else if (cp < 0x800) t[0] = (char)(0xc0 | cp >> 6), t[1] = (char)(0x80 | (cp & 63)), n = 2;
+    else if (cp < 0x10000)
+        t[0] = (char)(0xe0 | cp >> 12), t[1] = (char)(0x80 | (cp >> 6 & 63)), t[2] = (char)(0x80 | (cp & 63)), n = 3;
+    else
+        t[0] = (char)(0xf0 | cp >> 18), t[1] = (char)(0x80 | (cp >> 12 & 63)), t[2] = (char)(0x80 | (cp >> 6 & 63)),
+        t[3] = (char)(0x80 | (cp & 63)), n = 4;
+    if (*o + n < cap) memcpy(out + *o, t, n), *o += n; /* longer strings are cut, at a character boundary */
+}
+static int jhex4(JP *j, unsigned *v) {
+    if (j->end - j->p < 4) return 0;
+    *v = 0;
+    for (int i = 0; i < 4; i++) {
+        char c = *j->p++;
+        int d = c >= '0' && c <= '9' ? c - '0' : c >= 'a' && c <= 'f' ? c - 'a' + 10 : c >= 'A' && c <= 'F' ? c - 'A' + 10 : -1;
+        if (d < 0) return 0;
+        *v = *v << 4 | (unsigned)d;
+    }
+    return 1;
+}
+/* A string into out (cap > 0), cut to fit. */
+static int jstr(JP *j, char *out, size_t cap) {
+    jws(j);
+    if (j->p >= j->end || *j->p != '"') return 0;
+    j->p++;
+    size_t o = 0;
+    while (j->p < j->end && *j->p != '"') {
+        unsigned char c = (unsigned char)*j->p++;
+        if (c < 0x20) return 0;
+        if (c != '\\') {
+            if (o + 1 < cap) out[o++] = (char)c;
+            continue;
+        }
+        if (j->p >= j->end) return 0;
+        c = (unsigned char)*j->p++;
+        unsigned cp;
+        switch (c) {
+        case '"': case '\\': case '/': cp = c; break;
+        case 'b': cp = 8; break;
+        case 'f': cp = 12; break;
+        case 'n': cp = 10; break;
+        case 'r': cp = 13; break;
+        case 't': cp = 9; break;
+        case 'u':
+            if (!jhex4(j, &cp)) return 0;
+            if (cp >= 0xd800 && cp < 0xdc00) { /* a surrogate pair */
+                unsigned lo;
+                if (!jlit(j, "\\u") || !jhex4(j, &lo) || lo < 0xdc00 || lo > 0xdfff) return 0;
+                cp = 0x10000 + ((cp - 0xd800) << 10) + (lo - 0xdc00);
+            } else if (cp >= 0xdc00 && cp < 0xe000) {
+                return 0;
+            }
+            break;
+        default: return 0;
+        }
+        if (!cp) return 0;
+        utf8(out, cap, &o, cp);
+    }
+    if (j->p >= j->end) return 0;
+    j->p++;
+    out[o < cap ? o : cap - 1] = 0;
+    return 1;
+}
+static int jnum(JP *j, long *v) {
+    jws(j);
+    const char *s = j->p;
+    if (j->p < j->end && *j->p == '-') j->p++;
+    long x = 0;
+    int digits = 0;
+    while (j->p < j->end && *j->p >= '0' && *j->p <= '9') {
+        if (x < 100000000) x = x * 10 + (*j->p - '0');
+        j->p++, digits++;
+    }
+    if (!digits) return 0;
+    if (j->p < j->end && (*j->p == '.' || *j->p == 'e' || *j->p == 'E')) return 0; /* ports are whole numbers */
+    *v = *s == '-' ? -x : x;
+    return 1;
+}
+static int jbool(JP *j, int *v) {
+    jws(j);
+    if (jlit(j, "true")) return *v = 1, 1;
+    if (jlit(j, "false")) return *v = 0, 1;
+    return 0;
+}
+static int jskip(JP *j, int depth) {
+    jws(j);
+    if (j->p >= j->end || depth > 16) return 0;
+    char c = *j->p;
+    if (c == '"') {
+        char t[2];
+        return jstr(j, t, sizeof t);
+    }
+    if (c == '{' || c == '[') {
+        char close = c == '{' ? '}' : ']';
+        j->p++;
+        jws(j);
+        if (j->p < j->end && *j->p == close) return j->p++, 1;
+        for (;;) {
+            if (c == '{') {
+                char t[2];
+                if (!jstr(j, t, sizeof t)) return 0;
+                jws(j);
+                if (j->p >= j->end || *j->p++ != ':') return 0;
+            }
+            if (!jskip(j, depth + 1)) return 0;
+            jws(j);
+            if (j->p >= j->end) return 0;
+            if (*j->p == ',') {
+                j->p++;
+                continue;
+            }
+            if (*j->p == close) return j->p++, 1;
+            return 0;
+        }
+    }
+    if (jlit(j, "true") || jlit(j, "false") || jlit(j, "null")) return 1;
+    long v;
+    if (c == '-' || (c >= '0' && c <= '9')) {
+        if (jnum(j, &v)) return 1;
+        while (j->p < j->end && strchr("+-.eE0123456789", *j->p)) j->p++; /* a number with a fraction */
+        return 1;
+    }
+    return 0;
+}
+
+static int parse_proto(const char *s) {
+    if (!strcasecmp(s, "tcp")) return HV_FWD_TCP;
+    if (!strcasecmp(s, "udp")) return HV_FWD_UDP;
+    if (!strcasecmp(s, "tcp+udp") || !strcasecmp(s, "both")) return HV_FWD_BOTH;
+    return 0;
+}
+static int parse_scope(const char *s) {
+    if (!strcasecmp(s, "loopback")) return HV_FWD_LOOPBACK;
+    if (!strcasecmp(s, "lan")) return HV_FWD_LAN;
+    if (!strcasecmp(s, "vpn")) return HV_FWD_VPN;
+    return -1;
+}
+
+/* One rule object; unknown keys are skipped. */
+static int jrule(JP *j, HvFwdRule *r) {
+    jws(j);
+    if (j->p >= j->end || *j->p != '{') return 0;
+    j->p++;
+    jws(j);
+    if (j->p < j->end && *j->p == '}') return j->p++, 1;
+    for (;;) {
+        char key[32], s[64];
+        long v;
+        if (!jstr(j, key, sizeof key)) return 0;
+        jws(j);
+        if (j->p >= j->end || *j->p++ != ':') return 0;
+        if (!strcmp(key, "id")) {
+            if (!jstr(j, r->id, sizeof r->id)) return 0;
+        } else if (!strcmp(key, "name")) {
+            if (!jstr(j, r->name, sizeof r->name)) return 0;
+        } else if (!strcmp(key, "protocol")) {
+            if (!jstr(j, s, sizeof s) || !(r->proto = parse_proto(s))) return 0;
+        } else if (!strcmp(key, "scope")) {
+            if (!jstr(j, s, sizeof s) || (r->scope = parse_scope(s)) < 0) return 0;
+        } else if (!strcmp(key, "hostPort")) {
+            if (!jnum(j, &v)) return 0;
+            r->host_port = v < 0 || v > 70000 ? -1 : (int)v;
+        } else if (!strcmp(key, "guestPort")) {
+            if (!jnum(j, &v)) return 0;
+            r->guest_port = v < 0 || v > 70000 ? -1 : (int)v;
+        } else if (!strcmp(key, "enabled")) {
+            if (!jbool(j, &r->enabled)) return 0;
+        } else if (!jskip(j, 1)) {
+            return 0;
+        }
+        jws(j);
+        if (j->p >= j->end) return 0;
+        if (*j->p == ',') {
+            j->p++;
+            continue;
+        }
+        if (*j->p == '}') return j->p++, 1;
+        return 0;
+    }
+}
+
+int hv_net_fwd_parse_rule(const char *json, size_t len, HvFwdRule *r) {
+    JP j = {json, json + len};
+    HvFwdRule t = *r;
+    if (!jrule(&j, &t)) return -1;
+    jws(&j);
+    if (j.p != j.end) return -1;
+    *r = t;
+    return 0;
+}
+
+/* ---- the IPv6 relay (Bridge): [::1], [::] or the VPN's IPv6 address -> libslirp's IPv4 listener ---- */
+
+static void no_sigpipe(int fd) {
+    int one = 1;
+    setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &one, sizeof one);
+}
+
+typedef struct Pump {
+    int a;
+    struct sockaddr_in target;
+} Pump;
+
+/* One TCP connection: connect to the IPv4 listener, then copy both ways until both sides are done. */
+static void *pump_thread(void *arg) {
+    Pump p = *(Pump *)arg;
+    free(arg);
+    int b = socket(AF_INET, SOCK_STREAM, 0);
+    if (b < 0) {
+        close(p.a);
+        return NULL;
+    }
+    no_sigpipe(b);
+    if (connect(b, (struct sockaddr *)&p.target, sizeof p.target) != 0) {
+        close(p.a), close(b);
+        return NULL;
+    }
+    int one = 1;
+    setsockopt(b, IPPROTO_TCP, TCP_NODELAY, &one, sizeof one);
+    setsockopt(p.a, IPPROTO_TCP, TCP_NODELAY, &one, sizeof one);
+    uint8_t buf[16384];
+    int eof[2] = {0, 0}, fd[2] = {p.a, b};
+    while (!eof[0] || !eof[1]) {
+        struct pollfd fds[2] = {{eof[0] ? -1 : p.a, POLLIN, 0}, {eof[1] ? -1 : b, POLLIN, 0}};
+        if (poll(fds, 2, -1) < 0) {
+            if (errno == EINTR) continue;
+            break;
+        }
+        int bad = 0;
+        for (int i = 0; i < 2 && !bad; i++) {
+            if (!(fds[i].revents & (POLLIN | POLLHUP | POLLERR))) continue;
+            ssize_t n = recv(fd[i], buf, sizeof buf, 0);
+            if (n < 0 && errno == EINTR) continue;
+            if (n <= 0) { /* this side is done sending: pass that on */
+                eof[i] = 1;
+                shutdown(fd[1 - i], SHUT_WR);
+                if (n < 0) bad = 1;
+                continue;
+            }
+            for (ssize_t off = 0; off < n;) {
+                ssize_t w = send(fd[1 - i], buf + off, (size_t)(n - off), 0);
+                if (w < 0 && errno == EINTR) continue;
+                if (w <= 0) {
+                    bad = 1;
+                    break;
+                }
+                off += w;
+            }
+        }
+        if (bad) break;
+    }
+    close(p.a), close(b);
+    return NULL;
+}
+
+static void *tcp_bridge_thread(void *arg) {
+    Bridge *br = arg;
+    int dead = 0; /* the socket broke (iOS reclaims a suspended app's listeners): wait for hv_net_fwd_reopen */
+    for (;;) {
+        struct pollfd fds[2] = {{dead ? -1 : br->fd, POLLIN, 0}, {br->stop[0], POLLIN, 0}};
+        if (poll(fds, 2, -1) < 0) {
+            if (errno == EINTR) continue;
+            break;
+        }
+        if (fds[1].revents) break;
+        if (fds[0].revents & (POLLERR | POLLNVAL)) dead = 1;
+        if (!(fds[0].revents & POLLIN)) continue;
+        int c = accept(br->fd, NULL, NULL);
+        if (c < 0) {
+            if (errno != EAGAIN && errno != EINTR && errno != ECONNABORTED) dead = 1;
+            continue;
+        }
+        no_sigpipe(c);
+        Pump *p = malloc(sizeof *p);
+        pthread_t t;
+        if (!p) {
+            close(c);
+            continue;
+        }
+        p->a = c, p->target = br->target;
+        if (pthread_create(&t, NULL, pump_thread, p) == 0) pthread_detach(t);
+        else free(p), close(c);
+    }
+    return NULL;
+}
+
+typedef struct UdpPeer {
+    int fd; /* connected to the IPv4 listener; -1: free */
+    struct sockaddr_in6 addr;
+    int64_t last;
+} UdpPeer;
+
+/* Each IPv6 peer gets an IPv4 socket of its own, so the answers can be told apart. */
+static void *udp_bridge_thread(void *arg) {
+    Bridge *br = arg;
+    UdpPeer peers[UDP_PEERS];
+    for (int i = 0; i < UDP_PEERS; i++) peers[i].fd = -1;
+    static __thread uint8_t buf[65536];
+    int dead = 0; /* as in tcp_bridge_thread */
+    for (;;) {
+        struct pollfd fds[2 + UDP_PEERS];
+        fds[0] = (struct pollfd){br->stop[0], POLLIN, 0};
+        fds[1] = (struct pollfd){dead ? -1 : br->fd, POLLIN, 0};
+        for (int i = 0; i < UDP_PEERS; i++) fds[2 + i] = (struct pollfd){peers[i].fd, POLLIN, 0};
+        if (poll(fds, 2 + UDP_PEERS, 1000) < 0 && errno != EINTR) break;
+        if (fds[0].revents) break;
+        int64_t now = now_ms();
+        if (fds[1].revents & POLLNVAL) dead = 1;
+        if (fds[1].revents & (POLLIN | POLLERR)) {
+            struct sockaddr_in6 from;
+            socklen_t fl = sizeof from;
+            ssize_t n = recvfrom(br->fd, buf, sizeof buf, 0, (struct sockaddr *)&from, &fl);
+            if (n < 0 && errno != EAGAIN && errno != EINTR && errno != ECONNREFUSED && errno != EHOSTUNREACH &&
+                errno != ENETUNREACH)
+                dead = 1;
+            if (n >= 0 && from.sin6_family == AF_INET6) {
+                int k = -1, oldest = 0;
+                for (int i = 0; i < UDP_PEERS; i++) {
+                    if (peers[i].fd >= 0 && peers[i].addr.sin6_port == from.sin6_port &&
+                        !memcmp(&peers[i].addr.sin6_addr, &from.sin6_addr, 16) &&
+                        peers[i].addr.sin6_scope_id == from.sin6_scope_id)
+                        k = i;
+                    if (peers[i].fd < 0 || (peers[oldest].fd >= 0 && peers[i].last < peers[oldest].last)) oldest = i;
+                }
+                if (k < 0) { /* a new peer, in a free slot or the one heard from longest ago */
+                    k = oldest;
+                    if (peers[k].fd >= 0) close(peers[k].fd);
+                    peers[k].fd = socket(AF_INET, SOCK_DGRAM, 0);
+                    if (peers[k].fd >= 0 &&
+                        connect(peers[k].fd, (struct sockaddr *)&br->target, sizeof br->target) != 0) {
+                        close(peers[k].fd);
+                        peers[k].fd = -1;
+                    }
+                    peers[k].addr = from;
+                }
+                if (peers[k].fd >= 0) {
+                    peers[k].last = now;
+                    (void)!send(peers[k].fd, buf, (size_t)n, 0);
+                }
+            }
+        }
+        for (int i = 0; i < UDP_PEERS; i++) {
+            if (peers[i].fd < 0) continue;
+            if (fds[2 + i].revents & (POLLIN | POLLERR)) {
+                ssize_t n = recv(peers[i].fd, buf, sizeof buf, 0); /* an error here is an ICMP: nothing to pass on */
+                if (n >= 0) {
+                    (void)!sendto(br->fd, buf, (size_t)n, 0, (struct sockaddr *)&peers[i].addr, sizeof peers[i].addr);
+                    peers[i].last = now;
+                }
+            }
+            if (now - peers[i].last > UDP_IDLE_MS) {
+                close(peers[i].fd);
+                peers[i].fd = -1;
+            }
+        }
+    }
+    for (int i = 0; i < UDP_PEERS; i++)
+        if (peers[i].fd >= 0) close(peers[i].fd);
+    return NULL;
+}
+
+/* NULL with *err set when the IPv6 socket cannot be had. */
+static Bridge *bridge_start(int udp, const struct in6_addr *a6, int port, struct in_addr target, int *err) {
+    int fd = socket(AF_INET6, udp ? SOCK_DGRAM : SOCK_STREAM, 0);
+    if (fd < 0) return *err = errno, NULL;
+    int one = 1;
+    setsockopt(fd, IPPROTO_IPV6, IPV6_V6ONLY, &one, sizeof one);
+    if (!udp) setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof one);
+    no_sigpipe(fd);
+    struct sockaddr_in6 sa = {0};
+    sa.sin6_len = sizeof sa;
+    sa.sin6_family = AF_INET6;
+    sa.sin6_port = htons((uint16_t)port);
+    sa.sin6_addr = *a6;
+    if (bind(fd, (struct sockaddr *)&sa, sizeof sa) != 0 || (!udp && listen(fd, 16) != 0)) {
+        *err = errno;
+        close(fd);
+        return NULL;
+    }
+    fcntl(fd, F_SETFL, fcntl(fd, F_GETFL) | O_NONBLOCK);
+    Bridge *br = calloc(1, sizeof *br);
+    if (!br || pipe(br->stop) != 0) {
+        *err = ENOMEM;
+        free(br);
+        close(fd);
+        return NULL;
+    }
+    br->udp = udp, br->fd = fd;
+    br->target.sin_len = sizeof br->target;
+    br->target.sin_family = AF_INET;
+    br->target.sin_port = htons((uint16_t)port);
+    br->target.sin_addr = target;
+    if (pthread_create(&br->thread, NULL, udp ? udp_bridge_thread : tcp_bridge_thread, br) != 0) {
+        *err = EAGAIN;
+        close(br->stop[0]), close(br->stop[1]), close(fd);
+        free(br);
+        return NULL;
+    }
+    return br;
+}
+
+/* Stops the relay and closes its socket before returning, so the port can be bound again at once. Connections
+   already relayed go on until they end, as libslirp's own do. */
+static void bridge_stop(Bridge *br) {
+    if (!br) return;
+    char c = 0;
+    (void)!write(br->stop[1], &c, 1);
+    pthread_join(br->thread, NULL);
+    close(br->fd), close(br->stop[0]), close(br->stop[1]);
+    free(br);
+}
+
+/* ---- the device's interfaces ---- */
+
+/* name starts with one of the comma-separated prefixes in list. */
+static int if_matches(const char *name, const char *list) {
+    for (const char *p = list; *p;) {
+        const char *e = strchr(p, ',');
+        size_t n = e ? (size_t)(e - p) : strlen(p);
+        if (n && !strncmp(name, p, n)) return 1;
+        p += n + (e ? 1 : 0);
+    }
+    return 0;
+}
+static int usable4(const struct sockaddr *sa) {
+    uint32_t a = ntohl(((const struct sockaddr_in *)sa)->sin_addr.s_addr);
+    return a && (a >> 16) != 0xa9fe; /* not 0.0.0.0, not 169.254/16 */
+}
+static int usable6(const struct sockaddr *sa) {
+    const struct in6_addr *a = &((const struct sockaddr_in6 *)sa)->sin6_addr;
+    return !IN6_IS_ADDR_UNSPECIFIED(a) && !IN6_IS_ADDR_LINKLOCAL(a) && !IN6_IS_ADDR_MULTICAST(a) &&
+           !IN6_IS_ADDR_V4MAPPED(a);
+}
+static const char *vpn_ifs(void) {
+    const char *e = getenv("HV_NET_VPN_IF"); /* which interfaces are a VPN's; the tests use lo0 */
+    return e && *e ? e : "utun,ipsec,ppp,tun,wg";
+}
+static const char *lan_ifs(void) {
+    const char *e = getenv("HV_NET_LAN_IF");
+    return e && *e ? e : "en,bridge"; /* Wi-Fi and wired, and the personal hotspot (bridge100) */
+}
+
+typedef struct VpnAddr {
+    char ifname[IFNAMSIZ];
+    int has4, has6;
+    struct in_addr a4;
+    struct in6_addr a6;
+} VpnAddr;
+
+/* The active VPN: the first VPN interface that is up with an IPv4 address (else one with an IPv6 address); iOS's
+   own utun interfaces only have link-local addresses and are passed over. */
+static void vpn_lookup(VpnAddr *v) {
+    memset(v, 0, sizeof *v);
+    struct ifaddrs *ifa = NULL;
+    if (getifaddrs(&ifa) != 0) return;
+    const char *list = vpn_ifs();
+    for (int want4 = 1; want4 >= 0 && !v->ifname[0]; want4--)
+        for (struct ifaddrs *i = ifa; i; i = i->ifa_next) {
+            if (!i->ifa_addr || !(i->ifa_flags & IFF_UP) || !if_matches(i->ifa_name, list)) continue;
+            int fam = i->ifa_addr->sa_family;
+            if ((want4 && fam == AF_INET && usable4(i->ifa_addr)) || (!want4 && fam == AF_INET6 && usable6(i->ifa_addr))) {
+                snprintf(v->ifname, sizeof v->ifname, "%s", i->ifa_name);
+                break;
+            }
+        }
+    for (struct ifaddrs *i = ifa; i && v->ifname[0]; i = i->ifa_next) {
+        if (!i->ifa_addr || strcmp(i->ifa_name, v->ifname)) continue;
+        if (i->ifa_addr->sa_family == AF_INET && !v->has4 && usable4(i->ifa_addr))
+            v->has4 = 1, v->a4 = ((struct sockaddr_in *)i->ifa_addr)->sin_addr;
+        if (i->ifa_addr->sa_family == AF_INET6 && !v->has6 && usable6(i->ifa_addr))
+            v->has6 = 1, v->a6 = ((struct sockaddr_in6 *)i->ifa_addr)->sin6_addr;
+    }
+    freeifaddrs(ifa);
+}
+
+static void addr_list(Buf *b, struct ifaddrs *ifa, const char *list, const char *only_if) {
+    int first = 1, n = 0;
+    bstr(b, "[");
+    for (struct ifaddrs *i = ifa; i && n < 8; i = i->ifa_next) {
+        if (!i->ifa_addr || !(i->ifa_flags & IFF_UP) || (i->ifa_flags & IFF_LOOPBACK && !only_if)) continue;
+        if (only_if ? strcmp(i->ifa_name, only_if) != 0 : !if_matches(i->ifa_name, list)) continue;
+        int fam = i->ifa_addr->sa_family;
+        char a[INET6_ADDRSTRLEN];
+        if (fam == AF_INET && usable4(i->ifa_addr))
+            inet_ntop(AF_INET, &((struct sockaddr_in *)i->ifa_addr)->sin_addr, a, sizeof a);
+        else if (fam == AF_INET6 && usable6(i->ifa_addr))
+            inet_ntop(AF_INET6, &((struct sockaddr_in6 *)i->ifa_addr)->sin6_addr, a, sizeof a);
+        else
+            continue;
+        bstr(b, first ? "{\"interface\":" : ",{\"interface\":");
+        bjson(b, i->ifa_name);
+        bstr(b, ",\"address\":");
+        bjson(b, a);
+        bstr(b, fam == AF_INET ? ",\"family\":4}" : ",\"family\":6}");
+        first = 0, n++;
+    }
+    bstr(b, "]");
+}
+
+char *hv_net_fwd_addresses_json(void) {
+    Buf b = {0};
+    struct ifaddrs *ifa = NULL;
+    VpnAddr v;
+    vpn_lookup(&v);
+    if (getifaddrs(&ifa) != 0) ifa = NULL;
+    bstr(&b, "{\"lan\":");
+    addr_list(&b, ifa, lan_ifs(), NULL);
+    bstr(&b, ",\"vpn\":");
+    if (v.ifname[0]) addr_list(&b, ifa, NULL, v.ifname);
+    else bstr(&b, "[]");
+    bstr(&b, "}");
+    if (ifa) freeifaddrs(ifa);
+    return b.p ? b.p : strdup("{\"lan\":[],\"vpn\":[]}");
+}
+
+/* ---- the rules ---- */
+
+/* fwd_mu held. */
+static Rule *find_rule(const char *id) {
+    for (int i = 0; i < MAX_RULES; i++)
+        if (rules[i].used && !rules[i].removed && !strcmp(rules[i].cfg.id, id)) return &rules[i];
+    return NULL;
+}
+
+static void set_state(Rule *r, const char *state, const char *code, const char *msg) {
+    snprintf(r->state, sizeof r->state, "%s", state);
+    snprintf(r->code, sizeof r->code, "%s", code ? code : "");
+    snprintf(r->msg, sizeof r->msg, "%s", msg ? msg : "");
+}
+
+/* fwd_mu held: frees a slot (when the network thread has nothing open for it). */
+static void free_rule(Rule *r) {
+    memset(r, 0, sizeof *r);
+}
+
+/* fwd_mu held. The saved rules as the file's JSON. */
+static char *store_json_locked(void) {
+    Buf b = {0};
+    bstr(&b, "{\n  \"version\": 1,\n  \"rules\": [");
+    int first = 1;
+    for (int i = 0; i < MAX_RULES; i++) {
+        Rule *r = &rules[i];
+        if (!r->used || r->removed || r->session) continue;
+        bstr(&b, first ? "\n    {\"id\": " : ",\n    {\"id\": ");
+        bjson(&b, r->cfg.id);
+        bstr(&b, ", \"name\": ");
+        bjson(&b, r->cfg.name);
+        bstr(&b, ", \"protocol\": ");
+        bjson(&b, proto_name(r->cfg.proto));
+        bstr(&b, ", \"hostPort\": ");
+        bint(&b, r->cfg.host_port);
+        bstr(&b, ", \"guestPort\": ");
+        bint(&b, r->cfg.guest_port);
+        bstr(&b, ", \"scope\": ");
+        bjson(&b, scope_name(r->cfg.scope));
+        bstr(&b, r->cfg.enabled ? ", \"enabled\": true}" : ", \"enabled\": false}");
+        first = 0;
+    }
+    bstr(&b, first ? "]\n}\n" : "\n  ]\n}\n");
+    return b.p;
+}
+
+/* Called with fwd_mu held: takes the JSON now, writes it after (newest wins). */
+static void fwd_save_locked(char **json, char *path, size_t cap, uint64_t *seq) {
+    *json = NULL;
+    if (!store_path[0]) return;
+    *json = store_json_locked();
+    snprintf(path, cap, "%s", store_path);
+    *seq = ++store_seq;
+}
+static void fwd_save_write(char *json, const char *path, uint64_t seq) {
+    if (!json) return;
+    pthread_mutex_lock(&save_mu);
+    if (seq > saved_seq) {
+        char tmp[1100];
+        snprintf(tmp, sizeof tmp, "%s.tmp", path);
+        FILE *f = fopen(tmp, "w");
+        int ok = f && fputs(json, f) >= 0;
+        if (f && fclose(f) != 0) ok = 0;
+        if (ok && rename(tmp, path) == 0) saved_seq = seq;
+        else fprintf(stderr, "winvm: net: could not save the port forwards to %s: %s\n", path, strerror(errno)), unlink(tmp);
+    }
+    pthread_mutex_unlock(&save_mu);
+    free(json);
+}
+
+static int id_ok(const char *id) {
+    if (!*id) return 0;
+    for (const char *p = id; *p; p++)
+        if (!((*p >= 'a' && *p <= 'z') || (*p >= 'A' && *p <= 'Z') || (*p >= '0' && *p <= '9') || *p == '-' ||
+              *p == '_' || *p == '.'))
+            return 0;
+    return 1;
+}
+
+/* fwd_mu held. 0, or -1 with why. */
+static int put_locked(HvFwdRule *in, int session, int from_guest, char *err, size_t errlen) {
+    HvFwdRule c = *in;
+    c.name[sizeof c.name - 1] = 0;
+    c.id[sizeof c.id - 1] = 0;
+    if (c.proto < HV_FWD_TCP || c.proto > HV_FWD_BOTH) return snprintf(err, errlen, "unknown protocol"), -1;
+    if (c.host_port < 1 || c.host_port > 65535 || c.guest_port < 1 || c.guest_port > 65535)
+        return snprintf(err, errlen, "ports go from 1 to 65535"), -1;
+    if (from_guest && c.host_port < 1024) return snprintf(err, errlen, "Windows can only open ports from 1024 up"), -1;
+    if (c.scope < HV_FWD_LOOPBACK || c.scope > HV_FWD_VPN) return snprintf(err, errlen, "unknown scope"), -1;
+    if (from_guest) c.scope = HV_FWD_LOOPBACK; /* the guest never opens anything beyond this device */
+    c.enabled = c.enabled != 0;
+    if (!c.id[0]) {
+        if (session) snprintf(c.id, sizeof c.id, "session-%s-%d", proto_name(c.proto), c.host_port);
+        else snprintf(c.id, sizeof c.id, "fwd-%08x%04x", arc4random(), arc4random() & 0xffff);
+        for (char *p = c.id; *p; p++)
+            if (*p == '+') *p = '-';
+    }
+    if (!id_ok(c.id)) return snprintf(err, errlen, "bad id"), -1;
+    if (!c.name[0]) snprintf(c.name, sizeof c.name, "%s %d", c.proto == HV_FWD_UDP ? "UDP" : "TCP", c.host_port);
+    Rule *same = find_rule(c.id);
+    if (same && session && !same->session) return snprintf(err, errlen, "that forward belongs to the app"), -1;
+    if (c.enabled)
+        for (int i = 0; i < MAX_RULES; i++) {
+            Rule *o = &rules[i];
+            if (!o->used || o->removed || o == same || !o->cfg.enabled) continue;
+            if (o->cfg.host_port == c.host_port && (o->cfg.proto & c.proto)) {
+                snprintf(err, errlen, "port %d (%s) is already forwarded by \"%s\"", c.host_port,
+                         (o->cfg.proto & c.proto) == HV_FWD_UDP ? "UDP" : "TCP", o->cfg.name);
+                return -1;
+            }
+        }
+    if (!same) {
+        int sessions = 0;
+        for (int i = 0; i < MAX_RULES; i++) sessions += rules[i].used && rules[i].session;
+        if (session && sessions >= MAX_SESSION_RULES) return snprintf(err, errlen, "too many forwards"), -1;
+        for (int i = 0; i < MAX_RULES && !same; i++)
+            if (!rules[i].used) same = &rules[i];
+        if (!same) return snprintf(err, errlen, "too many forwards"), -1;
+        memset(same, 0, sizeof *same);
+        same->used = 1;
+        same->serial = ++rule_serial;
+        set_state(same, "waiting", NULL, NULL);
+    }
+    same->cfg = c;
+    same->session = session;
+    same->dirty = 1;
+    *in = c;
+    fwd_changed_locked();
+    return 0;
+}
+
+int hv_net_fwd_put(HvFwdRule *r, int session, char *err, size_t errlen) {
+    char tmp[8], path[1024], *json = NULL;
+    uint64_t seq = 0;
+    if (!err || !errlen) err = tmp, errlen = sizeof tmp;
+    err[0] = 0;
+    pthread_mutex_lock(&fwd_mu);
+    int rc = put_locked(r, session != HV_FWD_SAVED, session == HV_FWD_GUEST, err, errlen);
+    if (rc == 0 && session == HV_FWD_SAVED) fwd_save_locked(&json, path, sizeof path, &seq);
+    pthread_mutex_unlock(&fwd_mu);
+    fwd_save_write(json, path, seq);
+    if (rc == 0) wake_net();
+    return rc;
+}
+
+/* fwd_mu held. */
+static void remove_locked(Rule *r) {
+    if (net_running) r->removed = 1; /* the network thread closes its listeners and frees it */
+    else free_rule(r);
+    fwd_changed_locked();
+}
+
+int hv_net_fwd_remove(const char *id, int session_only) {
+    char path[1024], *json = NULL;
+    uint64_t seq = 0;
+    pthread_mutex_lock(&fwd_mu);
+    Rule *r = id ? find_rule(id) : NULL;
+    int rc = -1;
+    if (r && (!session_only || r->session)) {
+        int saved = !r->session;
+        remove_locked(r);
+        if (saved) fwd_save_locked(&json, path, sizeof path, &seq);
+        rc = 0;
+    }
+    pthread_mutex_unlock(&fwd_mu);
+    fwd_save_write(json, path, seq);
+    if (rc == 0) wake_net();
+    return rc;
+}
+
+void hv_net_add_hostfwd(int host_port, int guest_port) {
+    if (host_port < 1024 || host_port > 65535 || guest_port < 1 || guest_port > 65535) return;
+    pthread_mutex_lock(&fwd_mu);
+    int covered = 0;
+    for (int i = 0; i < MAX_RULES; i++) {
+        Rule *o = &rules[i];
+        if (o->used && !o->removed && o->cfg.enabled && o->cfg.host_port == host_port && (o->cfg.proto & HV_FWD_TCP)) {
+            covered = 1;
+            if (o->cfg.guest_port != guest_port)
+                fprintf(stderr, "winvm: net: port %d is already forwarded (to %d), not to %d\n", host_port,
+                        o->cfg.guest_port, guest_port);
+        }
+    }
+    int rc = 0;
+    if (!covered) {
+        HvFwdRule r = {.proto = HV_FWD_TCP, .host_port = host_port, .guest_port = guest_port,
+                       .scope = HV_FWD_LOOPBACK, .enabled = 1};
+        snprintf(r.name, sizeof r.name, "localhost:%d", host_port);
+        char err[160];
+        rc = put_locked(&r, 1, 0, err, sizeof err);
+        if (rc) fprintf(stderr, "winvm: net: no forward for port %d: %s\n", host_port, err);
+    }
+    pthread_mutex_unlock(&fwd_mu);
+    if (!covered && rc == 0) wake_net();
+}
+
+int hv_net_fwd_set_store(const char *path) {
+    if (!path || !*path) return -1;
+    pthread_mutex_lock(&fwd_mu);
+    if (!strcmp(path, store_path)) {
+        pthread_mutex_unlock(&fwd_mu);
+        return 0;
+    }
+    pthread_mutex_unlock(&fwd_mu);
+
+    /* Read it outside the lock. */
+    char *text = NULL;
+    size_t len = 0;
+    int bad = 0;
+    FILE *f = fopen(path, "r");
+    if (f) {
+        Buf b = {0};
+        char chunk[4096];
+        size_t n;
+        while ((n = fread(chunk, 1, sizeof chunk, f)) > 0 && b.n < (1 << 20)) bput(&b, chunk, n);
+        bad = ferror(f) || b.n >= (1 << 20);
+        fclose(f);
+        text = b.p, len = b.n;
+    } else if (errno != ENOENT) {
+        bad = 1;
+    }
+    HvFwdRule loaded[MAX_RULES];
+    int nloaded = 0;
+    if (text && !bad) {
+        JP j = {text, text + len};
+        jws(&j);
+        int ok = j.p < j.end && *j.p == '{';
+        if (ok) j.p++;
+        int found_rules = 0;
+        while (ok) {
+            char key[32];
+            jws(&j);
+            if (j.p < j.end && *j.p == '}') break;
+            if (!jstr(&j, key, sizeof key)) { ok = 0; break; }
+            jws(&j);
+            if (j.p >= j.end || *j.p++ != ':') { ok = 0; break; }
+            if (!strcmp(key, "rules")) {
+                found_rules = 1;
+                jws(&j);
+                if (j.p >= j.end || *j.p++ != '[') { ok = 0; break; }
+                jws(&j);
+                if (j.p < j.end && *j.p == ']') j.p++;
+                else
+                    for (;;) {
+                        HvFwdRule r = {.proto = HV_FWD_TCP, .enabled = 1};
+                        if (!jrule(&j, &r)) { ok = 0; break; }
+                        if (nloaded < MAX_RULES) loaded[nloaded++] = r;
+                        jws(&j);
+                        if (j.p < j.end && *j.p == ',') { j.p++; continue; }
+                        if (j.p < j.end && *j.p == ']') { j.p++; break; }
+                        ok = 0;
+                        break;
+                    }
+            } else if (!jskip(&j, 1)) {
+                ok = 0;
+            }
+            jws(&j);
+            if (ok && j.p < j.end && *j.p == ',') j.p++;
+        }
+        bad = !ok || !found_rules;
+    }
+    free(text);
+    if (bad) {
+        char moved[1100];
+        snprintf(moved, sizeof moved, "%s.bad", path);
+        fprintf(stderr, "winvm: net: %s is not a list of port forwards: kept as %s\n", path, moved);
+        rename(path, moved);
+        nloaded = 0;
+    }
+
+    pthread_mutex_lock(&fwd_mu);
+    snprintf(store_path, sizeof store_path, "%s", path);
+    for (int i = 0; i < MAX_RULES; i++)
+        if (rules[i].used && !rules[i].removed && !rules[i].session) remove_locked(&rules[i]);
+    int skipped = 0;
+    for (int i = 0; i < nloaded; i++) {
+        char err[160];
+        if (!loaded[i].id[0]) snprintf(loaded[i].id, sizeof loaded[i].id, "fwd-loaded-%d", i);
+        if (put_locked(&loaded[i], 0, 0, err, sizeof err) == 0) continue;
+        if (loaded[i].enabled) { /* its port is taken by one before it: kept, but off */
+            loaded[i].enabled = 0;
+            fprintf(stderr, "winvm: net: saved forward \"%s\" turned off: %s\n", loaded[i].name, err);
+            if (put_locked(&loaded[i], 0, 0, err, sizeof err) == 0) continue;
+        }
+        fprintf(stderr, "winvm: net: saved forward \"%s\" left out: %s\n", loaded[i].name, err);
+        skipped++;
+    }
+    fwd_changed_locked();
+    pthread_mutex_unlock(&fwd_mu);
+    fprintf(stderr, "winvm: net: %d port forward%s from %s\n", nloaded - skipped, nloaded - skipped == 1 ? "" : "s", path);
+    wake_net();
+    return bad ? -1 : 0;
+}
+
+void hv_net_fwd_refresh(void) {
+    pthread_mutex_lock(&fwd_mu);
+    for (int i = 0; i < MAX_RULES; i++) rules[i].dirty = 1;
+    fwd_changed_locked();
+    pthread_mutex_unlock(&fwd_mu);
+    wake_net();
+}
+
+void hv_net_fwd_reopen(void) {
+    pthread_mutex_lock(&fwd_mu);
+    int open = 0;
+    for (int i = 0; i < MAX_RULES; i++) {
+        rules[i].dirty = rules[i].reopen = 1;
+        open += rules[i].used && rules[i].cfg.enabled && net_running;
+    }
+    if (open) fprintf(stderr, "winvm: net: opening the port forwards again\n");
+    fwd_changed_locked();
+    pthread_mutex_unlock(&fwd_mu);
+    wake_net();
+}
+
+int hv_net_fwd_sync(int timeout_ms) {
+    struct timespec until;
+    clock_gettime(CLOCK_REALTIME, &until);
+    until.tv_sec += timeout_ms / 1000;
+    until.tv_nsec += (long)(timeout_ms % 1000) * 1000000;
+    if (until.tv_nsec >= 1000000000) until.tv_sec++, until.tv_nsec -= 1000000000;
+    pthread_mutex_lock(&fwd_mu);
+    uint64_t want = fwd_change_gen;
+    int rc = 0;
+    while (net_running && fwd_done_gen < want)
+        if (pthread_cond_timedwait(&fwd_cond, &fwd_mu, &until) == ETIMEDOUT) {
+            rc = fwd_done_gen < want ? -1 : 0;
+            break;
+        }
+    pthread_mutex_unlock(&fwd_mu);
+    return rc;
+}
+
+char *hv_net_fwd_list_json(void) {
+    Buf b = {0};
+    pthread_mutex_lock(&fwd_mu);
+    bstr(&b, net_running ? "{\"running\":true,\"rules\":[" : "{\"running\":false,\"rules\":[");
+    int first = 1;
+    for (int i = 0; i < MAX_RULES; i++) {
+        Rule *r = &rules[i];
+        if (!r->used || r->removed) continue;
+        const char *state = r->state;
+        if (!r->cfg.enabled) state = "off";
+        else if (!net_running) state = "waiting";
+        bstr(&b, first ? "{\"id\":" : ",{\"id\":");
+        bjson(&b, r->cfg.id);
+        bstr(&b, ",\"name\":");
+        bjson(&b, r->cfg.name);
+        bstr(&b, ",\"protocol\":");
+        bjson(&b, proto_name(r->cfg.proto));
+        bstr(&b, ",\"hostPort\":");
+        bint(&b, r->cfg.host_port);
+        bstr(&b, ",\"guestPort\":");
+        bint(&b, r->cfg.guest_port);
+        bstr(&b, ",\"scope\":");
+        bjson(&b, scope_name(r->cfg.scope));
+        bstr(&b, r->cfg.enabled ? ",\"enabled\":true" : ",\"enabled\":false");
+        bstr(&b, r->session ? ",\"session\":true,\"state\":" : ",\"session\":false,\"state\":");
+        bjson(&b, state);
+        int live = r->cfg.enabled && net_running;
+        bstr(&b, ",\"code\":");
+        bjson(&b, live ? r->code : "");
+        bstr(&b, ",\"message\":");
+        bjson(&b, live ? r->msg : "");
+        bstr(&b, ",\"warning\":");
+        bjson(&b, live ? r->warn : "");
+        bstr(&b, ",\"listen\":[");
+        for (int k = 0; live && k < r->nlisten; k++) {
+            if (k) bstr(&b, ",");
+            bjson(&b, r->listen[k]);
+        }
+        bstr(&b, "]}");
+        first = 0;
+    }
+    bstr(&b, "]}");
+    pthread_mutex_unlock(&fwd_mu);
+    return b.p ? b.p : strdup("{\"running\":false,\"rules\":[]}");
+}
+
+/* ---- applying them (network thread) ---- */
+
+static int fwd_rules_off(void) {
+    const char *e = getenv("HV_NET_FWD_RULES"); /* 0: saved forwards are listed but not opened */
+    return e && !strcmp(e, "0");
+}
+
+typedef struct Want {
+    int ok;
+    char code[16], msg[160];
+    struct in_addr a4;
+    int show4; /* a4 is reachable as configured (not just the relay's way in) */
+    int has6;
+    struct in6_addr a6;
+} Want;
+
+static void want_for(const HvFwdRule *c, const VpnAddr *vpn, Want *w) {
+    memset(w, 0, sizeof *w);
+    w->ok = 1, w->show4 = 1, w->has6 = 1;
+    switch (c->scope) {
+    case HV_FWD_LAN:
+        w->a4.s_addr = htonl(INADDR_ANY);
+        w->a6 = in6addr_any;
+        break;
+    case HV_FWD_VPN:
+        if (!vpn->has4 && !vpn->has6) {
+            w->ok = 0;
+            snprintf(w->code, sizeof w->code, "no_vpn");
+            snprintf(w->msg, sizeof w->msg, "no VPN is connected");
+            return;
+        }
+        if (vpn->has4) w->a4 = vpn->a4;
+        else w->a4.s_addr = htonl(INADDR_LOOPBACK), w->show4 = 0; /* an IPv6-only VPN: the relay's way in */
+        w->has6 = vpn->has6;
+        if (vpn->has6) w->a6 = vpn->a6;
+        break;
+    default:
+        w->a4.s_addr = htonl(INADDR_LOOPBACK);
+        w->a6 = in6addr_loopback;
+        break;
+    }
+}
+
+static void fwd_teardown(Applied *ap) {
+    if (ap->tcp4) slirp_remove_hostfwd(slirp, 0, ap->a4, ap->host_port);
+    if (ap->udp4) slirp_remove_hostfwd(slirp, 1, ap->a4, ap->host_port);
+    bridge_stop(ap->tcp6);
+    bridge_stop(ap->udp6);
+    memset(ap, 0, sizeof *ap);
+}
+
+static void errno_text(int e, int port, const char *proto, char *code, size_t cl, char *msg, size_t ml) {
+    if (e == EADDRINUSE) {
+        snprintf(code, cl, "in_use");
+        snprintf(msg, ml, "port %d (%s) is in use by another app or forward on this device", port, proto);
+    } else if (e == EACCES || e == EPERM) {
+        snprintf(code, cl, "denied");
+        snprintf(msg, ml, "the system does not let the app use port %d (%s)", port, proto);
+    } else if (e == EADDRNOTAVAIL) {
+        snprintf(code, cl, "no_address");
+        snprintf(msg, ml, "the address for port %d (%s) is gone", port, proto);
+    } else {
+        snprintf(code, cl, "failed");
+        snprintf(msg, ml, "port %d (%s): %s", port, proto, strerror(e));
+    }
+}
+
+typedef struct Outcome {
+    char state[12], code[16], msg[160], warn[160];
+    char listen[4][64];
+    int nlisten;
+} Outcome;
+
+static void fwd_apply(const HvFwdRule *c, const Want *w, Applied *ap, Outcome *o) {
+    struct in_addr guest;
+    inet_pton(AF_INET, "10.0.2.15", &guest);
+    ap->proto = c->proto, ap->host_port = c->host_port, ap->guest_port = c->guest_port, ap->a4 = w->a4;
+    ap->has6 = w->has6, ap->a6 = w->a6;
+    for (int udp = 0; udp <= 1; udp++) {
+        if (!(c->proto & (udp ? HV_FWD_UDP : HV_FWD_TCP))) continue;
+        errno = 0;
+        if (slirp_add_hostfwd(slirp, udp, w->a4, c->host_port, guest, c->guest_port) != 0) {
+            int e = errno ? errno : EADDRINUSE;
+            fwd_teardown(ap);
+            snprintf(o->state, sizeof o->state, "error");
+            errno_text(e, c->host_port, udp ? "UDP" : "TCP", o->code, sizeof o->code, o->msg, sizeof o->msg);
+            return;
+        }
+        if (udp) ap->udp4 = 1;
+        else ap->tcp4 = 1;
+    }
+    ap->on = 1;
+    snprintf(o->state, sizeof o->state, "listening");
+    char a[INET6_ADDRSTRLEN];
+    if (w->show4) {
+        inet_ntop(AF_INET, &w->a4, a, sizeof a);
+        snprintf(o->listen[o->nlisten++], sizeof o->listen[0], "%s:%d", a, c->host_port);
+    }
+    if (!w->has6) return;
+    int e6 = 0;
+    const char *p6 = NULL;
+    struct in_addr target = w->a4; /* the relay's way in: the IPv4 listener (on loopback when it is on every interface) */
+    if (target.s_addr == htonl(INADDR_ANY)) target.s_addr = htonl(INADDR_LOOPBACK);
+    for (int udp = 0; udp <= 1; udp++) {
+        if (!(c->proto & (udp ? HV_FWD_UDP : HV_FWD_TCP))) continue;
+        int e = 0;
+        Bridge *br = bridge_start(udp, &w->a6, c->host_port, target, &e);
+        if (udp) ap->udp6 = br;
+        else ap->tcp6 = br;
+        if (!br && !e6) e6 = e, p6 = udp ? "UDP" : "TCP";
+    }
+    if (ap->tcp6 || ap->udp6) {
+        inet_ntop(AF_INET6, &w->a6, a, sizeof a);
+        snprintf(o->listen[o->nlisten++], sizeof o->listen[0], "[%s]:%d", a, c->host_port);
+    }
+    if (e6) {
+        char code[16], msg[140];
+        errno_text(e6, c->host_port, p6, code, sizeof code, msg, sizeof msg);
+        snprintf(o->warn, sizeof o->warn, "IPv6: %s", msg);
+    }
+}
+
+static int same_place(const Applied *ap, const HvFwdRule *c, const Want *w) {
+    return ap->on && ap->proto == c->proto && ap->host_port == c->host_port && ap->guest_port == c->guest_port &&
+           ap->a4.s_addr == w->a4.s_addr && ap->has6 == w->has6 && (!w->has6 || !memcmp(&ap->a6, &w->a6, 16));
+}
+
+typedef struct Snap {
+    int used, removed, session, dirty, reopen, errored;
+    uint64_t serial;
+    HvFwdRule c;
+    char state[12], msg[160], warn[160], listen0[64];
+} Snap;
+
+/* Make what is open match what the rules want: first close what changed, then open, so a forward that moved
+   (edited, or removed and added again) does not find its own old listener in the way. periodic: the timer's pass,
+   which retries forwards that failed and follows the VPN's address. */
+static void fwd_reconcile(int periodic) {
+    static Snap s[MAX_RULES];
+    static Outcome o[MAX_RULES];
+    static Want w[MAX_RULES];
+    int act[MAX_RULES]; /* 0: as it is, 1: a new state, 2: a new state after opening */
+    pthread_mutex_lock(&fwd_mu);
+    uint64_t gen = fwd_change_gen;
+    int need_vpn = 0;
+    for (int i = 0; i < MAX_RULES; i++) {
+        Rule *r = &rules[i];
+        memset(&s[i], 0, sizeof s[i]);
+        s[i].used = r->used, s[i].removed = r->removed, s[i].session = r->session, s[i].dirty = r->dirty;
+        s[i].reopen = r->reopen;
+        r->reopen = 0;
+        s[i].errored = !strcmp(r->state, "error");
+        s[i].serial = r->serial, s[i].c = r->cfg;
+        memcpy(s[i].state, r->state, sizeof s[i].state);
+        memcpy(s[i].msg, r->msg, sizeof s[i].msg);
+        memcpy(s[i].warn, r->warn, sizeof s[i].warn);
+        memcpy(s[i].listen0, r->nlisten ? r->listen[0] : "", r->nlisten ? sizeof s[i].listen0 : 1);
+        r->dirty = 0;
+        need_vpn |= r->used && !r->removed && r->cfg.enabled && r->cfg.scope == HV_FWD_VPN;
+    }
+    pthread_mutex_unlock(&fwd_mu);
+    VpnAddr vpn;
+    memset(&vpn, 0, sizeof vpn);
+    if (need_vpn) vpn_lookup(&vpn);
+    int off = fwd_rules_off();
+
+    for (int i = 0; i < MAX_RULES; i++) {
+        act[i] = 0;
+        if (!s[i].used) continue;
+        Applied *ap = &rules[i].ap; /* network thread only */
+        HvFwdRule *c = &s[i].c;
+        int suspended = off && !s[i].session;
+        memset(&o[i], 0, sizeof o[i]);
+        act[i] = 1;
+        if (s[i].removed || !c->enabled || suspended) {
+            if (ap->on) fwd_teardown(ap);
+            snprintf(o[i].state, sizeof o[i].state, "off");
+            if (suspended && c->enabled) {
+                snprintf(o[i].code, sizeof o[i].code, "env_off");
+                snprintf(o[i].msg, sizeof o[i].msg, "saved forwards are off (HV_NET_FWD_RULES=0)");
+            }
+            continue;
+        }
+        want_for(c, &vpn, &w[i]);
+        if (!w[i].ok) {
+            if (ap->on) fwd_teardown(ap);
+            snprintf(o[i].state, sizeof o[i].state, "error");
+            snprintf(o[i].code, sizeof o[i].code, "%s", w[i].code);
+            snprintf(o[i].msg, sizeof o[i].msg, "%s", w[i].msg);
+        } else if (!s[i].reopen && (same_place(ap, c, &w[i]) || (!ap->on && s[i].errored && !s[i].dirty && !periodic))) {
+            act[i] = 0; /* as it is (a failed one is tried again on the timer, or when it is changed) */
+        } else {
+            if (ap->on) fwd_teardown(ap);
+            act[i] = 2;
+        }
+    }
+    for (int i = 0; i < MAX_RULES; i++)
+        if (act[i] == 2) fwd_apply(&s[i].c, &w[i], &rules[i].ap, &o[i]);
+
+    pthread_mutex_lock(&fwd_mu);
+    for (int i = 0; i < MAX_RULES; i++) {
+        Rule *r = &rules[i];
+        if (!act[i] || !r->used || r->serial != s[i].serial) continue;
+        if (s[i].removed) {
+            free_rule(r);
+            continue;
+        }
+        set_state(r, o[i].state, o[i].code, o[i].msg);
+        snprintf(r->warn, sizeof r->warn, "%s", o[i].warn);
+        memcpy(r->listen, o[i].listen, sizeof r->listen);
+        r->nlisten = o[i].nlisten;
+    }
+    if (gen > fwd_done_gen) fwd_done_gen = gen;
+    pthread_cond_broadcast(&fwd_cond);
+    pthread_mutex_unlock(&fwd_mu);
+
+    for (int i = 0; i < MAX_RULES; i++) { /* the log: one line when a forward's state changes */
+        if (!act[i] || (!strcmp(s[i].state, o[i].state) && !strcmp(s[i].msg, o[i].msg) && !strcmp(s[i].warn, o[i].warn) &&
+                        !strcmp(s[i].listen0, o[i].nlisten ? o[i].listen[0] : "")))
+            continue;
+        const HvFwdRule *c = &s[i].c;
+        if (s[i].removed)
+            fprintf(stderr, "winvm: net: forward \"%s\" removed\n", c->name);
+        else if (!strcmp(o[i].state, "listening"))
+            fprintf(stderr, "winvm: net: forward \"%s\" %s %s%s%s -> 10.0.2.15:%d%s%s\n", c->name, proto_name(c->proto),
+                    o[i].listen[0], o[i].nlisten > 1 ? " " : "", o[i].nlisten > 1 ? o[i].listen[1] : "", c->guest_port,
+                    o[i].warn[0] ? "; " : "", o[i].warn);
+        else if (!strcmp(o[i].state, "error"))
+            fprintf(stderr, "winvm: net: forward \"%s\" not open: %s\n", c->name, o[i].msg);
+        else if (strcmp(s[i].state, "waiting"))
+            fprintf(stderr, "winvm: net: forward \"%s\" off\n", c->name);
+    }
+}
+
 /* ---- the network thread ---- */
 
 static void *net_thread(void *unused) {
     (void)unused;
+    int64_t fwd_last = now_ms();
     for (;;) {
         uint32_t timeout = 1000;
         int64_t now = now_ms();
@@ -358,26 +1518,13 @@ static void *net_thread(void *unused) {
             char buf[64];
             while (read(wake_pipe[0], buf, sizeof buf) > 0) {}
         }
-        for (;;) {
-            FwdReq req = {0, 0};
-            pthread_mutex_lock(&fwd_mu);
-            if (npending_fwds > 0) req = pending_fwds[--npending_fwds];
-            pthread_mutex_unlock(&fwd_mu);
-            if (!req.host_port) break;
-            int exists = 0;
-            for (int i = 0; i < nactive_fwds; i++)
-                if (active_fwds[i] == req.host_port) exists = 1;
-            if (!exists) {
-                struct in_addr h, g;
-                inet_pton(AF_INET, "127.0.0.1", &h);
-                inet_pton(AF_INET, "10.0.2.15", &g);
-                if (slirp_add_hostfwd(slirp, 0, h, req.host_port, g, req.guest_port) == 0) {
-                    if (nactive_fwds < 64) active_fwds[nactive_fwds++] = req.host_port;
-                    start_ipv6_loopback_bridge(req.host_port);
-                    fprintf(stderr, "winvm: net: forwarded [::1]/127.0.0.1:%d -> 10.0.2.15:%d\n", req.host_port, req.guest_port);
-                }
-            }
-        }
+        pthread_mutex_lock(&fwd_mu);
+        int fwd_changed = fwd_change_gen != fwd_done_gen;
+        pthread_mutex_unlock(&fwd_mu);
+        int64_t t = now_ms();
+        int periodic = t - fwd_last >= FWD_PERIOD_MS;
+        if (periodic) fwd_last = t;
+        if (fwd_changed || periodic) fwd_reconcile(periodic);
         slirp_pollfds_poll(slirp, r < 0, get_revents, NULL);
         now = now_ms();
         for (int i = 0; i < MAX_TIMERS; i++)
@@ -474,27 +1621,41 @@ int hv_net_attach(HvMachine *m, HvVirtioNet *n) {
     hv_dns_proxy_set_nameserver6(v6 ? dns6.s6_addr : NULL);
     hv_dns_proxy_start(); /* before the guest can transmit: queries to 10.0.2.3 (and ::3) go to the host's resolver */
     fprintf(stderr, "winvm: net: IPv4 10.0.2.15/24%s\n", v6 ? ", IPv6 " V6_PREFIX "/64 (SLAAC)" : ", IPv6 off (HV_IPV6=0)");
+    pthread_mutex_lock(&fwd_mu);
+    int have_store = store_path[0] != 0;
+    pthread_mutex_unlock(&fwd_mu);
+    if (!have_store && getenv("HV_NET_FWD_FILE")) hv_net_fwd_set_store(getenv("HV_NET_FWD_FILE")); /* the Mac tool */
     if (getenv("HV_NET_FWD")) {
-        /* TCP forwards into the guest, comma-separated: "hostport:guestport" listens on the host's loopback,
-           "lan:hostport:guestport" on every interface (other devices on the Wi-Fi or a VPN can connect;
-           iOS asks for Local Network access), "a.b.c.d:hostport:guestport" on one IPv4 address. */
+        /* TCP forwards into the guest for this session, comma-separated: "hostport:guestport" listens on the
+           host's loopback, "lan:hostport:guestport" on every interface (other devices on the Wi-Fi or a VPN can
+           connect; iOS asks for Local Network access), "vpn:hostport:guestport" on the VPN's address; these are
+           session forwards in the list (IPv4 and IPv6). "a.b.c.d:hostport:guestport" listens on one IPv4
+           address, outside the list. */
         char spec[256];
         snprintf(spec, sizeof spec, "%s", getenv("HV_NET_FWD"));
         char *save = NULL;
         for (char *item = strtok_r(spec, ", ", &save); item; item = strtok_r(NULL, ", ", &save)) {
-            char bind[64] = "127.0.0.1";
+            char bind[64] = "loopback";
             int hp = 0, gp = 0;
             if (sscanf(item, "%d:%d", &hp, &gp) == 2 && !strchr(strchr(item, ':') + 1, ':')) {
                 /* loopback */
-            } else if (sscanf(item, "%63[^:]:%d:%d", bind, &hp, &gp) == 3) {
-                if (!strcmp(bind, "lan")) snprintf(bind, sizeof bind, "0.0.0.0");
-            } else {
+            } else if (sscanf(item, "%63[^:]:%d:%d", bind, &hp, &gp) != 3) {
                 fprintf(stderr, "winvm: net: HV_NET_FWD: cannot read \"%s\"\n", item);
                 continue;
             }
+            int scope = !strcmp(bind, "loopback") ? HV_FWD_LOOPBACK : !strcmp(bind, "lan") ? HV_FWD_LAN
+                      : !strcmp(bind, "vpn") ? HV_FWD_VPN : -1;
             struct in_addr h, g;
-            if (hp < 1 || hp > 65535 || gp < 1 || gp > 65535 || inet_pton(AF_INET, bind, &h) != 1) {
+            if (hp < 1 || hp > 65535 || gp < 1 || gp > 65535 || (scope < 0 && inet_pton(AF_INET, bind, &h) != 1)) {
                 fprintf(stderr, "winvm: net: HV_NET_FWD: bad forward \"%s\"\n", item);
+                continue;
+            }
+            if (scope >= 0) {
+                HvFwdRule r = {.proto = HV_FWD_TCP, .host_port = hp, .guest_port = gp, .scope = scope, .enabled = 1};
+                char err[160];
+                snprintf(r.name, sizeof r.name, "HV_NET_FWD %s%s%d", scope ? bind : "", scope ? ":" : "", hp);
+                if (hv_net_fwd_put(&r, HV_FWD_SESSION, err, sizeof err) != 0)
+                    fprintf(stderr, "winvm: net: HV_NET_FWD: no forward for \"%s\": %s\n", item, err);
                 continue;
             }
             inet_pton(AF_INET, "10.0.2.15", &g);
@@ -509,6 +1670,10 @@ int hv_net_attach(HvMachine *m, HvVirtioNet *n) {
         inet_pton(AF_INET, HV_SHARE_ADDR, &addr);
         if (slirp_add_unix(slirp, share_socket, &addr, 80) != 0) fprintf(stderr, "hengevm: net: no route to the shared folder\n");
     }
+    pthread_mutex_lock(&fwd_mu);
+    net_running = 1; /* from here on the network thread opens and closes the forwards */
+    fwd_changed_locked();
+    pthread_mutex_unlock(&fwd_mu);
     net = n;
     n->transmit = transmit;
     pthread_t t;
