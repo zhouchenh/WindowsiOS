@@ -1280,7 +1280,7 @@ static int host_zva_is_64(void) {
     return known;
 }
 
-/* IC IVAU at EL1 (xnu: 100K+ a second), without the helper when the page holds
+/* IC IVAU (xnu at EL1: 100K+ a second; JITs at EL0), without the helper when the page holds
    no translated code: look the address up like a load, find its host page, and
    check the main RAM's code-page flags. A TLB miss, another RAM region or a
    code page take the helper, which invalidates. */
@@ -1294,7 +1294,7 @@ static void translate_ic_ivau(Emit *e, uint32_t insn, uint64_t pc) {
     spill(e, s, 3);
     if (is_stolen(rt)) put(e, LDR_X(A, 28, slot_of(rt)));
     else put(e, MOV_X(A, rt)); /* rt 31 is XZR here */
-    int el_idx = (e->flags & HV_BLOCK_PAN) ? 2 : 1;
+    int el_idx = !(e->flags & HV_BLOCK_EL1) ? 0 : (e->flags & HV_BLOCK_PAN) ? 2 : 1;
     uint32_t tlb = put_tlb_slot(e, T, A, el_idx);
     put(e, LDR_X(U, T, tlb + 0)); /* read tag */
     put(e, SUB_X(U, A, U));
@@ -1785,7 +1785,7 @@ static int translate_one(Emit *e, uint32_t insn, uint64_t pc) {
             return 0;
         }
         if (crn == 7 && op1 == 3 && crm == 5 && op2 == 1 && !hv_ic_ivau_drops()) return 0; /* IC IVAU: nothing to do, see there */
-        if (crn == 7 && op1 == 3 && crm == 5 && op2 == 1 && (e->flags & HV_BLOCK_EL1) && !e->slow_mem && e->m->main_ram) {
+        if (crn == 7 && op1 == 3 && crm == 5 && op2 == 1 && !e->slow_mem && e->m->main_ram) {
             translate_ic_ivau(e, insn, pc);
             return 0;
         }

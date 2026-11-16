@@ -14,6 +14,8 @@ DECLARE_PROGRAM(long_block);
 DECLARE_PROGRAM(pstate_bits);
 DECLARE_PROGRAM(pac);
 DECLARE_PROGRAM(flagm);
+DECLARE_PROGRAM(smc_call);
+DECLARE_PROGRAM(smc_ivau);
 extern const char jit_programs_begin[], jit_programs_finish[];
 
 static const TestProgram programs[] = {
@@ -22,6 +24,10 @@ static const TestProgram programs[] = {
     TEST_PROGRAM(stolen),  TEST_PROGRAM(pcrel),  TEST_PROGRAM(long_block), TEST_PROGRAM(pstate_bits),
     TEST_PROGRAM(flagm),
 };
+
+static void set_el0(HvCpu *cpu) {
+    cpu->el = 0;
+}
 
 int main(void) {
     setvbuf(stdout, NULL, _IONBF, 0);
@@ -71,6 +77,37 @@ int main(void) {
         if (!bad) bad = compare_cpus("pac", &want, &jit);
         printf("%-12s       : %s\n", "pac", bad ? "FAIL" : "ok");
         failed += bad != 0;
+    }
+    /* IC IVAU after code changed without the translator seeing the store (as when a store passed its TLB
+       write check just before another CPU marked the page as code): the guest's IC IVAU must drop the
+       stale translation, at EL1 and EL0. The code lives in the largest RAM, so the inline check runs. */
+    {
+        static const TestProgram call = TEST_PROGRAM(smc_call), ivau = TEST_PROGRAM(smc_ivau);
+        size_t code_bytes = 256 << 10;
+        uint32_t *code = aligned_alloc(16384, code_bytes);
+        memset(code, 0, code_bytes);
+        uint64_t code_pa = (uint64_t)(uintptr_t)code;
+        hv_machine_add_ram(&m, code_pa, code_bytes, code, 0);
+        for (int el = 1; el >= 0; el--) {
+            static HvCpu init, jit;
+            uint32_t *fn = code + 1024 * (el + 1); /* its own page per EL */
+            uint32_t w[2] = {0xd2800000u | (uint32_t)(10 + el) << 5, 0xd65f03c0u}; /* movz x0, #10+el; ret */
+            hv_phys_write(&m, (uint64_t)(uintptr_t)fn, w, sizeof w);
+            memset(&init, 0, sizeof init);
+            seed_cpu(&init, 77 + el, sp);
+            init.x[1] = (uint64_t)(uintptr_t)fn;
+            void (*setup)(HvCpu *) = el ? NULL : set_el0;
+            int bad = run_jit(&m, &call, &init, &jit, setup);
+            bad |= jit.x[0] != (uint64_t)(10 + el);
+            fn[0] = 0xd2800000u | (uint32_t)(20 + el) << 5; /* movz x0, #20+el, written unseen */
+            bad |= run_jit(&m, &ivau, &init, &jit, setup);
+            if (jit.x[0] != (uint64_t)(20 + el)) {
+                printf("  smc_ivau EL%d: x0 %llu, expected %d (the stale translation ran)\n", el, (unsigned long long)jit.x[0], 20 + el);
+                bad = 1;
+            }
+            printf("%-12s EL%d   : %s\n", "smc_ivau", el, bad ? "FAIL" : "ok");
+            failed += bad != 0;
+        }
     }
     /* Again with a JIT region so small that it fills (and everything is flushed)
        in the middle of a program, chains pending and all. */

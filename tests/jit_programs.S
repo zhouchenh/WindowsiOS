@@ -245,6 +245,22 @@ PROGRAM flagm
     mrs x16, nzcv
 END flagm
 
+// Code changed behind the translator's back (a store that raced another CPU marking the page as
+// code), then the IC IVAU a guest JIT issues after writing code: the call must run the new code.
+// x1 points at the code (test_jit.c writes it).
+PROGRAM smc_call
+    blr x1
+END smc_call
+
+PROGRAM smc_ivau
+    dc cvau, x1
+    dsb ish
+    ic ivau, x1
+    dsb ish
+    isb
+    blr x1
+END smc_ivau
+
 // More instructions than one block holds.
 // DIT is a PSTATE bit the translator reads and writes inline; x6 and x7 live in the HvCpu.
 PROGRAM pstate_bits
