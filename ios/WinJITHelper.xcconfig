@@ -1,0 +1,13 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
+//
+// Signing settings of the WinJITHelper app extension (Built-in JIT's debugger, docs/builtin-jit.md).
+// Same team and signing style as the app (Signing.xcconfig and your Signing.local.xcconfig), and a
+// bundle id under the app's: <app bundle id>.JITHelper. With a free personal team that is a second
+// App ID, which Xcode registers by itself (Automatic signing).
+//
+// No entitlements: the helper is the debugger, not the debugged app, and needs none of the app's.
+
+#include "Signing.xcconfig"
+
+PRODUCT_BUNDLE_IDENTIFIER = $(inherited).JITHelper
+CODE_SIGN_ENTITLEMENTS =

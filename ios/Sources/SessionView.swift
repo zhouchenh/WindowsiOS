@@ -468,10 +468,10 @@ private struct LaunchPage: View {
                         title: "JIT",
                         detail: vm.isJITLive
                             ? L("已开启", "Enabled")
-                            : L("请通过 StikDebug 开启 JIT", "Please enable JIT with StikDebug")
+                            : L("请开启 JIT（StikDebug 或内置）", "Please enable JIT (StikDebug or built-in)") // builtin-jit hook
                     ) {
                         if !vm.isJITLive {
-                            Button(L("用 StikDebug 开启", "Enable with StikDebug")) { JITSetup.shared.enable() } // app-jit hook
+                            JITEnableButton() // builtin-jit hook: StikDebug or the built-in helper
                                 .buttonStyle(.bordered)
                             JITPanel() // app-jit hook
                         }

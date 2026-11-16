@@ -2,6 +2,10 @@
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
+	<key>BGTaskSchedulerPermittedIdentifiers</key>
+	<array>
+		<string>$(PRODUCT_BUNDLE_IDENTIFIER).pairing.*</string>
+	</array>
 	<key>CADisableMinimumFrameDurationOnPhone</key>
 	<true/>
 	<key>CFBundleDevelopmentRegion</key>
@@ -52,9 +56,11 @@
 	<key>NSBonjourServices</key>
 	<array>
 		<string>_applevm._tcp</string>
+		<string>_remotepairing-pairable-host._tcp</string>
+		<string>_remotepairing._tcp</string>
 	</array>
 	<key>NSLocalNetworkUsageDescription</key>
-	<string>Lets other devices on your network or VPN connect to Windows through port forwards you set up (for example SSH or Remote Desktop).</string>
+	<string>Pairs this iPhone with Apple VM for Built-in JIT, and lets other devices on your network or VPN reach Windows through port forwards you set up (for example SSH or Remote Desktop).</string>
 	<key>NSMicrophoneUsageDescription</key>
 	<string>Windows uses the microphone for voice input and audio recording.</string>
 	<key>UIBackgroundModes</key>
