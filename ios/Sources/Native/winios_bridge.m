@@ -1871,7 +1871,11 @@ static NSString *winios_take_json(char *s, NSString *fallback) {
     [self usePortForwardsOfCurrentMachine];
     HvFwdRule r = {0};
     snprintf(r.id, sizeof r.id, "%s", forwardID.UTF8String ?: "");
-    snprintf(r.name, sizeof r.name, "%s", name.UTF8String ?: "");
+    /* a long name is cut at a character boundary (a CJK name past ~21 characters), not inside one */
+    NSString *fit = name ?: @"";
+    while (fit.length && strlen(fit.UTF8String ?: "") >= sizeof r.name)
+        fit = [fit substringToIndex:[fit rangeOfComposedCharacterSequenceAtIndex:fit.length - 1].location];
+    snprintf(r.name, sizeof r.name, "%s", fit.UTF8String ?: "");
     r.proto = (int)protocols;
     r.host_port = (int)MAX(MIN(hostPort, 70000), -1);
     r.guest_port = (int)MAX(MIN(guestPort, 70000), -1);

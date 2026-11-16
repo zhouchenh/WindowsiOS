@@ -613,6 +613,61 @@ static int scenario_rules(void) {
     return failures != 0;
 }
 
+/* s is entirely UTF-8. */
+static int utf8_ok(const char *s) {
+    const unsigned char *p = (const unsigned char *)s;
+    while (*p) {
+        int n = *p < 0x80 ? 1 : (*p & 0xe0) == 0xc0 ? 2 : (*p & 0xf0) == 0xe0 ? 3 : (*p & 0xf8) == 0xf0 ? 4 : 0;
+        if (!n) return 0;
+        for (int i = 1; i < n; i++)
+            if ((p[i] & 0xc0) != 0x80) return 0;
+        p += n;
+    }
+    return 1;
+}
+
+/* Names that are not UTF-8, or cut inside a character, never reach the list or the file as such: one would
+   make the app's whole list unreadable (it showed none of the forwards, and none could be turned off). */
+static int scenario_utf8(void) {
+    char path[512], err[160], json[256];
+    store_file(path, sizeof path, "utf8.json");
+    unsetenv("HV_NET_FWD");
+    check("utf8: store", hv_net_fwd_set_store(path) == 0);
+    /* the guest's raw byte 0xff in a name (POST /.henge/forwards) */
+    int p_guest = free_port();
+    snprintf(json, sizeof json, "{\"hostPort\":%d,\"guestPort\":7,\"name\":\"a\xff\"}", p_guest);
+    HvFwdRule g = {.proto = HV_FWD_TCP, .enabled = 1};
+    check("utf8: guest rule parsed", hv_net_fwd_parse_rule(json, strlen(json), &g) == 0);
+    check("utf8: guest rule taken", hv_net_fwd_put(&g, HV_FWD_GUEST, err, sizeof err) == 0);
+    /* a CJK name cut at 63 bytes inside a character: raw in JSON, and as the app copies it */
+    char cjk[256] = "a";
+    for (int i = 0; i < 30; i++) strcat(cjk, "\xe4\xb8\xad");
+    int p_raw = free_port();
+    snprintf(json, sizeof json, "{\"hostPort\":%d,\"guestPort\":7,\"name\":\"%s\"}", p_raw, cjk);
+    HvFwdRule raw = {.proto = HV_FWD_TCP, .enabled = 1};
+    check("utf8: long raw name parsed", hv_net_fwd_parse_rule(json, strlen(json), &raw) == 0);
+    check("utf8: long raw name cut at a character", utf8_ok(raw.name) && strlen(raw.name) == 61);
+    check("utf8: long raw name taken", hv_net_fwd_put(&raw, HV_FWD_GUEST, err, sizeof err) == 0);
+    HvFwdRule app = rule("cjk", HV_FWD_TCP, free_port(), 7, HV_FWD_LOOPBACK);
+    snprintf(app.name, sizeof app.name, "%s", cjk); /* cut by snprintf at 63 bytes */
+    put(app);
+    /* a stray byte in the middle */
+    HvFwdRule mid = rule("mid", HV_FWD_TCP, free_port(), 7, HV_FWD_LOOPBACK);
+    snprintf(mid.name, sizeof mid.name, "x\x80y\xc3");
+    put(mid);
+    char *all = hv_net_fwd_list_json();
+    check("utf8: the list is UTF-8", all && utf8_ok(all));
+    check("utf8: a stray byte becomes ?", all && strstr(all, "\"name\":\"a?\"") && strstr(all, "\"name\":\"x?y\""));
+    check("utf8: every forward still listed", all && strstr(all, g.id) && strstr(all, raw.id) && strstr(all, "\"cjk\"") &&
+                                                  strstr(all, "\"mid\""));
+    free(all);
+    const char *text = read_file(path);
+    check("utf8: the file is UTF-8", text && utf8_ok(text) && strstr(text, "\"id\": \"cjk\""));
+    printf("fwd (utf8): %d failures\n", failures);
+    fflush(stdout);
+    return failures != 0;
+}
+
 static int scenario_bad_store(void) {
     char path[512], moved[600];
     store_file(path, sizeof path, "bad.json");
@@ -671,10 +726,10 @@ int main(void) {
     const char *tmp = getenv("TMPDIR");
     snprintf(dir, sizeof dir, "%s/test_net_fwd.XXXXXX", tmp && *tmp ? tmp : "/tmp");
     if (!mkdtemp(dir)) return 2;
-    int (*scenarios[])(void) = {scenario_rules, scenario_bad_store, scenario_rules_off};
-    const char *names[] = {"rules", "damaged store", "HV_NET_FWD_RULES=0"};
+    int (*scenarios[])(void) = {scenario_rules, scenario_bad_store, scenario_rules_off, scenario_utf8};
+    const char *names[] = {"rules", "damaged store", "HV_NET_FWD_RULES=0", "UTF-8 names"};
     int bad = 0;
-    for (int i = 0; i < 3; i++) {
+    for (int i = 0; i < (int)(sizeof scenarios / sizeof *scenarios); i++) {
         fflush(stdout);
         pid_t pid = fork();
         if (pid < 0) return 2;

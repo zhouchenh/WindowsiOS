@@ -327,6 +327,52 @@ static void bput(Buf *b, const char *s, size_t n) {
     b->p[b->n] = 0;
 }
 static void bstr(Buf *b, const char *s) { bput(b, s, strlen(s)); }
+
+/* ---- UTF-8: names come from people and from the guest, and the list goes to JSON readers that refuse
+   anything else (NSString gives nil for the whole list) ---- */
+
+/* The length of the valid UTF-8 sequence at p (n bytes left), or 0: a stray or cut sequence, an overlong
+   one, a surrogate, past U+10FFFF. */
+static size_t utf8_seq(const unsigned char *p, size_t n) {
+    if (!n) return 0;
+    unsigned c = p[0], cp, min;
+    size_t len;
+    if (c < 0x80) return 1;
+    if ((c & 0xe0) == 0xc0) len = 2, cp = c & 0x1f, min = 0x80;
+    else if ((c & 0xf0) == 0xe0) len = 3, cp = c & 0x0f, min = 0x800;
+    else if ((c & 0xf8) == 0xf0) len = 4, cp = c & 0x07, min = 0x10000;
+    else return 0;
+    if (n < len) return 0;
+    for (size_t i = 1; i < len; i++) {
+        if ((p[i] & 0xc0) != 0x80) return 0;
+        cp = cp << 6 | (p[i] & 0x3f);
+    }
+    if (cp < min || cp > 0x10ffff || (cp >= 0xd800 && cp < 0xe000)) return 0;
+    return len;
+}
+
+/* A string cut to fit may end inside a character (a lead byte with fewer continuation bytes after it than
+   it announces): that piece goes. Bytes that start no character at all are left to utf8_repair. */
+static void utf8_trim_cut(char *s) {
+    size_t n = strlen(s), i = n;
+    while (i > 0 && n - i < 3 && ((unsigned char)s[i - 1] & 0xc0) == 0x80) i--; /* back over continuation bytes */
+    if (!i) return;
+    unsigned c = (unsigned char)s[i - 1];
+    size_t want = c >= 0xc2 && c <= 0xdf ? 2 : c >= 0xe0 && c <= 0xef ? 3 : c >= 0xf0 && c <= 0xf4 ? 4 : 0;
+    if (want && n - (i - 1) < want) s[i - 1] = 0;
+}
+
+/* In place: cut at a character boundary, and every byte that does not start a valid character becomes '?'
+   (the string keeps its size). */
+static void utf8_repair(char *s) {
+    utf8_trim_cut(s);
+    size_t n = strlen(s);
+    for (size_t i = 0; i < n;) {
+        size_t k = utf8_seq((const unsigned char *)s + i, n - i);
+        if (!k) s[i] = '?', k = 1;
+        i += k;
+    }
+}
 static void bint(Buf *b, long v) {
     char t[24];
     snprintf(t, sizeof t, "%ld", v);
@@ -342,8 +388,13 @@ static void bjson(Buf *b, const char *s) { /* a JSON string */
             char e[8];
             snprintf(e, sizeof e, "\\u%04x", *p);
             bstr(b, e);
-        } else {
+        } else if (*p < 0x80) {
             bput(b, (const char *)p, 1);
+        } else {
+            /* never anything but UTF-8: one bad name must not make a whole list unreadable */
+            size_t k = utf8_seq(p, strlen((const char *)p));
+            if (k) bput(b, (const char *)p, k), p += k - 1;
+            else bstr(b, "\\ufffd");
         }
     }
     bput(b, "\"", 1);
@@ -387,17 +438,19 @@ static int jhex4(JP *j, unsigned *v) {
     }
     return 1;
 }
-/* A string into out (cap > 0), cut to fit. */
+/* A string into out (cap > 0), cut to fit, at a character boundary. */
 static int jstr(JP *j, char *out, size_t cap) {
     jws(j);
     if (j->p >= j->end || *j->p != '"') return 0;
     j->p++;
     size_t o = 0;
+    int cut = 0;
     while (j->p < j->end && *j->p != '"') {
         unsigned char c = (unsigned char)*j->p++;
         if (c < 0x20) return 0;
         if (c != '\\') {
             if (o + 1 < cap) out[o++] = (char)c;
+            else cut = 1;
             continue;
         }
         if (j->p >= j->end) return 0;
@@ -428,6 +481,7 @@ static int jstr(JP *j, char *out, size_t cap) {
     if (j->p >= j->end) return 0;
     j->p++;
     out[o < cap ? o : cap - 1] = 0;
+    if (cut) utf8_trim_cut(out); /* raw bytes cut inside a character */
     return 1;
 }
 static int jnum(JP *j, long *v) {
@@ -967,6 +1021,7 @@ static int put_locked(HvFwdRule *in, int session, int from_guest, char *err, siz
     HvFwdRule c = *in;
     c.name[sizeof c.name - 1] = 0;
     c.id[sizeof c.id - 1] = 0;
+    utf8_repair(c.name); /* from the guest or a file: whatever bytes; cut by a caller inside a character */
     if (c.proto < HV_FWD_TCP || c.proto > HV_FWD_BOTH) return snprintf(err, errlen, "unknown protocol"), -1;
     if (c.host_port < 1 || c.host_port > 65535 || c.guest_port < 1 || c.guest_port > 65535)
         return snprintf(err, errlen, "ports go from 1 to 65535"), -1;
