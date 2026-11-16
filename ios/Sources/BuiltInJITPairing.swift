@@ -304,11 +304,20 @@ import UserNotifications
                              subtitle: L("在本机输入以与 Apple VM 配对", "Enter it on this \(Self.deviceKind) to pair with Apple VM"))
             task.progress.completedUnitCount = 1
         }
-        task.expirationHandler = {
+        // The user stopped the task from its progress UI, or iOS ended it. It has to be marked complete
+        // before it expires or iOS may kill the app, so here rather than in endBackground(), which no
+        // longer sees it once `continued` is cleared. On the main thread, where `continued` is only
+        // changed, so it is completed once: by this, or by endBackground() if that ran first.
+        task.expirationHandler = { [weak task] in
             DispatchQueue.main.async {
                 MainActor.assumeIsolated {
-                    OnDevicePairing.shared.continued = nil
-                    OnDevicePairing.shared.cancel(reason: L("iOS 在后台停止了配对，请重试。", "iOS stopped the pairing in the background. Try again."))
+                    let pairing = OnDevicePairing.shared
+                    if let task, pairing.continued === task {
+                        pairing.continued = nil
+                        task.setTaskCompleted(success: false)
+                        pairing.log("continued-processing expired")
+                    }
+                    pairing.cancel(reason: L("iOS 在后台停止了配对，请重试。", "iOS stopped the pairing in the background. Try again."))
                 }
             }
         }
