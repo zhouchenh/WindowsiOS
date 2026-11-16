@@ -76,7 +76,7 @@ static int init_rest(HvMachine *m) {
     knob_env(HV_K_FASTICACHE, 1); /* on unless its variable says 0 */
     /* Henge 94ca6a9 (its first part): a process's id in the branch cache (asid_cid) also goes with the table base its
        ASID had, so an ASID back with another TTBR0 base, with no TLBI by ASID in between, starts with no cached targets. */
-    knob_env(HV_K_IJCTTBKEY, 0);
+    knob_env(HV_K_IJCTTBKEY, 1); /* on unless its variable says 0 */
     /* Henge 061b250 (its first part): a whole-TLB flush clears the entries logged since the last one (user_fills,
        kernel_fills) instead of all four tables, and a user branch-cache reset the ASIDs given ids since the last one
        (asid_log) instead of all 64K. The large-page filters are still cleared whole. */
