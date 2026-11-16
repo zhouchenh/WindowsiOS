@@ -485,6 +485,21 @@ static void test_walk_log(HvMachine *m, HvCpu *cpu, HvCpu *cpu1) {
         memset(p->large_2m_bloom, 0, sizeof p->large_2m_bloom);
         memset(p->large_big_bloom, 0, sizeof p->large_big_bloom);
     }
+    /* A finished walk of another page of the same 2 MB block, filled for real (tlb_fill sets the filter bit from the
+       VA as accessed, 0xffff... in the kernel half): the recheck must find that bit, in both halves. */
+    const struct { const char *what; uint64_t block; int table; } blocks[] = {
+        {"the user half", UBLOCKS, 0},
+        {"the kernel half", KBLOCKS, 1},
+    };
+    for (size_t i = 0; i < sizeof blocks / sizeof blocks[0]; i++) {
+        hv_tlb_flush(cpu1); /* the filters clear */
+        p->walk_seq = 2 * k0;
+        tlb_touch(cpu1, blocks[i].block + (300 << 12), 1, blocks[i].table, 1); /* walk k0, now finished */
+        int got = hv_walks_elsewhere(cpu1, 2 * k0, 2 * k0 + 2, blocks[i].block + (10 << 12), 1);
+        check_that(p->walk_seq == 2 * k0 + 2 && !got, "walk log, %s: a finished walk filling from the TLBI's 2 MB block let through",
+                   blocks[i].what);
+    }
+    hv_tlb_flush(cpu1);
     /* The whole drop, with a walk of the kernel half running there: done from here with the log. */
     p->walk_seq = 2 * k0;
     tlb_touch(cpu1, P, 1, 0, 1);

@@ -863,8 +863,11 @@ int hv_walks_elsewhere(HvCpu *target, uint32_t s1, uint32_t s2, uint64_t va, uin
     __atomic_thread_fence(__ATOMIC_ACQUIRE);
     uint32_t s3 = __atomic_load_n(&p->walk_seq, __ATOMIC_SEQ_CST);
     if ((s3 >> 1) - k1 >= WALK_LOG) return 0;
-    /* A finished walk of a page of a large mapping holding one of the pages: its filter bit, set before walk_end. */
-    if (bloom_hit(p, lo) || bloom_hit(p, (lo + span - 1) & m56)) return 0;
+    /* A finished walk of a page of a large mapping holding one of the pages: its filter bit, set before walk_end.
+       Hashed from the VA as tlb_fill hashes it (and every other filter reader), not the 56-bit form of the log: a
+       kernel page is 0xffff... there. */
+    uint64_t full = va & ~(uint64_t)PAGE_MASK;
+    if (bloom_hit(p, full) || bloom_hit(p, full + span - 1)) return 0;
     if (target->m && target->m->stats_interval) target->m->stats.race_other_page++;
     return 1;
 }
