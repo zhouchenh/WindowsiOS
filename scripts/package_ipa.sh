@@ -151,6 +151,7 @@ if [ "$TIPA" = 1 ]; then cp "$IPA" "$OUT_DIR/$NAME.tipa"; fi
 echo
 echo "IPA:          $IPA ($(du -h "$IPA" | cut -f1 | tr -d ' '))"
 if [ "$TIPA" = 1 ]; then echo "TIPA:         $OUT_DIR/$NAME.tipa"; fi
+echo "size:         $(stat -f %z "$IPA") bytes"
 echo "sha256:       $(shasum -a 256 "$IPA" | cut -d' ' -f1)"
 echo "bundle id:    $BID, version $VER, iOS $MINOS+"
 echo "entitlements: $(basename "$ENTITLEMENTS") (ad-hoc signed)"
