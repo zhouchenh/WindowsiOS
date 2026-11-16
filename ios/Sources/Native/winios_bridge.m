@@ -18,6 +18,9 @@
 
 static WinIOSBridge *s_shared_bridge = nil;
 
+NSNotificationName const WinIOSDisplayStateDidChangeNotification = @"WinIOSDisplayStateDidChangeNotification";
+NSNotificationName const WinIOSDisplayWillReshapeNotification = @"WinIOSDisplayWillReshapeNotification";
+
 @interface WinIOSBridge () {
     BOOL _vmRunning;
     BOOL _unpacking;
@@ -44,6 +47,28 @@ static WinIOSBridge *s_shared_bridge = nil;
     NSInteger _hingeStatus;
     double _hingeAngleDegrees;
     BOOL _pausedInBackground;   /* the guest was stopped because the app went to the background */
+
+    /* display sizing engine (main thread) */
+    CGFloat _viewNativeScale;
+    NSInteger _displayPreset, _displaySharpness;
+    BOOL _displayImmersive, _immersiveKeeps;
+    WinIOSDisplayPlan _committedPlan; /* sent to Windows (or to be sent at start) */
+    CGSize _committedViewPts;
+    WinIOSDisplayPlan _pendingPlan;
+    CGSize _pendingViewPts;
+    BOOL _hasPending, _reshapeAnnounced;
+    WinIOSReshapeState _reshapeState;
+    CFAbsoluteTime _reshapeStart;
+    NSTimer *_reshapeWatch;
+    BOOL _guestFollowsModes;
+    NSUInteger _remodeCount;
+    double _lastReshapeMs;
+    WinIOSDisplayApplied _applied;
+    NSDate *_appliedStamp;
+    /* input the app has sent down, lifted on a reshape */
+    double _tabletX, _tabletY;
+    uint8_t _tabletButtons;
+    uint8_t _keysDown[32];
 }
 - (void)handleVMExitWithReason:(NSString *)reason;
 - (void)updateUnpackProgress:(double)frac;
@@ -142,6 +167,10 @@ static void winios_capture_stderr(NSString *docs) {
         BOOL safariDefault = ([ud objectForKey:@"winios.safariOAuthV2"] == nil) ? YES : [ud boolForKey:@"winios.safariOAuthV2"];
         hv_share_set_url_handler_enabled(safariDefault ? 1 : 0);
         _hiDPIDisplay = [ud boolForKey:@"winios.hiDPIDisplay"];
+        _displayPreset = 1;     /* DisplaySettings.swift pushes the saved choices at launch */
+        _displaySharpness = 0;
+        _guestFollowsModes = YES;
+        _tabletX = _tabletY = 0.5;
         dispatch_queue_attr_t attr = dispatch_queue_attr_make_with_qos_class(DISPATCH_QUEUE_SERIAL, QOS_CLASS_UTILITY, 0);
         _diagQueue = dispatch_queue_create("me.ammaar.windowsios.diag", attr);
         NSNotificationCenter *nc = [NSNotificationCenter defaultCenter];
@@ -257,7 +286,9 @@ static void winios_capture_stderr(NSString *docs) {
     os_unfair_lock_unlock(&_metricsLock);
 }
 
-/* Points -> a mode virtio-gpu accepts: at least 960x600 (scaled up, aspect kept), even sizes. */
+static BOOL winios_machine_is_linux(void);
+
+/* Points -> a mode virtio-gpu accepts: at least 960x600 (scaled up, aspect kept), even sizes. (Legacy sizing.) */
 static void winios_gpu_mode_for(CGSize pts, uint32_t *w, uint32_t *h) {
     double fw = pts.width, fh = pts.height;
     if (fw < 1 || fh < 1) { *w = *h = 0; return; }
@@ -268,54 +299,439 @@ static void winios_gpu_mode_for(CGSize pts, uint32_t *w, uint32_t *h) {
     *h = ((uint32_t)fh) & ~1u;
 }
 
-/* The size the guest should use, where the guest-side setup script reads it (http://10.0.2.4/res.txt). */
-- (void)publishWantedResolution:(uint32_t)w height:(uint32_t)h {
-    if (!w || !h) return;
+/* ---- Display sizing: the guest mode is the picture area in native panel pixels / k, and Windows' scale
+   is chosen with it so the workspace keeps a usable size (UX study, section 4.2).
+     P = the view in native pixels (bounds x nativeScale), even
+     k = 1 Sharp (1:1 pixels) or 2 Balanced (exactly half, shown at 2x)
+     G = even(P / k), the mode Windows gets
+     preset factor f / floor F: Larger Text 1.10 / 600, Default 0.92 / 680, More Space 0.74 / 820
+     s_pref = the scale step nearest to 100 x nativeScale x f
+     s = the largest step <= max(100, s_pref / k) with min(G) / (s / 100) >= F; none: 100% and the preset
+         is not available here (Balanced then falls back to Sharp)
+   Windows' workspace is G / (s / 100): the "Looks like" readout. ---- */
+static const uint32_t kWinScaleSteps[] = {100, 125, 150, 175, 200, 225, 250, 300, 350};
+#define WINIOS_NSTEPS (sizeof kWinScaleSteps / sizeof *kWinScaleSteps)
+static const double kPresetFactor[3] = {1.10, 0.92, 0.74};
+static const double kPresetFloor[3] = {600.0, 680.0, 820.0};
+
+static uint32_t winios_even(double v) { return v < 2 ? 0 : ((uint32_t)v) & ~1u; }
+
+static WinIOSDisplayPlan winios_plan_k(uint32_t pw, uint32_t ph, double n, NSInteger preset, int k) {
+    WinIOSDisplayPlan p = {0};
+    p.pictureWidth = pw; p.pictureHeight = ph; p.sharpness = k;
+    uint32_t gw = winios_even((double)pw / k), gh = winios_even((double)ph / k);
+    BOOL grown = gw < 640 || gh < 480;
+    if (grown) { /* virtio-gpu's smallest mode (Balanced is then no exact 2x: not offered, see below) */
+        double up = fmax(640.0 / fmax(gw, 1), 480.0 / fmax(gh, 1));
+        gw = winios_even(ceil(gw * up) + 1); gh = winios_even(ceil(gh * up) + 1);
+    }
+    if (gw > 8192 || gh > 8192) {
+        double dn = fmin(8192.0 / gw, 8192.0 / gh);
+        gw = winios_even(gw * dn); gh = winios_even(gh * dn);
+    }
+    p.modeWidth = gw; p.modeHeight = gh;
+    double want = 100.0 * n * kPresetFactor[preset];
+    uint32_t pref = kWinScaleSteps[0];
+    for (size_t i = 0; i < WINIOS_NSTEPS; i++)
+        if (fabs(kWinScaleSteps[i] - want) < fabs(pref - want)) pref = kWinScaleSteps[i];
+    double target = fmax(100.0, (double)pref / k);
+    uint32_t s = 0;
+    for (size_t i = WINIOS_NSTEPS; i-- > 0;) {
+        uint32_t st = kWinScaleSteps[i];
+        if (st <= target + 0.001 && fmin(gw, gh) * 100.0 / st >= kPresetFloor[preset]) { s = st; break; }
+    }
+    p.available = s != 0 && !(grown && k > 1);
+    p.scalePercent = s ? s : 100;
+    p.lookWidth = (uint32_t)lround(gw * 100.0 / p.scalePercent);
+    p.lookHeight = (uint32_t)lround(gh * 100.0 / p.scalePercent);
+    return p;
+}
+
+static WinIOSDisplayPlan winios_plan(CGSize pts, double n, NSInteger preset, NSInteger sharpness) {
+    if (n <= 0) n = 2.0;
+    if (preset < 0 || preset > 2) preset = 1;
+    uint32_t pw = winios_even(floor(pts.width * n + 0.01)), ph = winios_even(floor(pts.height * n + 0.01));
+    if (!pw || !ph) return (WinIOSDisplayPlan){0};
+    int k = sharpness == 1 ? 1 : sharpness == 2 ? 2 : ((double)pw * ph > 2.6e6 ? 2 : 1);
+    WinIOSDisplayPlan p = winios_plan_k(pw, ph, n, preset, k);
+    if (k == 2 && !p.available) p = winios_plan_k(pw, ph, n, preset, 1); /* Balanced only where it fits */
+    return p;
+}
+
+static BOOL winios_plans_equal(WinIOSDisplayPlan a, WinIOSDisplayPlan b) {
+    return a.modeWidth == b.modeWidth && a.modeHeight == b.modeHeight && a.scalePercent == b.scalePercent &&
+           a.legacy == b.legacy;
+}
+
+/* The size the guest should use, where the guest-side helper reads it (http://10.0.2.4/res.txt):
+   "WxH@scale" (e.g. "2576x1812@250"), or "WxH" with legacy sizing. */
+- (void)publishWantedPlan:(WinIOSDisplayPlan)plan {
+    if (!plan.modeWidth || !plan.modeHeight) return;
     NSString *dir = [[self documentsPath] stringByAppendingPathComponent:@"Shared"];
     [[NSFileManager defaultManager] createDirectoryAtPath:dir withIntermediateDirectories:YES attributes:nil error:nil];
-    [[NSString stringWithFormat:@"%ux%u", w, h] writeToFile:[dir stringByAppendingPathComponent:@"res.txt"]
-                                                 atomically:YES encoding:NSASCIIStringEncoding error:nil];
+    NSString *line = plan.legacy ? [NSString stringWithFormat:@"%ux%u", plan.modeWidth, plan.modeHeight]
+                                 : [NSString stringWithFormat:@"%ux%u@%u", plan.modeWidth, plan.modeHeight, plan.scalePercent];
+    [line writeToFile:[dir stringByAppendingPathComponent:@"res.txt"] atomically:YES encoding:NSASCIIStringEncoding error:nil];
 }
 
-- (BOOL)hiDPIDisplay {
-    return _hiDPIDisplay;
+/* HV_DISPLAY_LEGACY=1 (Documents/env.txt): the sizing from before the 1:1 pipeline (points, at least
+   960x600, 1.5 s settle, linear filtering, drawable at UIScreen.scale); =0 forces the new one. Unset:
+   legacy for Linux guests only (nothing in them sets a scale), the new sizing for Windows. */
+- (BOOL)displayLegacy {
+    const char *v = getenv("HV_DISPLAY_LEGACY");
+    if (v && *v) return *v != '0';
+    return winios_machine_is_linux();
 }
 
-- (void)setHiDPIDisplay:(BOOL)on {
-    _hiDPIDisplay = on;
-    [[NSUserDefaults standardUserDefaults] setBool:on forKey:@"winios.hiDPIDisplay"];
+- (WinIOSDisplayPlan)planForView:(CGSize)pts preset:(NSInteger)preset sharpness:(NSInteger)sharpness {
+    if (pts.width < 1 || pts.height < 1) return (WinIOSDisplayPlan){0};
+    os_unfair_lock_lock(&_metricsLock);
+    CGFloat scale = _screenScale > 0 ? _screenScale : 2.0;
+    CGFloat n = _viewNativeScale > 0 ? _viewNativeScale : scale;
+    os_unfair_lock_unlock(&_metricsLock);
+    if (self.displayLegacy) {
+        WinIOSDisplayPlan p = {0};
+        uint32_t w = 0, h = 0;
+        winios_gpu_mode_for(_hiDPIDisplay ? CGSizeMake(pts.width * scale, pts.height * scale) : pts, &w, &h);
+        p.pictureWidth = w; p.pictureHeight = h; p.modeWidth = w; p.modeHeight = h;
+        p.scalePercent = 0; p.lookWidth = w; p.lookHeight = h; p.available = 1; p.legacy = 1;
+        p.sharpness = _hiDPIDisplay ? 1 : 0;
+        return p;
+    }
+    return winios_plan(pts, n, preset, sharpness);
+}
+
+- (WinIOSDisplayPlan)displayPlanForPreset:(NSInteger)preset sharpness:(NSInteger)sharpness {
     os_unfair_lock_lock(&_metricsLock);
     CGSize pts = _displayViewPts;
     os_unfair_lock_unlock(&_metricsLock);
-    if (pts.width > 0) [self updateDisplayViewSize:pts];
+    return [self planForView:pts preset:preset sharpness:sharpness];
+}
+
+- (WinIOSDisplayPlan)currentDisplayPlan {
+    return _hasPending ? _pendingPlan : _committedPlan;
+}
+
+- (BOOL)hiDPIDisplay {
+    if (self.displayLegacy) return _hiDPIDisplay;
+    WinIOSDisplayPlan p = self.currentDisplayPlan;
+    return p.modeWidth ? p.sharpness == 1 : _displaySharpness == 1;
+}
+
+/* The former switch. With the new sizing it picks Sharp (on) or Balanced (off). */
+- (void)setHiDPIDisplay:(BOOL)on {
+    _hiDPIDisplay = on;
+    [[NSUserDefaults standardUserDefaults] setBool:on forKey:@"winios.hiDPIDisplay"];
+    if (self.displayLegacy) [self replanDisplay:@"hidpi"];
+    else self.displaySharpness = on ? 1 : 2;
+}
+
+- (NSInteger)displaySizePreset { return _displayPreset; }
+- (void)setDisplaySizePreset:(NSInteger)preset {
+    preset = MAX(0, MIN(2, preset));
+    if (preset == _displayPreset) return;
+    _displayPreset = preset;
+    [self replanDisplay:@"display size"];
+}
+
+- (NSInteger)displaySharpness { return _displaySharpness; }
+- (void)setDisplaySharpness:(NSInteger)sharpness {
+    sharpness = MAX(0, MIN(2, sharpness));
+    if (sharpness == _displaySharpness) return;
+    _displaySharpness = sharpness;
+    [self replanDisplay:@"sharpness"];
+}
+
+- (BOOL)displayImmersive { return _displayImmersive; }
+- (void)setDisplayImmersive:(BOOL)on {
+    if (on == _displayImmersive) return;
+    _displayImmersive = on;
+    fprintf(stderr, "display: immersive %s (%s)\n", on ? "on" : "off", _immersiveKeeps ? "keeps the resolution" : "full panel");
+    [self replanDisplay:@"immersive"];
+}
+
+- (BOOL)immersiveKeepsResolution { return _immersiveKeeps; }
+- (void)setImmersiveKeepsResolution:(BOOL)keep {
+    if (keep == _immersiveKeeps) return;
+    _immersiveKeeps = keep;
+    if (_displayImmersive) [self replanDisplay:@"immersive"];
 }
 
 - (void)updateDisplayViewSize:(CGSize)size {
-    uint32_t w = 0, h = 0;
     os_unfair_lock_lock(&_metricsLock);
     _displayViewPts = size;
-    CGFloat scale = _screenScale > 0 ? _screenScale : 2.0;
     os_unfair_lock_unlock(&_metricsLock);
-    CGSize px = _hiDPIDisplay ? CGSizeMake(size.width * scale, size.height * scale) : size;
-    winios_gpu_mode_for(px, &w, &h);
-    if (!w || !h) return;
+    [self replanDisplay:@"view"];
+}
+
+- (void)updateDisplayViewSize:(CGSize)size nativeScale:(CGFloat)nativeScale {
     os_unfair_lock_lock(&_metricsLock);
-    BOOL changed = (w != _gpuPrefW || h != _gpuPrefH);
-    _gpuPrefW = w;
-    _gpuPrefH = h;
+    _displayViewPts = size;
+    if (nativeScale > 0) _viewNativeScale = nativeScale;
     os_unfair_lock_unlock(&_metricsLock);
-    if (!changed || !_vmRunning) return;
-    /* Layout passes (bars appearing, rotation animations) change the view size for a moment:
-       tell the guest only once a size has held for 1.5 s, or Windows keeps re-moding. */
+    [self replanDisplay:@"view"];
+}
+
+- (void)postDisplayStateChanged {
+    dispatch_block_t post = ^{
+        [[NSNotificationCenter defaultCenter] postNotificationName:WinIOSDisplayStateDidChangeNotification object:self];
+    };
+    if ([NSThread isMainThread]) post();
+    else dispatch_async(dispatch_get_main_queue(), post);
+}
+
+/* Reshape pipeline (UX study 4.3): only settled sizes reach Windows. A size is sent once it has held for
+   300 ms; a change under 30 pt (bars, banners) waits 1 s and is dropped if it reverts meanwhile; a newer
+   size replaces a waiting one. A real reshape first lifts what the app holds down (buttons, keys) and
+   tells the views to cancel their touches. Main thread. */
+- (void)replanDisplay:(NSString *)why {
+    if (![NSThread isMainThread]) {
+        dispatch_async(dispatch_get_main_queue(), ^{ [self replanDisplay:why]; });
+        return;
+    }
+    os_unfair_lock_lock(&_metricsLock);
+    CGSize pts = _displayViewPts;
+    os_unfair_lock_unlock(&_metricsLock);
+    WinIOSDisplayPlan plan = [self planForView:pts preset:_displayPreset sharpness:_displaySharpness];
+    if (!plan.modeWidth) return;
+    if (_displayImmersive && _immersiveKeeps && _committedPlan.modeWidth && !plan.legacy) {
+        /* immersive, keeping the resolution: no re-mode; the presenter fits the picture to the panel */
+        if (_hasPending) {
+            _gpuPrefToken++;
+            _hasPending = NO;
+            _reshapeAnnounced = NO;
+            if (_reshapeState == WinIOSReshapeStateIdle) hv_fb_metal_hold_for_size(0, 0, 0);
+            [self postDisplayStateChanged];
+        }
+        return;
+    }
+    if (winios_plans_equal(plan, _committedPlan)) {
+        if (_hasPending) {
+            _gpuPrefToken++;
+            _hasPending = NO;
+            _reshapeAnnounced = NO;
+            if (_reshapeState == WinIOSReshapeStateIdle) hv_fb_metal_hold_for_size(0, 0, 0);
+            fprintf(stderr, "display: %.0fx%.0f pt is back within the settle time: no re-mode\n", pts.width, pts.height);
+            [self postDisplayStateChanged];
+        }
+        return;
+    }
+    if (_hasPending && winios_plans_equal(plan, _pendingPlan)) {
+        _pendingViewPts = pts;
+        return; /* already waiting for this one */
+    }
+    BOOL modeChanges = plan.modeWidth != _committedPlan.modeWidth || plan.modeHeight != _committedPlan.modeHeight;
+    BOOL small = modeChanges && _committedPlan.modeWidth && fabs(pts.width - _committedViewPts.width) < 30 &&
+                 fabs(pts.height - _committedViewPts.height) < 30;
+    double delay = plan.legacy ? 1.5 : small ? 1.0 : 0.3;
+    _pendingPlan = plan;
+    _pendingViewPts = pts;
+    _hasPending = YES;
     uint64_t token = ++_gpuPrefToken;
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.5 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-        if (token != self->_gpuPrefToken || !self->_vmRunning) return;
-        os_unfair_lock_lock(&self->_metricsLock);
-        uint32_t fw = self->_gpuPrefW, fh = self->_gpuPrefH;
-        os_unfair_lock_unlock(&self->_metricsLock);
-        hv_winvm_set_preferred_display(fw, fh);
-        [self publishWantedResolution:fw height:fh];
+    if (!_vmRunning) { /* nothing to re-mode yet: this is what Windows gets when it starts */
+        [self commitPendingPlan:why];
+        return;
+    }
+    if (modeChanges && !small && !plan.legacy) {
+        /* the last good frame stays (scaled by the layer) through the settle time too, not a letterboxed one */
+        if (_guestFollowsModes && [self guestDisplayDriverUp])
+            hv_fb_metal_hold_for_size(plan.modeWidth, plan.modeHeight, (uint32_t)((delay + 3.0) * 1000));
+        if (!_reshapeAnnounced) {
+            _reshapeAnnounced = YES;
+            [self releaseAllInputForReshape];
+            [[NSNotificationCenter defaultCenter] postNotificationName:WinIOSDisplayWillReshapeNotification object:self];
+        }
+    }
+    [self postDisplayStateChanged];
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(delay * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        if (token != self->_gpuPrefToken || !self->_hasPending) return;
+        [self commitPendingPlan:why];
     });
+}
+
+/* The size of the picture Windows draws now (see framebufferWidth). */
+- (void)guestPictureWidth:(uint32_t *)w height:(uint32_t *)h {
+    *w = self.framebufferWidth;
+    *h = self.framebufferHeight;
+}
+
+/* Is Windows' own display driver (virtio-gpu) running, so that a new mode can be followed at all? */
+- (BOOL)guestDisplayDriverUp {
+    char line[768] = "";
+    if (!_vmRunning || hv_winvm_gpu_status(line, sizeof line) < 0) return NO;
+    return strstr(line, "driver_ok=1") != NULL && strstr(line, "stage=os") != NULL;
+}
+
+- (void)commitPendingPlan:(NSString *)why {
+    if (!_hasPending) return;
+    WinIOSDisplayPlan plan = _pendingPlan, old = _committedPlan;
+    _hasPending = NO;
+    _reshapeAnnounced = NO;
+    _committedPlan = plan;
+    _committedViewPts = _pendingViewPts;
+    os_unfair_lock_lock(&_metricsLock);
+    _gpuPrefW = plan.modeWidth;
+    _gpuPrefH = plan.modeHeight;
+    CGFloat n = _viewNativeScale;
+    os_unfair_lock_unlock(&_metricsLock);
+    BOOL modeChanged = plan.modeWidth != old.modeWidth || plan.modeHeight != old.modeHeight;
+    fprintf(stderr, "display: %s %ux%u@%u%% (view %.1fx%.1f pt, nativeScale %.4f, picture %ux%u px, k=%d, preset %ld%s), "
+                    "looks like %ux%u [%s]\n",
+            _vmRunning ? "request" : "planned", plan.modeWidth, plan.modeHeight, plan.scalePercent, _committedViewPts.width,
+            _committedViewPts.height, n, plan.pictureWidth, plan.pictureHeight, plan.sharpness, (long)_displayPreset,
+            plan.legacy ? ", legacy" : plan.available ? "" : ", preset not available here", plan.lookWidth, plan.lookHeight,
+            why.UTF8String);
+    if (_vmRunning) {
+        if (modeChanged) {
+            hv_winvm_set_preferred_display(plan.modeWidth, plan.modeHeight);
+            _remodeCount++;
+            uint32_t gw = 0, gh = 0;
+            [self guestPictureWidth:&gw height:&gh];
+            BOOL already = gw == plan.modeWidth && gh == plan.modeHeight;
+            if ([self guestDisplayDriverUp] && !already) {
+                /* the old picture stays (scaled by the layer) until Windows draws at the new size, 3 s at most;
+                   not when Windows did not follow the last time (no helper or driver): no freeze for nothing */
+                if (_guestFollowsModes && !plan.legacy) hv_fb_metal_hold_for_size(plan.modeWidth, plan.modeHeight, 3000);
+                [self startReshapeWatch];
+            } else {
+                [self endReshapeWatch:WinIOSReshapeStateIdle];
+            }
+        }
+        [self publishWantedPlan:plan];
+    }
+    [self postDisplayStateChanged];
+    [self notifyChanged];
+}
+
+- (void)startReshapeWatch {
+    [_reshapeWatch invalidate];
+    _reshapeStart = CFAbsoluteTimeGetCurrent();
+    _reshapeState = WinIOSReshapeStateWaiting;
+    __weak typeof(self) weakSelf = self;
+    _reshapeWatch = [NSTimer timerWithTimeInterval:0.1 repeats:YES block:^(NSTimer *t) {
+        (void)t;
+        [weakSelf reshapeWatchTick];
+    }];
+    [[NSRunLoop mainRunLoop] addTimer:_reshapeWatch forMode:NSRunLoopCommonModes]; /* also while scrolling */
+    [self postDisplayStateChanged];
+}
+
+- (void)endReshapeWatch:(WinIOSReshapeState)state {
+    [_reshapeWatch invalidate];
+    _reshapeWatch = nil;
+    if (_reshapeState != state) {
+        _reshapeState = state;
+        [self postDisplayStateChanged];
+    }
+}
+
+- (void)reshapeWatchTick {
+    if (!_vmRunning) {
+        [self endReshapeWatch:WinIOSReshapeStateIdle];
+        return;
+    }
+    double elapsed = CFAbsoluteTimeGetCurrent() - _reshapeStart;
+    uint32_t gw = 0, gh = 0;
+    [self guestPictureWidth:&gw height:&gh];
+    if (gw == _committedPlan.modeWidth && gh == _committedPlan.modeHeight) {
+        _lastReshapeMs = elapsed * 1000.0;
+        _guestFollowsModes = YES;
+        fprintf(stderr, "display: Windows is at %ux%u after %.0f ms (re-mode %lu)\n", _committedPlan.modeWidth,
+                _committedPlan.modeHeight, _lastReshapeMs, (unsigned long)_remodeCount);
+        [self endReshapeWatch:WinIOSReshapeStateIdle];
+        [self refreshAppliedDisplay];
+        return;
+    }
+    WinIOSReshapeState st = elapsed >= 10.0 ? WinIOSReshapeStateStuck
+                          : elapsed >= 3.0  ? WinIOSReshapeStateSlow
+                                            : WinIOSReshapeStateWaiting;
+    if (st != _reshapeState) {
+        _reshapeState = st;
+        if (st == WinIOSReshapeStateStuck) {
+            _guestFollowsModes = NO;
+            fprintf(stderr, "display: Windows did not take %ux%u within 10 s (still %ux%u): display driver or helper missing?\n",
+                    _committedPlan.modeWidth, _committedPlan.modeHeight, gw, gh);
+        }
+        [self postDisplayStateChanged];
+    }
+    if (elapsed > 600.0) [self endReshapeWatch:WinIOSReshapeStateIdle];
+}
+
+- (WinIOSReshapeState)displayReshapeState { return _reshapeState; }
+- (NSUInteger)displayRemodeCount { return _remodeCount; }
+- (double)lastReshapeMillis { return _lastReshapeMs; }
+
+/* The helper's report (winkit/setres.ps1 PUTs res_applied.txt), e.g.
+   "2576x1812@250 live min=100 max=300 rec=200": the mode, the scale Windows accepted, how (live,
+   signout, failed) and the range Windows allows for this mode. */
+- (void)refreshAppliedDisplay {
+    NSString *f = [[[self documentsPath] stringByAppendingPathComponent:@"Shared"] stringByAppendingPathComponent:@"res_applied.txt"];
+    NSDate *stamp = [[NSFileManager defaultManager] attributesOfItemAtPath:f error:nil][NSFileModificationDate];
+    if (!stamp) return;
+    if (_appliedStamp && [stamp isEqualToDate:_appliedStamp]) {
+        _applied.age = -stamp.timeIntervalSinceNow;
+        return;
+    }
+    NSString *t = [[NSString stringWithContentsOfFile:f encoding:NSASCIIStringEncoding error:nil]
+        stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
+    WinIOSDisplayApplied a = {0};
+    char method[16] = "";
+    unsigned w = 0, h = 0, sc = 0, mn = 0, mx = 0, rec = 0;
+    if (t.length && sscanf(t.UTF8String, "%ux%u@%u %15s min=%u max=%u rec=%u", &w, &h, &sc, method, &mn, &mx, &rec) >= 4) {
+        a.modeWidth = w; a.modeHeight = h; a.scalePercent = sc;
+        a.minPercent = mn; a.maxPercent = mx; a.recommendedPercent = rec;
+        a.method = !strcmp(method, "live") ? 1 : !strcmp(method, "signout") ? 2 : 3;
+    }
+    a.age = -stamp.timeIntervalSinceNow;
+    _applied = a;
+    _appliedStamp = stamp;
+    fprintf(stderr, "display: helper reports \"%s\"\n", t.length ? t.UTF8String : "");
+    [self postDisplayStateChanged];
+}
+
+- (WinIOSDisplayApplied)appliedDisplay { return _applied; }
+
+- (WinIOSPresenterStats)presenterStats {
+    HvFbMetalStats s;
+    hv_fb_metal_get_stats(&s);
+    WinIOSPresenterStats o = {
+        .frames = s.frames, .ticks = s.ticks, .held = s.held, .cpuNanos = s.cpu_ns, .uploadBytes = s.upload_bytes,
+        .linkHz = s.link_hz, .idle = s.idle, .nearest = s.nearest, .holding = s.holding,
+        .srcWidth = s.src_w, .srcHeight = s.src_h, .dstWidth = s.dst_w, .dstHeight = s.dst_h, .scaleX100 = s.scale_x100,
+    };
+    return o;
+}
+
+/* Lift every button and key the app has sent down: before Windows re-modes (a posture change mid-drag must
+   not leave a button held) and whenever the UI asks. Modifiers are always lifted. Main thread. */
+- (void)releaseAllInputForReshape {
+    if (!_vmRunning) return;
+    if (_tabletButtons) {
+        _tabletButtons = 0;
+        hv_winvm_tablet(_tabletX, _tabletY, 0, 0);
+    }
+    for (int u = 0; u < 256; u++) {
+        BOOL mod = u >= 0xe0 && u <= 0xe7;
+        if (mod || (_keysDown[u >> 3] & (1u << (u & 7)))) hv_winvm_key_hid((uint8_t)u, 0);
+    }
+    memset(_keysDown, 0, sizeof _keysDown);
+}
+
+/* display hooks in the input paths: what is held down (for the release above), and input for the presenter's
+   idle throttling */
+- (void)trackKey:(uint8_t)usage down:(BOOL)down {
+    if (down) _keysDown[usage >> 3] |= (uint8_t)(1u << (usage & 7));
+    else _keysDown[usage >> 3] &= (uint8_t)~(1u << (usage & 7));
+    hv_fb_metal_note_input();
+}
+
+- (void)noteUserInput {
+    hv_fb_metal_note_input();
+}
+
+- (void)trackTabletX:(double)x y:(double)y buttons:(uint8_t)buttons {
+    _tabletX = x; _tabletY = y; _tabletButtons = buttons;
+    hv_fb_metal_note_input();
 }
 
 - (void)updateHingeStatus:(NSInteger)status angleDegrees:(double)angleDegrees {
@@ -371,15 +787,25 @@ static void winios_gpu_mode_for(CGSize pts, uint32_t *w, uint32_t *h) {
     return _vmStatus;
 }
 
+/* The picture on screen: the presenter's last frame when there is one (with 3D the scanout is a Metal
+   texture that the 2D framebuffer size does not follow), else the 2D framebuffer. */
 - (uint32_t)framebufferWidth {
+    if (!_vmRunning) return 0;
+    HvFbMetalStats s;
+    hv_fb_metal_get_stats(&s);
+    if (s.frames && s.src_w && s.src_h) return s.src_w;
     uint32_t w = 0, h = 0;
-    if (_vmRunning && hv_winvm_display_size(&w, &h) == 0) return w;
+    if (hv_winvm_display_size(&w, &h) == 0) return w;
     return 0;
 }
 
 - (uint32_t)framebufferHeight {
+    if (!_vmRunning) return 0;
+    HvFbMetalStats s;
+    hv_fb_metal_get_stats(&s);
+    if (s.frames && s.src_w && s.src_h) return s.src_h;
     uint32_t w = 0, h = 0;
-    if (_vmRunning && hv_winvm_display_size(&w, &h) == 0) return h;
+    if (hv_winvm_display_size(&w, &h) == 0) return h;
     return 0;
 }
 
@@ -869,11 +1295,14 @@ static NSString *winios_unpack_resource(NSString *name, NSString *dst) {
         return;
     }
 
-    os_unfair_lock_lock(&_metricsLock);
-    uint32_t gpuW = _gpuPrefW, gpuH = _gpuPrefH;
-    os_unfair_lock_unlock(&_metricsLock);
+    /* display sizing: env.txt is loaded now (HV_DISPLAY_LEGACY), so plan again from the view's size */
+    hv_fb_metal_set_legacy_fit(self.displayLegacy);
+    [self replanDisplay:@"start"];
+    if (_hasPending) [self commitPendingPlan:@"start"];
+    uint32_t gpuW = _committedPlan.modeWidth, gpuH = _committedPlan.modeHeight;
     if (gpuW && gpuH) hv_winvm_set_preferred_display(gpuW, gpuH); /* before the driver starts: no event needed */
-    [self publishWantedResolution:gpuW height:gpuH];
+    [self publishWantedPlan:_committedPlan];
+    [self postDisplayStateChanged];
 
     CAMetalLayer *layer = _pendingLayer;
     if (layer) {
@@ -1019,6 +1448,7 @@ static void winios_type_run(NSString *text) {
         }
     }
     [self writeDiagnosticsSnapshot];
+    if (_vmRunning) dispatch_async(dispatch_get_main_queue(), ^{ [self refreshAppliedDisplay]; }); /* display hook */
     if (_vmRunning) {
         if ((_diagTickCount % 4u) == 0u) {
             hv_winvm_flush_disks();
@@ -1126,12 +1556,32 @@ static void winios_type_run(NSString *text) {
         pt.width, pt.height, scale,
         gpuLine,
         (int)_hiDPIDisplay];
+    { /* display sizing and the presenter (UX P0-1, P0-3): what was asked, what Windows took, what it costs */
+        WinIOSDisplayPlan p = _committedPlan;
+        WinIOSDisplayApplied a = _applied;
+        HvFbMetalStats ps;
+        hv_fb_metal_get_stats(&ps);
+        txt = [txt stringByAppendingFormat:
+            @"display_plan: %ux%u@%u looks=%ux%u picture=%ux%u k=%d preset=%ld available=%d legacy=%d native_scale=%.4f\n"
+            @"display_reshape: state=%ld remodes=%lu last_ms=%.0f follows=%d immersive=%d keep=%d\n"
+            @"display_applied: %ux%u@%u method=%d min=%u max=%u rec=%u age=%.0f\n"
+            @"presenter: frames=%llu ticks=%llu held=%llu cpu_ms=%.0f upload_mb=%.0f link_hz=%d idle=%d nearest=%d src=%ux%u dst=%ux%u scale=%.2f\n",
+            p.modeWidth, p.modeHeight, p.scalePercent, p.lookWidth, p.lookHeight, p.pictureWidth, p.pictureHeight,
+            p.sharpness, (long)_displayPreset, p.available, p.legacy, _viewNativeScale,
+            (long)_reshapeState, (unsigned long)_remodeCount, _lastReshapeMs, (int)_guestFollowsModes,
+            (int)_displayImmersive, (int)_immersiveKeeps,
+            a.modeWidth, a.modeHeight, a.scalePercent, a.method, a.minPercent, a.maxPercent, a.recommendedPercent, a.age,
+            ps.frames, ps.ticks, ps.held, ps.cpu_ns / 1e6, ps.upload_bytes / 1048576.0, ps.link_hz, ps.idle, ps.nearest,
+            ps.src_w, ps.src_h, ps.dst_w, ps.dst_h, ps.scale_x100 / 100.0];
+    }
     [txt writeToFile:statusFile atomically:YES encoding:NSUTF8StringEncoding error:nil];
 }
 
 - (void)handleVMExitWithReason:(NSString *)reason {
     _vmRunning = NO;
     [self stopDiagTimer];
+    [self endReshapeWatch:WinIOSReshapeStateIdle]; /* display hook */
+    hv_fb_metal_hold_for_size(0, 0, 0);
     [[UIApplication sharedApplication] setIdleTimerDisabled:NO];
     _vmStatus = [NSString stringWithFormat:@"Stopped (%@)", reason];
     dispatch_async(_diagQueue, ^{ [self writeDiagnosticsSnapshot]; });
@@ -1140,16 +1590,19 @@ static void winios_type_run(NSString *text) {
 
 - (void)sendTabletNormalizedX:(double)x y:(double)y buttons:(uint8_t)buttons wheel:(int8_t)wheel {
     if (!_vmRunning) return;
+    [self trackTabletX:x y:y buttons:buttons]; /* display hook: reshape release, idle throttling */
     hv_winvm_tablet(x, y, buttons, wheel);
 }
 
 - (void)sendKeyHid:(uint8_t)usage down:(BOOL)down {
     if (!_vmRunning) return;
+    [self trackKey:usage down:down]; /* display hook */
     hv_winvm_key_hid(usage, down ? 1 : 0);
 }
 
 - (void)tapKeyHid:(uint8_t)usage {
     if (!_vmRunning) return;
+    hv_fb_metal_note_input(); /* display hook: idle throttling */
     hv_winvm_key_hid(usage, 1);
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(35 * NSEC_PER_MSEC)), dispatch_get_main_queue(), ^{
         hv_winvm_key_hid(usage, 0);
@@ -1158,6 +1611,7 @@ static void winios_type_run(NSString *text) {
 
 - (void)sendKeyComboWithModifiers:(NSArray<NSNumber *> *)modifiers key:(uint8_t)usage {
     if (!_vmRunning) return;
+    hv_fb_metal_note_input(); /* display hook: idle throttling */
     for (NSNumber *m in modifiers) {
         hv_winvm_key_hid((uint8_t)m.unsignedCharValue, 1);
     }
