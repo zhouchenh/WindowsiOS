@@ -65,6 +65,9 @@ an arm64 executable, the JIT script, the signature) and prints its size and SHA-
 `get-task-allow`, which JIT needs. Use `--entitlements ios/WindowsiOS-IncreasedMemory.entitlements`
 if you will re-sign with an account that has the Increased Memory Limit capability.
 
+The IPA's bundle id is `com.applevm.duo`, the one in `repo.json`, even if your
+`ios/Signing.local.xcconfig` (section 4b) sets another; pass `--bundle-id ID` for a different one.
+
 ### 3D graphics (optional)
 
 Without extra files the IPA has 2D graphics only. The 3D path (virtio-gpu with virglrenderer,
@@ -79,10 +82,15 @@ scripts/package_ipa.sh
 ```
 
 Or pass any other `UTM.app/Frameworks` directory with `--utm DIR` (or `UTM_FRAMEWORKS=DIR`).
-The frameworks are copied in by `scripts/embed_gpu3d.sh`, which also puts these into the app when
-they exist: `dist/WinKit/drivers.img` (the WinKit disk, see `winkit/`) and
-`dist/ArchInstaller/*.z` (the Arch Linux installer, `scripts/build_arch_installer.py`). Patched
-frameworks in `work/3d/fw-override/` take precedence over UTM's.
+The frameworks are copied in by `scripts/embed_gpu3d.sh`. Patched frameworks in
+`work/3d/fw-override/` take precedence over UTM's.
+
+### WinKit disk and Arch Linux installer (optional)
+
+With or without 3D, `scripts/package_ipa.sh` puts these into the app when they exist, and its
+summary says which it embedded: `dist/WinKit/drivers.img` (the WinKit disk, see `winkit/`; built by
+`make winkit-img`) and `dist/ArchInstaller/*.z` (the Arch Linux installer,
+`scripts/build_arch_installer.py`). Build them before running the script.
 
 ## 4b. Signed build from Xcode (free or paid Apple account)
 
@@ -112,21 +120,26 @@ frameworks in `work/3d/fw-override/` take precedence over UTM's.
    cd ios && xcodegen generate --spec project.yml && open WindowsiOS.xcodeproj
    ```
 
-   then pick your device and press Run; or on the command line (device connected, Developer Mode on):
+   then pick your device and press Run; or on the command line (device connected, Developer Mode on;
+   `xcrun devicectl list devices` shows its UDID):
 
    ```sh
    cd ios && xcodegen generate --spec project.yml && cd ..
    xcodebuild -project ios/WindowsiOS.xcodeproj -scheme WindowsiOS -configuration Release \
      -destination 'generic/platform=iOS' -derivedDataPath build/DerivedData \
      -allowProvisioningUpdates build
+   APP=build/DerivedData/Build/Products/Release-iphoneos/WindowsiOS.app
+   xcrun devicectl device install app --device <DEVICE_UDID> "$APP"
    ```
 
    With automatic signing Xcode registers the App ID (with the capabilities in the entitlements
    file) and makes the provisioning profile. Changes to `Signing.local.xcconfig` take effect on the
    next build; rerun `xcodegen` only after changing `project.yml`.
 
-3. Optional 3D frameworks: embed them into the signed app and re-sign it with your certificate
-   (`security find-identity -v -p codesigning` lists it; use its SHA-1 if you have several):
+3. Optional 3D frameworks: embed them into the signed app built in step 2, re-sign it with your
+   certificate (`security find-identity -v -p codesigning` lists it; use its SHA-1 if you have
+   several) and install it again. This also embeds the WinKit disk and the Arch installer when
+   they exist (section 4a):
 
    ```sh
    APP=build/DerivedData/Build/Products/Release-iphoneos/WindowsiOS.app
@@ -141,8 +154,8 @@ Free accounts: the app expires after 7 days and a free team can register only a 
 The emulator needs JIT, enabled by a debugger on every launch: with
 [StikDebug](https://github.com/StephenDev0/StikDebug) on the device (the app asks it through a
 `stikjit://` link, passing its own bundle id and the JIT script), or from
-the Mac with `scripts/launch_on_duo.sh <DEVICE_UDID> <your bundle id>` (pass your bundle id: the
-script's default is the original WindowsiOS one). Both need `get-task-allow`, which every build
+the Mac with `scripts/launch_on_duo.sh <DEVICE_UDID> [bundle id]` (the bundle id defaults to
+`com.applevm.duo`; pass yours if `Signing.local.xcconfig` sets another). Both need `get-task-allow`, which every build
 here has.
 
 ## 6. Disk images

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Launch WindowsiOS (`me.ammaar.windowsios`) on Ammaar's physical iPhone Duo
+Launch WindowsiOS (default bundle id `com.applevm.duo`) on Ammaar's physical iPhone Duo
 (`00008160-000E05D036C0000A`), service the iOS 26/27 TXM BreakpointJIT traps
 (`brk #0x69` probe, `brk #0xf00d` RX allocation + 16 KiB page blessing + clean detach),
 and let Windows 11 ARM64 run natively at full speed with zero debugger attached.
@@ -25,7 +25,7 @@ import lldb  # noqa: E402
 ROOT = Path(__file__).resolve().parent.parent
 WORK = ROOT / "work"
 DEFAULT_UDID = "00008160-000E05D036C0000A"
-DEFAULT_BUNDLE_ID = "me.ammaar.windowsios"
+DEFAULT_BUNDLE_ID = "com.applevm.duo"
 
 
 def run_cmd(debugger, cmd: str) -> str:
