@@ -68,6 +68,11 @@ final class ChromeModel: ObservableObject {
     private let gestures = ChromeWindowGestures()
     private var hintWork: DispatchWorkItem?
     private var vbarCheck: DispatchWorkItem?
+    /// The surface on which immersive needed the vertical bar turned off (its inset stayed after the
+    /// visibility APIs). Kept for as long as that immersive lasts on that surface: a trait change (the bar
+    /// itself going away, a rotation) does not try the visibility APIs again, which would bring the bar
+    /// back and take it away every 0.6 s.
+    private var vbarFallbackSurface: ChromeSurface?
     private var lastInsets = EdgeInsets()
     private var lastViewport: CGSize = .zero
 
@@ -206,23 +211,30 @@ final class ChromeModel: ObservableObject {
 
     /// Editing gestures off while Windows has the screen; edge swipes only while immersive.
     func updateSessionActive(_ active: Bool) {
+        guard active != sessionActive else { return }
         sessionActive = active
         RootControllerHooks.editingGesturesBlocked = active
-        gestures.setEdgeSwipeEnabled(active && isImmersive)
+        applySystemState() // e.g. the vertical bar comes back over the launch page, Settings or Safari
     }
 
     private func applySystemState() {
         gestures.setEdgeSwipeEnabled(sessionActive && isImmersive)
         vbarCheck?.cancel()
         let forced = ChromeEnv.flag("HV_VBAR_DISABLE")
-        if !isImmersive || forced == false {
-            setVerticalBarDisabled(false, why: isImmersive ? "HV_VBAR_DISABLE=0" : "controls shown")
+        if !sessionActive || !isImmersive || forced == false {
+            vbarFallbackSurface = nil
+            setVerticalBarDisabled(false, why: !isImmersive ? "controls shown" : !sessionActive ? "Windows not on screen" : "HV_VBAR_DISABLE=0")
             return
         }
         if forced == true {
             setVerticalBarDisabled(true, why: "HV_VBAR_DISABLE=1")
             return
         }
+        if vbarFallbackSurface == surface {
+            setVerticalBarDisabled(true, why: "kept for this immersive")
+            return
+        }
+        vbarFallbackSurface = nil
         // Visibility APIs first (bars, status bar, home indicator hidden). If the vertical bar still
         // keeps its inset once things settle, turn it off for as long as immersive lasts.
         setVerticalBarDisabled(false, why: "immersive: visibility APIs")
@@ -238,6 +250,7 @@ final class ChromeModel: ObservableObject {
     }
 
     private func checkVerticalBarAfterHiding() {
+        guard sessionActive else { return } // left the screen meanwhile: applySystemState has run
         guard isImmersive, verticalBarSide != .none else {
             verticalBarPath = isImmersive ? L("沉浸：隐藏栏（没有竖栏）", "Immersive: bars hidden (no vertical bar)")
                                           : verticalBarPath
@@ -247,6 +260,7 @@ final class ChromeModel: ObservableObject {
         let inset = verticalBarSide == .leading ? lastInsets.leading : lastInsets.trailing
         if inset > 1 {
             chromeLog(String(format: "immersive: vertical-bar inset %.0f pt remains after hiding the bars -> preferredVerticalBarBehavior = .disabled", inset))
+            vbarFallbackSurface = surface
             setVerticalBarDisabled(true, why: String(format: "inset %.0f pt stayed", inset))
         } else {
             verticalBarPath = L("沉浸：隐藏栏（可见性 API）", "Immersive: bars hidden (visibility APIs)")
