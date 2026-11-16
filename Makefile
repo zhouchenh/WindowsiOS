@@ -105,3 +105,36 @@ clean:
 	rm -rf $(B)
 
 .PHONY: all test-core ios-lib clean
+
+# ---- Windows guest tools: build/guest/WinIOSBrowser.exe (the OAuth bridge, see docs/oauth-bridge.md) ----
+# Freestanding AArch64 Win32: no CRT, only kernel32/ws2_32 imports. Needs Homebrew llvm and lld.
+# The import libraries come from short export lists via llvm-dlltool (no Windows SDK needed).
+GUEST_LLVM ?= /opt/homebrew/opt/llvm/bin
+GUEST_LLD ?= /opt/homebrew/opt/lld/bin
+GUEST_CC = $(GUEST_LLVM)/clang --target=aarch64-pc-windows-msvc
+GUEST_CFLAGS = -std=c11 -Wall -Wextra -Werror -Os -ffreestanding -nostdlib -fno-builtin -fno-stack-protector
+GUEST_LDFLAGS = /machine:arm64 /subsystem:windows,6.02 /entry:WinMainCRTStartup /nodefaultlib /dynamicbase /nxcompat \
+                /Brepro /opt:ref /opt:icf
+GB = $(B)/guest
+GUEST_KERNEL32 = GetCommandLineW GetModuleFileNameW GetTempPathW GetFileAttributesW WideCharToMultiByte \
+                 MultiByteToWideChar CreateFileW WriteFile CloseHandle CreateProcessW CreateThread \
+                 WaitForMultipleObjects Sleep GetTickCount64 GetProcessHeap HeapAlloc HeapFree ExitProcess
+GUEST_WS2_32 = WSAStartup socket setsockopt bind listen accept connect send recv shutdown closesocket
+
+$(GB)/kernel32.lib: Makefile | $(GB)
+	{ echo 'LIBRARY kernel32.dll'; echo 'EXPORTS'; for f in $(GUEST_KERNEL32); do echo "$$f"; done; } > $(GB)/kernel32.def
+	$(GUEST_LLVM)/llvm-dlltool -m arm64 -d $(GB)/kernel32.def -l $@
+$(GB)/ws2_32.lib: Makefile | $(GB)
+	{ echo 'LIBRARY ws2_32.dll'; echo 'EXPORTS'; for f in $(GUEST_WS2_32); do echo "$$f"; done; } > $(GB)/ws2_32.def
+	$(GUEST_LLVM)/llvm-dlltool -m arm64 -d $(GB)/ws2_32.def -l $@
+$(GB)/winios_browser_arm64.obj: tools/winios_browser_arm64.c | $(GB)
+	$(GUEST_CC) $(GUEST_CFLAGS) -c $< -o $@
+$(GB)/WinIOSBrowser.exe: $(GB)/winios_browser_arm64.obj $(GB)/kernel32.lib $(GB)/ws2_32.lib
+	$(GUEST_LLD)/lld-link $(GUEST_LDFLAGS) /out:$@ $^
+
+$(GB):
+	mkdir -p $(GB)
+
+guest-tools: $(GB)/WinIOSBrowser.exe
+
+.PHONY: guest-tools
