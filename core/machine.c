@@ -80,7 +80,7 @@ static int init_rest(HvMachine *m) {
     /* Henge 061b250 (its first part): a whole-TLB flush clears the entries logged since the last one (user_fills,
        kernel_fills) instead of all four tables, and a user branch-cache reset the ASIDs given ids since the last one
        (asid_log) instead of all 64K. The large-page filters are still cleared whole. */
-    knob_env(HV_K_LOGFLUSH, 0);
+    knob_env(HV_K_LOGFLUSH, 1); /* on unless its variable says 0 */
     /* Henge b537dbb: a code change drops the cached branch targets into its page (under every live user id and
        kernel salt) instead of every CPU's whole branch cache. */
     knob_env(HV_K_IJCPAGES, 0);
