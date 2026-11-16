@@ -138,3 +138,10 @@ $(GB):
 guest-tools: $(GB)/WinIOSBrowser.exe
 
 .PHONY: guest-tools
+
+# ---- the WinKit disk: dist/WinKit/drivers.img (64 MB, MBR, one FAT32 partition labelled WINKIT) ----
+# winkit/ without its README, plus WinIOSBrowser.exe; scripts/embed_gpu3d.sh puts it into the app.
+winkit-img: $(GB)/WinIOSBrowser.exe
+	scripts/make_winkit_img.sh dist/WinKit/drivers.img $(GB)/WinIOSBrowser.exe
+
+.PHONY: winkit-img

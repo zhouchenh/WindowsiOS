@@ -24,13 +24,14 @@ done
 rm -rf "$APP/vulkan"; cp -R "$SRC/../vulkan" "$APP/vulkan"
 # The WinKit disk (drivers and setup scripts for Windows) travels inside the app as winkit.img, so
 # an imported machine needs no separate drivers.img. Taken from dist/WinKit, or $WINKIT_IMG.
+# `make winkit-img` builds dist/WinKit/drivers.img (winkit/ plus WinIOSBrowser.exe, the OAuth bridge).
 WK="${WINKIT_IMG:-$(cd "$(dirname "$0")/.." && pwd)/dist/WinKit/drivers.img}"
 if [ -f "$WK" ]; then
     rm -f "$APP/winkit.img"
     cp "$WK" "$APP/winkit.img"
     echo "WinKit disk embedded: $WK"
 else
-    echo "no WinKit disk at $WK: the app is built without one"
+    echo "no WinKit disk at $WK: the app is built without one (make winkit-img makes it)"
 fi
 # The Arch Linux installer (scripts/build_arch_installer.py): the installer disk and the firmware, packed.
 AI="$(cd "$(dirname "$0")/.." && pwd)/dist/ArchInstaller"
