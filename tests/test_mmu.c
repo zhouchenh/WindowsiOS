@@ -227,11 +227,138 @@ static void test_logged_flush(HvMachine *m, HvCpu *cpu) {
     hv_cpu_reset(cpu, m);
 }
 
+/* Can a lookup on CPU i still find tag (VA ^ salt) in its branch cache, table `flags`? It is there, and its salt is
+   one a lookup may use: a kernel salt current or kept for a TTBR1 (kttbr_map), a process id some ASID has now. A reset
+   leaves entries in place and only makes their salts unreachable. */
+static int ijc_has(HvMachine *m, int i, uint32_t flags, uint64_t tag) {
+    const uint64_t *ent = m->percpu[i].ijc + (size_t)(flags & (HV_IJC_TABLES - 1)) * (HV_IJC_TABLE_BYTES / 8) + (size_t)hv_ijc_index(tag) * 2;
+    if (!tag || (ent[0] != tag && ent[2] != tag)) return 0;
+    const HvCpu *c = m->cpus[i];
+    if (flags & HV_BLOCK_EL1) {
+        uint16_t kg = (uint16_t)((tag >> 48) ^ 0xffff);
+        if (kg == (uint16_t)(c->ijc_salt[1] >> 48)) return 1;
+        for (int k = 0; k < HV_KTTBR_SLOTS; k++)
+            if (c->kttbr_map[k].ttbr1 && c->kttbr_map[k].kgen == kg) return 1;
+        return 0;
+    }
+    uint16_t cid = (uint16_t)(tag >> 48);
+    for (uint32_t a = 0; a < 65536; a++)
+        if (c->asid_cid[a] == cid) return 1;
+    return 0;
+}
+
+/* A block at va translated from guest page pa, cached in cpu's branch cache the way the dispatcher does it (its page
+   in the TLB first). Returns the tag it went in under, 0 if it was not cached. */
+static uint64_t cache_block(HvMachine *m, HvCpu *cpu, HvBlock *b, uint64_t va, uint64_t page_pa, uint32_t flags) {
+    uint64_t pa = page_pa | (va & ((1ull << HV_TLB_PAGE_BITS) - 1));
+    HvRam *r = hv_ram_lookup(m, pa);
+    uint64_t pg = (pa - r->pa) >> HV_TLB_PAGE_BITS, got;
+    *b = (HvBlock){.va = va, .pa = pa, .flags = flags, .ram = r, .pg = pg, .gen = r->page_gen[pg],
+                   .code = (uint32_t *)(uintptr_t)(0x10000 + (va & 0xffff))};
+    r->code_pages[pg] = 1;
+    uint64_t save = cpu->pstate_extra;
+    if (flags & HV_BLOCK_PAN) cpu->pstate_extra |= HV_PSTATE_PAN;
+    uint32_t fsc = hv_mmu_access(cpu, va, HV_ACC_EXEC, (flags & HV_BLOCK_EL1) ? 1 : 0, &got);
+    cpu->pstate_extra = save;
+    if (fsc || got != pa) return 0;
+    if (!hv_ijc_fill_checked(cpu, b)) return 0;
+    return va ^ cpu->ijc_salt[flags & HV_BLOCK_EL1];
+}
+
+/* HV_IJC_PAGES: a code change drops the cached branch targets into its page under every id that can still be looked
+   up (every process's, every TTBR1's), on this CPU at once and on another by request, and keeps the rest. */
+static void test_code_page_drops(HvMachine *m, HvCpu *cpu, HvCpu *cpu1) {
+    tlb_tables();
+    hv_cpu_reset_index(cpu1, m, 1);
+    hv_cpu_reset(cpu, m);
+    tlb_mmu_on(cpu, 5);
+    tlb_mmu_on(cpu1, 5);
+    const uint64_t code_pa = BIG_PA + 0x5000, kcode_pa = BIG_PA + 0x7000, other_pa = BIG_PA + 0x6000;
+    const uint64_t uva = UPAGES + 0x5010, uva_other = UPAGES + 0x6010, kva = KPAGES + 0x7020, kva_other = KPAGES + 0x6020;
+    static HvBlock blk[16];
+    uint64_t tag[16];
+    int ok = 1;
+    hv_self = cpu;
+    /* User: the page cached by ASIDs 5 and 6 (both still live), another page by ASID 7. */
+    ok &= (tag[0] = cache_block(m, cpu, &blk[0], uva, code_pa, 0)) != 0;
+    cpu->x[0] = 6ull << 48 | tlb_r0;
+    hv_sysreg_msr(cpu, 0xd5182000u, 0);
+    ok &= (tag[1] = cache_block(m, cpu, &blk[1], uva, code_pa, 0)) != 0;
+    cpu->x[0] = 7ull << 48 | tlb_r0;
+    hv_sysreg_msr(cpu, 0xd5182000u, 0);
+    ok &= (tag[2] = cache_block(m, cpu, &blk[2], uva_other, other_pa, 0)) != 0;
+    /* Kernel: the same page (its kernel alias) cached under two TTBR1s' salts, a third TTBR1 current; another page too. */
+    cpu->x[0] = tlb_r1;
+    hv_sysreg_msr(cpu, 0xd5182020u, 0);
+    cpu->x[0] = tlb_r1 | 1ull << 48; /* TCR.A1 is 0: another TTBR1 value, the same tables */
+    hv_sysreg_msr(cpu, 0xd5182020u, 0);
+    ok &= (tag[3] = cache_block(m, cpu, &blk[3], kva, kcode_pa, HV_BLOCK_EL1)) != 0;
+    cpu->x[0] = tlb_r1 | 2ull << 48;
+    hv_sysreg_msr(cpu, 0xd5182020u, 0);
+    ok &= (tag[4] = cache_block(m, cpu, &blk[4], kva, kcode_pa, HV_BLOCK_EL1 | HV_BLOCK_SPX)) != 0;
+    ok &= (tag[5] = cache_block(m, cpu, &blk[5], kva_other, other_pa, HV_BLOCK_EL1)) != 0;
+    cpu->x[0] = tlb_r1 | 3ull << 48;
+    hv_sysreg_msr(cpu, 0xd5182020u, 0);
+    /* The other CPU: the user page by its ASID 5, the kernel one and another page by its kernel salt. */
+    hv_self = cpu1;
+    ok &= (tag[6] = cache_block(m, cpu1, &blk[6], uva, code_pa, 0)) != 0;
+    ok &= (tag[7] = cache_block(m, cpu1, &blk[7], kva_other, other_pa, HV_BLOCK_EL1)) != 0;
+    ok &= (tag[8] = cache_block(m, cpu1, &blk[8], kva, kcode_pa, HV_BLOCK_EL1)) != 0;
+    check_that(ok && tag[3] != tag[4] && tag[0] != tag[1], "code-page drops: setup (cached %d)", ok);
+    const uint32_t fl[9] = {0, 0, 0, HV_BLOCK_EL1, HV_BLOCK_EL1 | HV_BLOCK_SPX, HV_BLOCK_EL1, 0, HV_BLOCK_EL1, HV_BLOCK_EL1};
+    const int on[9] = {0, 0, 0, 0, 0, 0, 1, 1, 1};
+    /* The code changes in both pages, seen by CPU 0 (stores of its own): it drops its entries now, CPU 1 when it
+       next looks. */
+    hv_self = cpu;
+    hv_invalidate_code(m, code_pa);
+    hv_invalidate_code(m, kcode_pa);
+    hv_self = NULL;
+    hv_cpu_process_requests(cpu1);
+    const int stale[9] = {1, 1, 0, 1, 1, 0, 1, 0, 1}; /* led into a changed page */
+    for (int k = 0; k < 9; k++) {
+        int has = ijc_has(m, on[k], fl[k], tag[k]);
+        if (stale[k]) check_that(!has, "code-page drops: CPU %d's entry %d (into the changed page) kept (HV_IJC_PAGES=%d)", on[k], k, hv_knob[HV_K_IJCPAGES]);
+        else if (hv_knob[HV_K_IJCPAGES]) check_that(has, "code-page drops: CPU %d's entry %d (another page) dropped", on[k], k);
+    }
+    /* Back on a TTBR1 whose salt cached the page: still nothing to find. */
+    cpu->x[0] = tlb_r1 | 1ull << 48;
+    hv_sysreg_msr(cpu, 0xd5182020u, 0);
+    check_that(!ijc_has(m, 0, HV_BLOCK_EL1, kva ^ cpu->ijc_salt[1]), "code-page drops: a TTBR1 switched back to finds the dropped target");
+
+    /* A block made before the change cannot be cached after it. */
+    hv_self = cpu;
+    uint64_t t = cache_block(m, cpu, &blk[13], uva_other, other_pa, 0);
+    HvRam *r = hv_ram_lookup(m, other_pa);
+    hv_invalidate_code(m, other_pa);
+    r->code_pages[(other_pa - r->pa) >> HV_TLB_PAGE_BITS] = 1;
+    check_that(t && !hv_ijc_fill_checked(cpu, &blk[13]), "code-page drops: a stale block was cached");
+
+    /* One page cached under two VA pages (a user and a kernel alias): the change drops both. */
+    t = cache_block(m, cpu, &blk[9], uva, code_pa, 0);
+    uint64_t t2 = cache_block(m, cpu, &blk[10], KPAGES + 0x5020, code_pa, HV_BLOCK_EL1);
+    hv_invalidate_code(m, code_pa);
+    check_that(t && t2 && !ijc_has(m, 0, 0, t) && !ijc_has(m, 0, HV_BLOCK_EL1, t2), "code-page drops: a page cached under two VAs kept one");
+
+    /* More changes than the other CPU's queue holds before it looks: it starts its cache over. */
+    hv_self = cpu1;
+    t = cache_block(m, cpu1, &blk[11], uva_other, other_pa, 0);
+    hv_self = cpu;
+    for (int k = 0; k < 20; k++) {
+        cache_block(m, cpu, &blk[12], uva, code_pa, 0);
+        hv_invalidate_code(m, code_pa);
+    }
+    hv_self = NULL;
+    hv_cpu_process_requests(cpu1);
+    check_that(t && !ijc_has(m, 1, 0, t), "code-page drops: a full request queue did not drop everything");
+    hv_cpu_reset(cpu, m);
+}
+
 int main(void) {
     static HvMachine m;
-    static HvCpu cpu;
+    static HvCpu cpu, cpu1;
     hv_machine_init(&m, 1 << 20);
-    printf("knobs: HV_IJC_TTBKEY=%d HV_TLB_LOGFLUSH=%d\n", hv_knob[HV_K_IJCTTBKEY], hv_knob[HV_K_LOGFLUSH]);
+    printf("knobs: HV_IJC_TTBKEY=%d HV_TLB_LOGFLUSH=%d HV_IJC_PAGES=%d\n", hv_knob[HV_K_IJCTTBKEY], hv_knob[HV_K_LOGFLUSH],
+           hv_knob[HV_K_IJCPAGES]);
     pt = aligned_alloc(65536, PT_SIZE);
     hv_machine_add_ram(&m, PT_PA, PT_SIZE, pt, 0);
     uint8_t *big = aligned_alloc(1u << 21, 4u << 20);
@@ -589,6 +716,7 @@ int main(void) {
     }
 
     test_logged_flush(&m, &cpu);
+    test_code_page_drops(&m, &cpu, &cpu1);
 
     printf("%d checks, %d failures\n", checks, failures);
     return failures != 0;

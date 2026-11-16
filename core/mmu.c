@@ -975,11 +975,64 @@ static int tlb_maps_block(HvCpu *cpu, const HvBlock *b) {
            (uint64_t)e->addend == (uint64_t)(uintptr_t)(b->ram->host + (page_pa - b->ram->pa)) - page_va;
 }
 
+/* Henge b537dbb: note on b's physical page the VA page it is cached under (the page's code changing then drops just
+   those targets, hv_invalidate_code), then check b is still current. Both read-modify-writes and the load are
+   sequentially consistent, against the generation bump and the note's exchange there: either the change sees this
+   note, or this sees the new generation and caches nothing. Done whatever HV_IJC_PAGES says, so the notes are
+   complete whenever it is turned on. */
+static int ijc_note_page(const HvBlock *b) {
+    HvRam *r = b->ram;
+    if (!r || !r->ijc_va) return 1;
+    uint64_t pg = (b->pa - r->pa) >> HV_TLB_PAGE_BITS, v = (b->va & ~(uint64_t)PAGE_MASK) | 2;
+    uint64_t *slot = &r->ijc_va[pg];
+    uint64_t old = __atomic_load_n(slot, __ATOMIC_ACQUIRE);
+    /* Noted already (v, or ~0): what this read saw is what the next change's exchange sees first, so that change
+       drops this target too (its request reaches this CPU after the fill). Else noted here, in the order. */
+    while (old != v && old != ~0ull)
+        if (__atomic_compare_exchange_n(slot, &old, old ? ~0ull : v, 0, __ATOMIC_SEQ_CST, __ATOMIC_ACQUIRE)) break;
+    return __atomic_load_n(&r->page_gen[pg], __ATOMIC_SEQ_CST) == b->gen;
+}
+
+/* HV_IJC_PAGES: a code change in a page whose blocks were cached under VA page v (| 2), or v = 1 (cached nowhere).
+   The return predictions of both halves go (they may lead into the page), then the page's cached targets under every
+   id that can still be looked up. Kernel: the current salt and each TTBR1's in kttbr_map (Windows switches TTBR1 per
+   process, and each keeps its own salt, up to HV_KTTBR_SLOTS; one no longer in the map is never used again). User:
+   each live process id (asid_log names every ASID given one since the user half started over) that cached a target
+   in the page, as the (id, page) set says; with the log run over, the whole user half. */
+void hv_ijc_drop_code_page(HvCpu *cpu, uint64_t v) {
+    ret_new(cpu, 0);
+    ret_new(cpu, 1);
+    if (v == 1 || !cpu->pc_state) return;
+    uint64_t page = v & ~(uint64_t)PAGE_MASK;
+    if ((page >> 55) & 1) {
+        uint64_t cur = cpu->ijc_salt[1];
+        ijc_clear_page(cpu, page, 1, cur, 1);
+        for (uint32_t i = 0; i < HV_KTTBR_SLOTS; i++) {
+            uint64_t salt = (uint64_t)cpu->kttbr_map[i].kgen << 48;
+            if (cpu->kttbr_map[i].ttbr1 && cpu->kttbr_map[i].kgen && salt != cur) ijc_clear_page(cpu, page, 1, salt, 1);
+        }
+        return;
+    }
+    if (current_asid(cpu) < 0) {
+        ijc_clear_page(cpu, page, 0, cpu->ijc_salt[0], 1);
+        return;
+    }
+    if (cpu->nasid_log > HV_ASID_LOG) { /* the ids given out are not all known: start the user half over */
+        hv_ijc_reset(cpu, 0);
+        return;
+    }
+    for (uint32_t k = 0; k < cpu->nasid_log; k++) {
+        uint32_t cid = cpu->asid_cid[cpu->asid_log[k]];
+        if (cid && ucode_has(cpu->pc_state, cid, page)) ijc_clear_page(cpu, page, 0, (uint64_t)cid << 48, 1);
+    }
+}
+
 /* The dispatcher caching a block it found for va: only while the TLB still
    says va is there, inside ijc_seq, so another CPU's TLBI can drop this CPU's
    cached targets itself (hv_tlbi_drop_remote_va). */
 int hv_ijc_fill_checked(HvCpu *cpu, HvBlock *b) {
     HvPerCpu *p = cpu->pc_state;
+    if (!ijc_note_page(b)) return 0; /* its code changed meanwhile */
     if (!p) {
         hv_ijc_fill(cpu, b);
         return 1;

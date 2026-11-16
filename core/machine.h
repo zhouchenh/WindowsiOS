@@ -22,6 +22,10 @@ typedef struct HvRam {
        were more. When the page becomes code only those are dropped, not a whole
        TLB scanned. */
     uint64_t *whint;
+    /* Per page: the VA page (| 2) its blocks have been cached as branch targets under since its code last changed;
+       0 none, ~0 more than one. So a code change drops just those cached targets (HV_IJC_PAGES, hv_invalidate_code). */
+    uint64_t *ijc_va;
+    size_t npages;       /* pages of HV_TLB_PAGE_BITS: what page_gen, whint and ijc_va are per */
     /* Optional, per 4 KB page: where that page lives in host memory (NULL: host + offset as usual).
        A device window whose pages come from separate host allocations (virtio-gpu hostmem blobs,
        mapped at 4 KB offsets while host pages are 16 KB). Read through hv_ram_host(). */
@@ -102,6 +106,7 @@ typedef struct HvStats {
     uint64_t posted_kind[4];
     uint64_t race_kind[3];    /* remote drops that raced: walk under way, cache fill under way, either during the drop */  /* TLBIs other CPUs had to do themselves: a page or small range that raced, a big range, the rest (ASID, all) */
     uint64_t range_spared;    /* big user-range TLBIs that needed no cached targets dropped */
+    uint64_t code_ijc[3];     /* code changes: no cached target into the page, its VA page's targets dropped, all dropped (HV_IJC_PAGES) */
     uint64_t kernel_ranges;   /* big kernel-range TLBIs, dropped by range rather than with everything */
     uint64_t tlb_range_flushes; /* and that dropped only the TLB entries in the range */     /* of hv_ijc_resolve's lookups, ones that walked for the target page */   /* hv_ijc_resolve could not: chaining off/odd target, filters full, no TLB entry, block not made yet */   /* the same for hv_ijc_resolve's fills */
     uint64_t fill_kind[4];    /* ijc fills into an empty slot, over another live salt, over the same salt, over a dead salt */
@@ -187,6 +192,8 @@ typedef struct HvPerCpu {
     uint32_t req_flags;          /* HV_REQ_* */
     uint32_t nreq;
     struct { uint32_t op1, crn, crm, op2; uint64_t xt; } req[64]; /* TLBIs to apply */
+    uint32_t nijc_page;
+    uint64_t ijc_page[16];       /* code changed: cached targets to forget (hv_ijc_drop_code_page), queued as req */
     uint64_t req_seq, ack_seq;
     /* active: inside the dispatcher loop (0 while parked: WFI, powered off, at a
        flush barrier). tlb_live: active and not itself waiting for acks, i.e. it
@@ -313,7 +320,7 @@ int hv_ic_ivau_drops(void);
    ones after it) are read in init_rest with their defaults, so the Mac tool and the tests can set them too
    (Documents/env.txt on iOS): 0 turns one off. */
 enum { HV_K_NO_RAS, HV_K_SUPERBLOCKS, HV_K_GROUPS, HV_K_WFI_SPIN, HV_K_FLUSH, HV_K_TEST1, HV_K_TEST2, HV_K_TEST3, HV_K_TLBT, HV_K_JITCAP, HV_K_RECHECK,
-       HV_K_FASTICACHE, HV_K_IJCTTBKEY, HV_K_LOGFLUSH, HV_K_COUNT };
+       HV_K_FASTICACHE, HV_K_IJCTTBKEY, HV_K_LOGFLUSH, HV_K_IJCPAGES, HV_K_COUNT };
 extern int hv_knob[HV_K_COUNT];
 int hv_knob_set(HvMachine *m, const char *name, int value);
 /* Debugging (HV_WATCH): which pages keep losing their translations. */
@@ -339,6 +346,12 @@ void hv_dev_unlock(HvMachine *m);
 /* Ask another CPU to apply a TLBI (or HV_REQ_* work); returns the sequence to wait for. */
 uint64_t hv_cpu_post_tlbi(HvCpu *target, uint32_t op1, uint32_t crn, uint32_t crm, uint32_t op2, uint64_t xt);
 uint64_t hv_cpu_post(HvCpu *target, uint32_t flags);
+/* Code changed in a page whose blocks were cached as branch targets at VA page v (| 2), or v = 1: only the return
+   predictions. Too many queued: the whole branch cache instead. */
+uint64_t hv_cpu_post_ijc_page(HvCpu *target, uint64_t v);
+/* On cpu's own thread: code changed in a page cached as branch targets at VA page v (| 2), or v = 1 (none):
+   forget the return predictions and those targets, under every live id (mmu.c). */
+void hv_ijc_drop_code_page(HvCpu *cpu, uint64_t v);
 /* Wait until target has done everything up to seq (or is parked, and will before it runs). */
 void hv_cpu_sync(HvCpu *self, HvCpu *target, uint64_t seq);
 /* The owner: do what other CPUs asked. */

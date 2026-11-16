@@ -635,6 +635,8 @@ static void print_stats(HvCpu *cpu, int force) {
         mach_port_deallocate(mach_task_self(), self);
         fprintf(stderr, "  cache drops/s: full %.0f, ASID %.0f, user VA %.0f, kernel VA %.0f, code %.0f (whole user half %.0f, filter full %.0f, big user range %.0f)\n", RATE(reset_why[0]),
                 RATE(reset_why[1]), RATE(reset_why[2]), RATE(reset_why[3]), RATE(reset_why[4]), RATE(reset_why[5]), RATE(reset_why[6]), RATE(reset_why[7]));
+        fprintf(stderr, "  code changes/s: no cached target into the page %.0f, that VA page's targets dropped %.0f, all dropped %.0f\n",
+                RATE(code_ijc[0]), RATE(code_ijc[1]), RATE(code_ijc[2]));
         { /* block hash health: chain lengths and how much of it is stale */
             uint64_t used = 0, stale = 0, maxlen = 0, sumsq = 0;
             uint32_t worst = 0;
