@@ -8,39 +8,62 @@ func L(_ zh: String, _ en: String) -> String {
     (Locale.preferredLanguages.first ?? "en").hasPrefix("zh") ? zh : en
 }
 
-/// The whole app: the Windows screen edge to edge, one small floating toolbar, a launch page while
-/// Windows is not running, and a settings sheet.
+/// Where the laptop posture puts things: the top half of the screen is the lid (a thin bezel around
+/// the Windows screen), the bottom half the keyboard and trackpad deck. The halves meet at the hinge.
+private struct LaptopMetrics {
+    static let chinHeight: CGFloat = 15
+    static let sideBezel: CGFloat = 6
+
+    let lidHeight: CGFloat
+    let deckHeight: CGFloat
+    let cameraBezel: CGFloat
+    /// The Windows screen inside the lid, in screen coordinates.
+    let screen: CGRect
+
+    init(full: CGSize, safeTop: CGFloat) {
+        lidHeight = (full.height * 0.5).rounded(.down)
+        deckHeight = max(0, full.height - lidHeight)
+        cameraBezel = max(safeTop > 20 ? safeTop - 8 : 9, 9)
+        screen = CGRect(x: Self.sideBezel, y: cameraBezel,
+                        width: max(1, full.width - Self.sideBezel * 2),
+                        height: max(1, lidHeight - cameraBezel - Self.chinHeight))
+    }
+}
+
+/// The whole app: the Windows screen with one small floating toolbar (Studio), or on a half-folded
+/// foldable the Windows screen on the top half and a keyboard and trackpad on the bottom half (Laptop);
+/// a launch page while Windows is not running, and a settings sheet.
 struct SessionView: View {
     @ObservedObject var vm: VMViewModel
     @State private var showPowerConfirm = false
+    /// When the toolbar last appeared (it does not hide itself in its first moment).
+    @State private var controlBarShownAt = Date()
 
     var body: some View {
-        ZStack(alignment: .top) {
-            Color.black.ignoresSafeArea()
-
-            MetalDisplayView(
-                directTouch: $vm.directTouch,
-                keyboardVisible: $vm.systemKeyboardVisible,
-                hardwareKeyboard: vm.hardwareKeyboard,
-                focusAllowed: vm.isVMRunning && !vm.showSettings && vm.activeSafariURL == nil,
-                onThreeFingerTap: { withAnimation(.snappy(duration: 0.2)) { vm.controlBarVisible.toggle() } }
-            )
-            .ignoresSafeArea(.container, edges: [.bottom, .horizontal])
-            .opacity(vm.isVMRunning ? 1 : 0)
-
-            if vm.isVMRunning {
-                toolbar
-                    .padding(.top, 6)
-                    .transition(.move(edge: .top).combined(with: .opacity))
-            } else {
-                LaunchPage(vm: vm)
-            }
+        GeometryReader { geo in
+            // The whole screen, whatever the safe areas (and the on-screen keyboard) leave.
+            let full = CGSize(width: geo.size.width + geo.safeAreaInsets.leading + geo.safeAreaInsets.trailing,
+                              height: geo.size.height + geo.safeAreaInsets.top + geo.safeAreaInsets.bottom)
+            let laptop = vm.isVMRunning && vm.isLaptopLayoutActive(for: full)
+            session(full: full, laptop: laptop, lid: LaptopMetrics(full: full, safeTop: geo.safeAreaInsets.top))
+                .onAppear { vm.viewportSize = full }
+                .onChange(of: full) { _, newSize in vm.viewportSize = newSize }
+                .onChange(of: laptop) { _, on in
+                    if on {
+                        vm.systemKeyboardVisible = false // the deck is the keyboard
+                    } else {
+                        vm.rightClickArmed = false
+                    }
+                }
         }
         .statusBarHidden(true)
         .persistentSystemOverlays(.hidden)
         .defersSystemGestures(on: .all)
         .onAppear {
             WinIOSBridge.shared.updateScreenSize(UIScreen.main.bounds.size, scale: UIScreen.main.scale)
+        }
+        .onChange(of: vm.controlBarVisible) { _, visible in
+            if visible { controlBarShownAt = Date() }
         }
         .sheet(item: $vm.activeSafariURL) { item in
             SafariSheet(url: item.url).ignoresSafeArea()
@@ -68,59 +91,183 @@ struct SessionView: View {
         }
     }
 
-    // MARK: - Floating toolbar
+    /// One Windows screen for both postures (the same view, so Windows keeps its display and the
+    /// keyboard focus): full screen under the toolbar, or the lid's screen above the deck. Its size
+    /// is what Windows' resolution follows, so in Laptop Windows gets the lid's shape.
+    private func session(full: CGSize, laptop: Bool, lid: LaptopMetrics) -> some View {
+        ZStack(alignment: .top) {
+            Color.black.ignoresSafeArea()
+
+            // Invisible: UIHingeInteraction (iOS 27.1) reports the fold.
+            HingeSensorView { statusRaw, angleDeg in
+                DispatchQueue.main.async {
+                    vm.updateHinge(statusRaw: statusRaw, angleDegrees: angleDeg, viewportSize: vm.viewportSize)
+                }
+            }
+            .frame(width: 0, height: 0)
+            .allowsHitTesting(false)
+
+            if laptop {
+                VStack(spacing: 0) {
+                    laptopLid(width: full.width, lid: lid)
+                        .frame(width: full.width, height: lid.lidHeight)
+                    LaptopDeckView(vm: vm)
+                        .frame(width: full.width, height: lid.deckHeight)
+                }
+                .frame(width: full.width, height: full.height)
+                .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+                .ignoresSafeArea()
+                .transition(.opacity)
+            }
+
+            MetalDisplayView(
+                directTouch: laptop ? .constant(true) : $vm.directTouch, // the deck has the trackpad
+                keyboardVisible: laptop ? .constant(false) : $vm.systemKeyboardVisible,
+                hardwareKeyboard: vm.hardwareKeyboard,
+                focusAllowed: vm.isVMRunning && !vm.showSettings && vm.activeSafariURL == nil,
+                onThreeFingerTap: {
+                    if laptop {
+                        withAnimation(.spring(response: 0.28, dampingFraction: 0.88)) {
+                            vm.setPostureMode(.fullScreen, viewportSize: full)
+                        }
+                    } else {
+                        withAnimation(.snappy(duration: 0.2)) { vm.controlBarVisible.toggle() }
+                    }
+                },
+                rightClickArmed: $vm.rightClickArmed,
+                keyboardResizesView: !laptop,
+                onUserInteraction: {
+                    guard !laptop, vm.autoHideControlBar, vm.controlBarVisible,
+                          Date().timeIntervalSince(controlBarShownAt) > 1.0 else { return }
+                    withAnimation(.snappy(duration: 0.2)) { vm.controlBarVisible = false }
+                }
+            )
+            .clipShape(RoundedRectangle(cornerRadius: laptop ? 5.5 : 0, style: .continuous))
+            .overlay {
+                RoundedRectangle(cornerRadius: laptop ? 5.5 : 0, style: .continuous)
+                    .strokeBorder(Color.white.opacity(laptop ? 0.07 : 0), lineWidth: 0.5)
+                    .allowsHitTesting(false)
+            }
+            .frame(width: laptop ? lid.screen.width : nil, height: laptop ? lid.screen.height : nil)
+            .padding(.leading, laptop ? lid.screen.minX : 0)
+            .padding(.top, laptop ? lid.screen.minY : 0)
+            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+            .ignoresSafeArea(laptop ? .all : .container, edges: laptop ? .all : [.bottom, .horizontal])
+            .opacity(vm.isVMRunning ? 1 : 0)
+
+            if vm.isVMRunning {
+                if !laptop {
+                    toolbar
+                        .padding(.top, 6)
+                        .transition(.move(edge: .top).combined(with: .opacity))
+                }
+            } else {
+                LaunchPage(vm: vm)
+            }
+        }
+    }
+
+    // MARK: - Laptop lid
+
+    /// The lid around the Windows screen (which is drawn on top of it): a camera bezel, and a chin
+    /// with the sign-in browser switch and the posture switch.
+    private func laptopLid(width: CGFloat, lid: LaptopMetrics) -> some View {
+        ZStack(alignment: .top) {
+            RoundedRectangle(cornerRadius: 12, style: .continuous)
+                .fill(LinearGradient(colors: [Color(red: 0.038, green: 0.046, blue: 0.072),
+                                              Color(red: 0.020, green: 0.024, blue: 0.038)],
+                                     startPoint: .top, endPoint: .bottom))
+                .overlay(
+                    RoundedRectangle(cornerRadius: 12, style: .continuous)
+                        .strokeBorder(LinearGradient(colors: [Color(red: 0.64, green: 0.75, blue: 0.96).opacity(0.28),
+                                                              Color(red: 0.45, green: 0.56, blue: 0.78).opacity(0.10),
+                                                              Color.black.opacity(0.60)],
+                                                     startPoint: .top, endPoint: .bottom),
+                                      lineWidth: 0.85)
+                )
+
+            VStack(spacing: 0) {
+                // Camera bezel: the camera, and a status light (orange without JIT)
+                HStack(spacing: 7) {
+                    Circle().fill(Color(red: 0.10, green: 0.12, blue: 0.18)).frame(width: 3.5, height: 3.5)
+                    ZStack {
+                        Circle()
+                            .fill(Color(red: 0.05, green: 0.07, blue: 0.12))
+                            .frame(width: 5.5, height: 5.5)
+                            .overlay(Circle().strokeBorder(Color.white.opacity(0.16), lineWidth: 0.4))
+                        Circle()
+                            .fill(Color(red: 0.45, green: 0.65, blue: 1.0).opacity(0.55))
+                            .frame(width: 1.6, height: 1.6)
+                            .offset(x: -0.8, y: -0.8)
+                    }
+                    Circle()
+                        .fill(vm.isJITLive ? Color.white.opacity(0.32) : Color.orange.opacity(0.6))
+                        .frame(width: 2.4, height: 2.4)
+                }
+                .frame(height: lid.cameraBezel)
+
+                RoundedRectangle(cornerRadius: 5.5, style: .continuous)
+                    .fill(Color.black)
+                    .padding(.horizontal, LaptopMetrics.sideBezel)
+                    .frame(height: lid.screen.height)
+
+                ZStack {
+                    HStack(spacing: 5) {
+                        WindowsLogoMark(size: 7.5, color: Color.white.opacity(0.22))
+                        Text("SURFACE")
+                            .font(.system(size: 7.5, weight: .semibold))
+                            .tracking(2.2)
+                            .foregroundStyle(Color.white.opacity(0.22))
+                    }
+                    HStack {
+                        if !vm.isLinux {
+                            chinButton(vm.useSafariForOAuth ? "OAUTH: SAFARI" : "OAUTH: EDGE",
+                                       accessibility: vm.useSafariForOAuth
+                                           ? L("登录链接用 Safari 打开", "Sign-in links open in Safari")
+                                           : L("登录链接用 Edge 打开", "Sign-in links open in Edge")) {
+                                vm.toggleOAuthBrowserMode()
+                            }
+                        }
+                        Spacer()
+                        chinButton(vm.hingeAngleDegrees.map { String(format: "%.0f°", $0) } ?? vm.postureMode.rawValue.uppercased(),
+                                   accessibility: L("姿态：", "Posture: ") + vm.postureMode.title) {
+                            vm.cyclePostureMode(viewportSize: vm.viewportSize)
+                        }
+                    }
+                    .padding(.horizontal, 10)
+                }
+                .frame(height: LaptopMetrics.chinHeight)
+            }
+        }
+        .frame(width: width)
+    }
+
+    private func chinButton(_ text: String, accessibility: String, action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            Text(text)
+                .font(.system(size: 8.0, weight: .medium, design: .monospaced))
+                .foregroundStyle(Color.white.opacity(0.28))
+                .padding(.horizontal, 6)
+                .padding(.vertical, 1.5)
+                .contentShape(Rectangle().inset(by: -6))
+        }
+        .buttonStyle(.plain)
+        .accessibilityLabel(accessibility)
+    }
+
+    // MARK: - Floating toolbar (Studio)
 
     @ViewBuilder
     private var toolbar: some View {
         if vm.controlBarVisible {
-            HStack(spacing: 2) {
-                if !vm.hardwareKeyboard { // with a hardware keyboard attached there is nothing to bring up
-                    barButton(vm.systemKeyboardVisible ? "keyboard.fill" : "keyboard", L("键盘", "Keyboard"),
-                              active: vm.systemKeyboardVisible) {
-                        vm.systemKeyboardVisible.toggle()
-                    }
+            // On a narrow screen the row scrolls instead of being cut off.
+            ViewThatFits(in: .horizontal) {
+                toolbarRow
+                ScrollView(.horizontal, showsIndicators: false) {
+                    toolbarRow.padding(.horizontal, 8).padding(.vertical, 12)
                 }
-                barButton(vm.directTouch ? "hand.point.up.left.fill" : "rectangle.and.hand.point.up.left",
-                          vm.directTouch ? L("直接触摸", "Direct touch") : L("触控板", "Trackpad"),
-                          active: vm.directTouch) {
-                    vm.directTouch.toggle()
-                }
-                barButton("square.grid.2x2.fill", L("Win 键", "Windows key")) {
-                    WinIOSBridge.shared.sendWindowsKey()
-                }
-                if !vm.isLinux { // runs through the Windows-side helper
-                    Menu {
-                        Button("Claude Code", systemImage: "terminal") { vm.installClaudeCode() }
-                    } label: {
-                        barIcon("sparkles", active: false)
-                    }
-                    .accessibilityLabel(L("安装工具", "Install tools"))
-                }
-                Menu {
-                    Section(L("快捷键", "Shortcuts")) {
-                        Button("Ctrl + Alt + Del", systemImage: "lock") { WinIOSBridge.shared.sendCtrlAltDel() }
-                        Button(L("任务管理器", "Task Manager"), systemImage: "waveform.path.ecg") { vm.sendTaskManager() }
-                        Button("Alt + Tab", systemImage: "rectangle.on.rectangle") { WinIOSBridge.shared.sendAltTab() }
-                        Button("Esc", systemImage: "escape") { WinIOSBridge.shared.sendEscape() }
-                    }
-                    Section {
-                        Button(L("设置", "Settings"), systemImage: "gearshape") { vm.showSettings = true }
-                        Button(L("电源…", "Power…"), systemImage: "power") { showPowerConfirm = true }
-                    }
-                } label: {
-                    barIcon("ellipsis.circle", active: false)
-                }
-                .accessibilityLabel(L("更多", "More"))
-                Divider().frame(height: 20).padding(.horizontal, 2)
-                barButton("chevron.up", L("收起工具栏", "Hide toolbar")) {
-                    withAnimation(.snappy(duration: 0.2)) { vm.controlBarVisible = false }
-                }
+                .padding(.vertical, -12)
             }
-            .padding(.horizontal, 6)
-            .padding(.vertical, 4)
-            .background(.ultraThinMaterial, in: Capsule())
-            .overlay(Capsule().strokeBorder(.white.opacity(0.12)))
-            .shadow(color: .black.opacity(0.35), radius: 10, y: 3)
         } else {
             // A small handle so the toolbar can always be brought back (a three-finger tap does it too).
             Button {
@@ -136,6 +283,84 @@ struct SessionView: View {
             .accessibilityLabel(L("显示工具栏", "Show toolbar"))
             .opacity(0.7)
         }
+    }
+
+    private var toolbarRow: some View {
+        HStack(spacing: 2) {
+            if vm.supportsLaptopPosture { // a foldable: Laptop or Studio
+                Menu {
+                    Picker(L("姿态", "Posture"), selection: Binding(
+                        get: { vm.postureMode },
+                        set: { mode in
+                            withAnimation(.spring(response: 0.28, dampingFraction: 0.88)) {
+                                vm.setPostureMode(mode, viewportSize: vm.viewportSize)
+                            }
+                        }
+                    )) {
+                        ForEach(PostureMode.allCases, id: \.self) { mode in
+                            Label(mode.title, systemImage: mode.iconName).tag(mode)
+                        }
+                    }
+                } label: {
+                    barIcon("laptopcomputer", active: false)
+                }
+                .accessibilityLabel(L("姿态", "Posture"))
+            }
+            if !vm.hardwareKeyboard { // with a hardware keyboard attached there is nothing to bring up
+                barButton(vm.systemKeyboardVisible ? "keyboard.fill" : "keyboard", L("键盘", "Keyboard"),
+                          active: vm.systemKeyboardVisible) {
+                    vm.systemKeyboardVisible.toggle()
+                }
+            }
+            barButton(vm.directTouch ? "hand.point.up.left.fill" : "rectangle.and.hand.point.up.left",
+                      vm.directTouch ? L("直接触摸", "Direct touch") : L("触控板", "Trackpad"),
+                      active: vm.directTouch) {
+                vm.directTouch.toggle()
+            }
+            barButton("square.grid.2x2.fill", L("Win 键", "Windows key")) {
+                WinIOSBridge.shared.sendWindowsKey()
+            }
+            if !vm.isLinux { // these run inside Windows
+                Menu {
+                    Button("Claude Code", systemImage: "terminal") { vm.installClaudeCode() }
+                    Button("Paint", systemImage: "paintbrush.pointed") { vm.launchGuestPaint() }
+                    Button("Edge", systemImage: "globe") { vm.launchGuestEdgeBrowser() }
+                } label: {
+                    barIcon("sparkles", active: false)
+                }
+                .accessibilityLabel(L("应用", "Apps"))
+                barButton(vm.useSafariForOAuth ? "safari" : "network",
+                          vm.useSafariForOAuth ? L("登录链接用 Safari 打开", "Sign-in links open in Safari")
+                                               : L("登录链接用 Edge 打开", "Sign-in links open in Edge"),
+                          active: vm.useSafariForOAuth) {
+                    vm.toggleOAuthBrowserMode()
+                }
+            }
+            Menu {
+                Section(L("快捷键", "Shortcuts")) {
+                    Button("Ctrl + Alt + Del", systemImage: "lock") { WinIOSBridge.shared.sendCtrlAltDel() }
+                    Button(L("任务管理器", "Task Manager"), systemImage: "waveform.path.ecg") { vm.sendTaskManager() }
+                    Button("Alt + Tab", systemImage: "rectangle.on.rectangle") { WinIOSBridge.shared.sendAltTab() }
+                    Button("Esc", systemImage: "escape") { WinIOSBridge.shared.sendEscape() }
+                }
+                Section {
+                    Button(L("设置", "Settings"), systemImage: "gearshape") { vm.showSettings = true }
+                    Button(L("电源…", "Power…"), systemImage: "power") { showPowerConfirm = true }
+                }
+            } label: {
+                barIcon("ellipsis.circle", active: false)
+            }
+            .accessibilityLabel(L("更多", "More"))
+            Divider().frame(height: 20).padding(.horizontal, 2)
+            barButton("chevron.up", L("收起工具栏", "Hide toolbar")) {
+                withAnimation(.snappy(duration: 0.2)) { vm.controlBarVisible = false }
+            }
+        }
+        .padding(.horizontal, 6)
+        .padding(.vertical, 4)
+        .background(.ultraThinMaterial, in: Capsule())
+        .overlay(Capsule().strokeBorder(.white.opacity(0.12)))
+        .shadow(color: .black.opacity(0.35), radius: 10, y: 3)
     }
 
     private func barIcon(_ symbol: String, active: Bool) -> some View {
@@ -482,6 +707,7 @@ private struct SettingsSheet: View {
                         Text(L("直接触摸", "Direct touch")).tag(true)
                     }
                     .pickerStyle(.segmented)
+                    Toggle(L("使用 Windows 时自动收起工具栏", "Hide the toolbar while using Windows"), isOn: $vm.autoHideControlBar)
                 } header: {
                     Text(L("触控", "Touch"))
                 } footer: {
@@ -492,11 +718,29 @@ private struct SettingsSheet: View {
                             "Slide = move pointer · Tap = left click · Two-finger tap = right click · Two-finger slide = scroll · Tap then hold and move (or long press, then move) = drag · Three-finger tap = toolbar"))
                 }
 
+                if vm.supportsLaptopPosture {
+                    Section {
+                        Picker(L("姿态", "Posture"), selection: Binding(
+                            get: { vm.postureMode },
+                            set: { vm.setPostureMode($0, viewportSize: vm.viewportSize) }
+                        )) {
+                            ForEach(PostureMode.allCases, id: \.self) { mode in
+                                Text(mode.title).tag(mode)
+                            }
+                        }
+                    } header: {
+                        Text(L("折叠屏", "Foldable"))
+                    } footer: {
+                        Text(L("笔记本：半折时上半屏是 Windows，下半屏是键盘和触控板（上半屏直接触摸；F8 让下一次轻点变成右键，F12 或三指轻点回到全屏）。全屏：Windows 占满整个屏幕。自动：按折叠角度切换，没有角度读数时，竖着拿展开的内屏就是笔记本。Windows 的分辨率跟着画面大小变（需要 WinKit 的显卡驱动）。",
+                               "Laptop: half folded, Windows is on the top half and a keyboard and trackpad on the bottom half (touch the top half directly; F8 makes the next tap a right click, F12 or a three-finger tap goes back to Studio). Studio: Windows fills the screen. Automatic follows the hinge; without a hinge reading, the unfolded inner screen held upright is Laptop. Windows' resolution follows the screen's shape (with the WinKit display driver)."))
+                    }
+                }
+
                 Section {
                     if !vm.isLinux {
                         HStack {
                             Text(L("CPU 名称", "CPU name"))
-                            TextField("Apple Silicon", text: $vm.cpuName)
+                            TextField(L("自动", "Automatic"), text: $vm.cpuName)
                                 .multilineTextAlignment(.trailing)
                                 .autocorrectionDisabled()
                                 .onSubmit { vm.saveCPUName() }
@@ -513,7 +757,8 @@ private struct SettingsSheet: View {
                     Text(L("系统", "System"))
                 } footer: {
                     if !vm.isLinux {
-                        Text(L("CPU 名称是 Windows 里显示的处理器名字，下次启动生效。", "The CPU name is what Windows shows for the processor; applies at the next start."))
+                        Text(L("CPU 名称是 Windows 里显示的处理器名字，下次启动生效。留空时用设备的芯片名（例如 Apple A20 Pro），不认识的设备显示 Apple Silicon。",
+                               "The CPU name is what Windows shows for the processor; applies at the next start. Left empty, it is the device's chip (e.g. Apple A20 Pro), or Apple Silicon on a device the app does not know."))
                     }
                 }
 
@@ -529,6 +774,9 @@ private struct SettingsSheet: View {
                     LabeledContent(L("显卡", "Graphics"), value: vm.gpuStatusSummary)
                     LabeledContent(L("外接键盘", "Hardware keyboard"),
                                    value: vm.hardwareKeyboard ? L("已连接", "Connected") : L("未连接", "Not connected"))
+                    if vm.supportsLaptopPosture {
+                        LabeledContent(L("铰链", "Hinge"), value: hingeText)
+                    }
                 }
             }
             .navigationTitle(vm.machineTitle + L(" 设置", " Settings"))
@@ -543,6 +791,19 @@ private struct SettingsSheet: View {
             }
         }
         .onDisappear { vm.saveCPUName() }
+    }
+
+    /// The hinge as UIHingeInteraction last reported it.
+    private var hingeText: String {
+        guard let deg = vm.hingeAngleDegrees else { return L("没有读数", "No reading") }
+        let status: String
+        switch vm.hingeStatusRaw {
+        case 1: status = L("合上", "closed")
+        case 2: status = L("半开", "partly open")
+        case 3: status = L("展开", "open")
+        default: status = L("未知", "unknown")
+        }
+        return String(format: "%.0f° · ", deg) + status
     }
 }
 

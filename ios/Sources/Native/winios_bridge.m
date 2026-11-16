@@ -43,6 +43,7 @@ static WinIOSBridge *s_shared_bridge = nil;
     CGFloat _screenScale;
     NSInteger _hingeStatus;
     double _hingeAngleDegrees;
+    BOOL _pausedInBackground;   /* the guest was stopped because the app went to the background */
 }
 - (void)handleVMExitWithReason:(NSString *)reason;
 - (void)updateUnpackProgress:(double)frac;
@@ -146,8 +147,12 @@ static void winios_capture_stderr(NSString *docs) {
         NSNotificationCenter *nc = [NSNotificationCenter defaultCenter];
         /* iOS refuses GPU work from the background while this app keeps running there (audio):
            everything Windows drew meanwhile was lost (missing tray, Start menu, text). So the guest
-           CPUs stop as the app leaves the front and go on when it is back. */
-        [nc addObserver:self selector:@selector(onAppInactive:) name:UIApplicationWillResignActiveNotification object:nil];
+           CPUs stop when the app goes to the background and go on when it is back in front.
+           Only the background counts: an app that is merely inactive (Control Center, a notification
+           banner, the Face ID or passkey sheet during a Safari sign-in) is still on screen and may
+           still use the GPU, and stopping Windows then would stall the sign-in it is waiting for. */
+        [nc addObserver:self selector:@selector(onAppBackground:) name:UIApplicationDidEnterBackgroundNotification object:nil];
+        [nc addObserver:self selector:@selector(onAppForeground:) name:UIApplicationWillEnterForegroundNotification object:nil];
         [nc addObserver:self selector:@selector(onAppActive:) name:UIApplicationDidBecomeActiveNotification object:nil];
         [nc addObserver:self selector:@selector(onAppBackgroundOrTerminate:) name:UIApplicationDidEnterBackgroundNotification object:nil];
         [nc addObserver:self selector:@selector(onAppBackgroundOrTerminate:) name:UIApplicationWillTerminateNotification object:nil];
@@ -191,20 +196,39 @@ static void winios_capture_stderr(NSString *docs) {
     }
 }
 
-- (void)onAppInactive:(NSNotification *)note {
+- (void)onAppBackground:(NSNotification *)note {
     (void)note;
     if (_vmRunning && !getenv("WINIOS_RUN_IN_BACKGROUND")) {
         hv_winvm_set_paused(1);
-        fprintf(stderr, "winvm: paused (app not in front)\n");
+        _pausedInBackground = YES;
+        fprintf(stderr, "winvm: paused (app in the background)\n");
     }
 }
 
-- (void)onAppActive:(NSNotification *)note {
-    (void)note;
+- (void)resumeFromBackground {
+    if (!_pausedInBackground) return;
+    _pausedInBackground = NO;
     if (_vmRunning) {
         hv_winvm_set_paused(0);
         fprintf(stderr, "winvm: resumed\n");
     }
+}
+
+- (void)onAppForeground:(NSNotification *)note {
+    (void)note;
+    /* While this notification is delivered the app is still in the background state, where GPU
+       work is refused: go on once UIKit has finished moving it to the foreground (DidBecomeActive
+       also resumes, for when that comes first). */
+    dispatch_async(dispatch_get_main_queue(), ^{
+        if ([UIApplication sharedApplication].applicationState != UIApplicationStateBackground) {
+            [self resumeFromBackground];
+        }
+    });
+}
+
+- (void)onAppActive:(NSNotification *)note {
+    (void)note;
+    [self resumeFromBackground];
 }
 
 - (void)onAppBackgroundOrTerminate:(NSNotification *)note {
@@ -400,38 +424,68 @@ static NSString *winios_model_identifier(void) {
     return @(buf);
 }
 
-/* Its marketing name. iOS has no public way to ask, so: the identifiers of recent devices, else
-   "iPad (iPad99,9)". */
-static NSString *winios_model_name(NSString *ident) {
-    static NSDictionary<NSString *, NSString *> *names;
+/* Its marketing name and chip. iOS has no public way to ask, so: a table of recent devices, else
+   "iPad (iPad99,9)" and no chip. Names and chips follow Henge's ios/Henge/DeviceIdentity.swift
+   (Leviidev/Henge 7b55730, GPL-2.0, itself from adamawolf/3048717 and AppleDB), plus the M5 iPads. */
+static NSArray<NSString *> *winios_model_entry(NSString *ident) {
+    static NSDictionary<NSString *, NSArray<NSString *> *> *table;
     static dispatch_once_t once;
     dispatch_once(&once, ^{
-        names = @{
-            @"iPhone15,4": @"iPhone 15", @"iPhone15,5": @"iPhone 15 Plus",
-            @"iPhone16,1": @"iPhone 15 Pro", @"iPhone16,2": @"iPhone 15 Pro Max",
-            @"iPhone17,1": @"iPhone 16 Pro", @"iPhone17,2": @"iPhone 16 Pro Max",
-            @"iPhone17,3": @"iPhone 16", @"iPhone17,4": @"iPhone 16 Plus", @"iPhone17,5": @"iPhone 16e",
-            @"iPhone18,1": @"iPhone 17 Pro", @"iPhone18,2": @"iPhone 17 Pro Max",
-            @"iPhone19,2": @"iPhone 18 Pro",
-            @"iPad13,4": @"iPad Pro 11-inch (M1)", @"iPad13,5": @"iPad Pro 11-inch (M1)",
-            @"iPad13,6": @"iPad Pro 11-inch (M1)", @"iPad13,7": @"iPad Pro 11-inch (M1)",
-            @"iPad13,8": @"iPad Pro 12.9-inch (M1)", @"iPad13,9": @"iPad Pro 12.9-inch (M1)",
-            @"iPad13,10": @"iPad Pro 12.9-inch (M1)", @"iPad13,11": @"iPad Pro 12.9-inch (M1)",
-            @"iPad13,16": @"iPad Air (M1)", @"iPad13,17": @"iPad Air (M1)",
-            @"iPad14,3": @"iPad Pro 11-inch (M2)", @"iPad14,4": @"iPad Pro 11-inch (M2)",
-            @"iPad14,5": @"iPad Pro 12.9-inch (M2)", @"iPad14,6": @"iPad Pro 12.9-inch (M2)",
-            @"iPad14,8": @"iPad Air 11-inch (M2)", @"iPad14,9": @"iPad Air 11-inch (M2)",
-            @"iPad14,10": @"iPad Air 13-inch (M2)", @"iPad14,11": @"iPad Air 13-inch (M2)",
-            @"iPad16,3": @"iPad Pro 11-inch (M4)", @"iPad16,4": @"iPad Pro 11-inch (M4)",
-            @"iPad16,5": @"iPad Pro 13-inch (M4)", @"iPad16,6": @"iPad Pro 13-inch (M4)",
-            @"iPad17,1": @"iPad Pro 11-inch (M5)", @"iPad17,2": @"iPad Pro 11-inch (M5)",
-            @"iPad17,3": @"iPad Pro 13-inch (M5)", @"iPad17,4": @"iPad Pro 13-inch (M5)",
+        table = @{
+            @"iPhone13,1": @[@"iPhone 12 mini", @"Apple A14"], @"iPhone13,2": @[@"iPhone 12", @"Apple A14"],
+            @"iPhone13,3": @[@"iPhone 12 Pro", @"Apple A14"], @"iPhone13,4": @[@"iPhone 12 Pro Max", @"Apple A14"],
+            @"iPhone14,2": @[@"iPhone 13 Pro", @"Apple A15"], @"iPhone14,3": @[@"iPhone 13 Pro Max", @"Apple A15"],
+            @"iPhone14,4": @[@"iPhone 13 mini", @"Apple A15"], @"iPhone14,5": @[@"iPhone 13", @"Apple A15"],
+            @"iPhone14,6": @[@"iPhone SE (A15)", @"Apple A15"],
+            @"iPhone14,7": @[@"iPhone 14", @"Apple A15"], @"iPhone14,8": @[@"iPhone 14 Plus", @"Apple A15"],
+            @"iPhone15,2": @[@"iPhone 14 Pro", @"Apple A16"], @"iPhone15,3": @[@"iPhone 14 Pro Max", @"Apple A16"],
+            @"iPhone15,4": @[@"iPhone 15", @"Apple A16"], @"iPhone15,5": @[@"iPhone 15 Plus", @"Apple A16"],
+            @"iPhone16,1": @[@"iPhone 15 Pro", @"Apple A17 Pro"], @"iPhone16,2": @[@"iPhone 15 Pro Max", @"Apple A17 Pro"],
+            @"iPhone17,1": @[@"iPhone 16 Pro", @"Apple A18 Pro"], @"iPhone17,2": @[@"iPhone 16 Pro Max", @"Apple A18 Pro"],
+            @"iPhone17,3": @[@"iPhone 16", @"Apple A18"], @"iPhone17,4": @[@"iPhone 16 Plus", @"Apple A18"],
+            @"iPhone17,5": @[@"iPhone 16e", @"Apple A18"],
+            @"iPhone18,1": @[@"iPhone 17 Pro", @"Apple A19 Pro"], @"iPhone18,2": @[@"iPhone 17 Pro Max", @"Apple A19 Pro"],
+            @"iPhone18,3": @[@"iPhone 17", @"Apple A19"], @"iPhone18,4": @[@"iPhone Air", @"Apple A19 Pro"],
+            @"iPhone18,5": @[@"iPhone 17e", @"Apple A19"],
+            @"iPhone19,2": @[@"iPhone 18 Pro", @"Apple A20 Pro"], @"iPhone19,3": @[@"iPhone 18 Pro Max", @"Apple A20 Pro"],
+            @"iPhone19,7": @[@"iPhone 18 Pro Max", @"Apple A20 Pro"],
+            @"iPhone19,4": @[@"iPhone Duo", @"Apple A20 Pro"],
+            @"iPad13,1": @[@"iPad Air (A14)", @"Apple A14"], @"iPad13,2": @[@"iPad Air (A14)", @"Apple A14"],
+            @"iPad13,4": @[@"iPad Pro 11-inch (M1)", @"Apple M1"], @"iPad13,5": @[@"iPad Pro 11-inch (M1)", @"Apple M1"],
+            @"iPad13,6": @[@"iPad Pro 11-inch (M1)", @"Apple M1"], @"iPad13,7": @[@"iPad Pro 11-inch (M1)", @"Apple M1"],
+            @"iPad13,8": @[@"iPad Pro 12.9-inch (M1)", @"Apple M1"], @"iPad13,9": @[@"iPad Pro 12.9-inch (M1)", @"Apple M1"],
+            @"iPad13,10": @[@"iPad Pro 12.9-inch (M1)", @"Apple M1"], @"iPad13,11": @[@"iPad Pro 12.9-inch (M1)", @"Apple M1"],
+            @"iPad13,16": @[@"iPad Air (M1)", @"Apple M1"], @"iPad13,17": @[@"iPad Air (M1)", @"Apple M1"],
+            @"iPad13,18": @[@"iPad (10th generation)", @"Apple A14"], @"iPad13,19": @[@"iPad (10th generation)", @"Apple A14"],
+            @"iPad14,1": @[@"iPad mini (A15)", @"Apple A15"], @"iPad14,2": @[@"iPad mini (A15)", @"Apple A15"],
+            @"iPad14,3": @[@"iPad Pro 11-inch (M2)", @"Apple M2"], @"iPad14,4": @[@"iPad Pro 11-inch (M2)", @"Apple M2"],
+            @"iPad14,5": @[@"iPad Pro 12.9-inch (M2)", @"Apple M2"], @"iPad14,6": @[@"iPad Pro 12.9-inch (M2)", @"Apple M2"],
+            @"iPad14,8": @[@"iPad Air 11-inch (M2)", @"Apple M2"], @"iPad14,9": @[@"iPad Air 11-inch (M2)", @"Apple M2"],
+            @"iPad14,10": @[@"iPad Air 13-inch (M2)", @"Apple M2"], @"iPad14,11": @[@"iPad Air 13-inch (M2)", @"Apple M2"],
+            @"iPad15,3": @[@"iPad Air 11-inch (M3)", @"Apple M3"], @"iPad15,4": @[@"iPad Air 11-inch (M3)", @"Apple M3"],
+            @"iPad15,5": @[@"iPad Air 13-inch (M3)", @"Apple M3"], @"iPad15,6": @[@"iPad Air 13-inch (M3)", @"Apple M3"],
+            @"iPad15,7": @[@"iPad (A16)", @"Apple A16"], @"iPad15,8": @[@"iPad (A16)", @"Apple A16"],
+            @"iPad16,1": @[@"iPad mini (A17 Pro)", @"Apple A17 Pro"], @"iPad16,2": @[@"iPad mini (A17 Pro)", @"Apple A17 Pro"],
+            @"iPad16,3": @[@"iPad Pro 11-inch (M4)", @"Apple M4"], @"iPad16,4": @[@"iPad Pro 11-inch (M4)", @"Apple M4"],
+            @"iPad16,5": @[@"iPad Pro 13-inch (M4)", @"Apple M4"], @"iPad16,6": @[@"iPad Pro 13-inch (M4)", @"Apple M4"],
+            @"iPad17,1": @[@"iPad Pro 11-inch (M5)", @"Apple M5"], @"iPad17,2": @[@"iPad Pro 11-inch (M5)", @"Apple M5"],
+            @"iPad17,3": @[@"iPad Pro 13-inch (M5)", @"Apple M5"], @"iPad17,4": @[@"iPad Pro 13-inch (M5)", @"Apple M5"],
         };
     });
-    NSString *n = names[ident];
+    return table[ident];
+}
+
+static NSString *winios_model_name(NSString *ident) {
+    NSString *n = winios_model_entry(ident).firstObject;
     if (n) return n;
     NSString *kind = [ident hasPrefix:@"iPad"] ? @"iPad" : [ident hasPrefix:@"iPhone"] ? @"iPhone" : @"Apple device";
     return [NSString stringWithFormat:@"%@ (%@)", kind, ident];
+}
+
+/* The device's chip ("Apple A20 Pro"), nil when the table does not know the device. */
+static NSString *winios_model_chip(NSString *ident) {
+    NSArray<NSString *> *e = winios_model_entry(ident);
+    return e.count > 1 ? e[1] : nil;
 }
 
 /* Which machine the launch page picked: "Win11" (default) or "Arch" (Arch Linux ARM). Each has its
@@ -759,6 +813,7 @@ static NSString *winios_unpack_resource(NSString *name, NSString *dst) {
         NSString *nameFile = [[self documentsPath] stringByAppendingPathComponent:@"cpu_name.txt"];
         NSString *cpuName = [[NSString stringWithContentsOfFile:nameFile encoding:NSUTF8StringEncoding error:nil]
             stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
+        if (!cpuName.length) cpuName = winios_model_chip(winios_model_identifier());
         if (cpuName.length) setenv("HV_CPU_NAME", cpuName.UTF8String, 1);
     }
 

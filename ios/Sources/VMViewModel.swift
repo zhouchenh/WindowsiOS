@@ -35,6 +35,15 @@ enum PostureMode: String, CaseIterable {
         case .fullScreen: return "ipad.landscape"
         }
     }
+
+    /// What the posture menus show.
+    var title: String {
+        switch self {
+        case .auto: return L("自动（按折叠角度）", "Automatic (follow the hinge)")
+        case .laptop: return L("笔记本", "Laptop")
+        case .fullScreen: return L("全屏", "Studio")
+        }
+    }
 }
 
 enum DeckLayout: String, CaseIterable {
@@ -80,8 +89,14 @@ final class VMViewModel: ObservableObject {
     // iOS 27.1 UIHinge state (0 = unknown, 1 = closed, 2 = partiallyOpen, 3 = fullyOpen)
     @Published var hingeStatusRaw: Int = 0
     @Published var hingeAngleDegrees: Double? = nil
+    /// UIHingeInteraction has reported a hinge on this device at least once.
+    @Published var hingeAvailable: Bool = false
 
-    @Published var postureMode: PostureMode = .auto
+    /// Laptop (folded: Windows on the top half, keyboard and trackpad on the bottom half) or Studio
+    /// (Windows on the whole screen); Auto follows the hinge. Only foldable devices have a choice.
+    @Published var postureMode: PostureMode = PostureMode(rawValue: UserDefaults.standard.string(forKey: "winios.posture") ?? "") ?? .auto {
+        didSet { UserDefaults.standard.set(postureMode.rawValue, forKey: "winios.posture") }
+    }
     @Published var deckLayout: DeckLayout = .split
     @Published var controlBarVisible: Bool = true
     @Published var trackpadMode: Bool = false
@@ -97,6 +112,11 @@ final class VMViewModel: ObservableObject {
         didSet { UserDefaults.standard.set(directTouch, forKey: "winios.directTouch") }
     }
     @Published var showSettings: Bool = false
+    /// The toolbar hides by itself once Windows is used again (a tap, a drag, a click on the screen).
+    /// On by default on a foldable, where the screen is small and the toolbar covers part of it.
+    @Published var autoHideControlBar: Bool = (UserDefaults.standard.object(forKey: "winios.autoHideBar") as? Bool) ?? VMViewModel.isKnownFoldable {
+        didSet { UserDefaults.standard.set(autoHideControlBar, forKey: "winios.autoHideBar") }
+    }
     /// Advanced: JIT code cache in MiB (0 = default, the largest) and the most guest RAM in MiB (0 = automatic).
     /// Both are fixed when JIT is acquired, so a change applies after the app is closed and opened again.
     /// Refresh rate of the machine's screen (all machines): 30, 60 (default) or 120 where the screen can.
@@ -224,7 +244,7 @@ final class VMViewModel: ObservableObject {
         publishClaudeInstaller()
         let job = UUID().uuidString + "\r\n" + VMViewModel.claudeInstallLine + "\r\n"
         try? job.write(to: VMViewModel.documentsURL.appendingPathComponent("Shared/agent_job.txt"), atomically: true, encoding: .ascii)
-        if !hardwareKeyboard { systemKeyboardVisible = true } // the API key is typed by hand
+        if !hardwareKeyboard && !isLaptopLayoutActive { systemKeyboardVisible = true } // the API key is typed by hand
     }
 
     /// The fallback the user can choose when the helper is missing: the command typed by simulated keystrokes.
@@ -233,7 +253,7 @@ final class VMViewModel: ObservableObject {
         publishClaudeInstaller()
         try? ("!" + VMViewModel.claudeInstallLine)
             .write(to: VMViewModel.documentsURL.appendingPathComponent("type.request"), atomically: true, encoding: .utf8)
-        if !hardwareKeyboard { systemKeyboardVisible = true }
+        if !hardwareKeyboard && !isLaptopLayoutActive { systemKeyboardVisible = true }
     }
 
     static let claudeInstallerScript = #"""
@@ -571,26 +591,48 @@ function ai {
         UIImpactFeedbackGenerator(style: .light).impactOccurred()
     }
 
+    // MARK: Posture (foldable devices)
+
+    /// The device's model identifier, e.g. "iPhone19,4".
+    nonisolated static let modelIdentifier: String = {
+        var sys = utsname()
+        uname(&sys)
+        return withUnsafeBytes(of: &sys.machine) { raw in
+            String(decoding: raw.prefix { $0 != 0 }, as: UTF8.self)
+        }
+    }()
+
+    /// Foldable devices the app knows, for when the hinge does not report (yet).
+    nonisolated static let isKnownFoldable: Bool = ["iPhone19,4"].contains(modelIdentifier)
+
+    /// Laptop posture is offered on foldable devices only; everything else always shows Studio.
+    var supportsLaptopPosture: Bool { hingeAvailable || VMViewModel.isKnownFoldable }
+
+    /// The size of the whole screen, last reported by the session view (for the posture choice).
+    @Published var viewportSize: CGSize = .zero
+
+    var isLaptopLayoutActive: Bool { isLaptopLayoutActive(for: viewportSize) }
+
     func isLaptopLayoutActive(for size: CGSize) -> Bool {
+        guard supportsLaptopPosture else { return false }
         switch postureMode {
         case .laptop:
             return true
         case .fullScreen:
             return false
         case .auto:
-            // Hardware hinge folded into laptop posture (partiallyOpen == 2, or live hinge angle 30°..166°)
-            if hingeStatusRaw == 2 {
-                return true
+            // The hinge runs across the screen only while the inner screen is upright.
+            guard size.height > size.width else { return false }
+            switch hingeStatusRaw {
+            case 2: return true          // partially open: a laptop
+            case 1, 3: return false      // closed (the cover screen) or flat
+            default: break
             }
             if let deg = hingeAngleDegrees {
                 return deg >= 30.0 && deg <= 166.0
             }
-            // Fallback when UIHinge hasn't reported yet: portrait inner screen defaults to Laptop
-            let isUnfoldedInner = max(size.width, size.height) > 780 && min(size.width, size.height) > 580
-            if hingeStatusRaw == 0 && isUnfoldedInner && size.height > size.width {
-                return true
-            }
-            return false
+            // No hinge reading: the unfolded inner screen held upright defaults to Laptop.
+            return max(size.width, size.height) > 780 && min(size.width, size.height) > 580
         }
     }
 
@@ -598,22 +640,28 @@ function ai {
         let wasPartiallyOpen = (hingeStatusRaw == 2)
         hingeStatusRaw = statusRaw
         hingeAngleDegrees = angleDegrees
+        if angleDegrees != nil && !hingeAvailable { hingeAvailable = true }
         if postureMode == .auto && statusRaw == 2 && !wasPartiallyOpen {
             UIImpactFeedbackGenerator(style: .soft).impactOccurred()
             SceneOrientationController.alignForLaptopPostureIfLandscape(size: viewportSize)
         }
     }
 
-    func cyclePostureMode(viewportSize: CGSize) {
+    func setPostureMode(_ mode: PostureMode, viewportSize: CGSize) {
+        guard mode != postureMode else { return }
         UIImpactFeedbackGenerator(style: .light).impactOccurred()
-        switch postureMode {
-        case .auto:
-            postureMode = .laptop
+        postureMode = mode
+        if isLaptopLayoutActive(for: viewportSize) || mode == .laptop {
+            systemKeyboardVisible = false // the deck has the keyboard
             SceneOrientationController.alignForLaptopPostureIfLandscape(size: viewportSize)
-        case .laptop:
-            postureMode = .fullScreen
-        case .fullScreen:
-            postureMode = .auto
+        }
+    }
+
+    func cyclePostureMode(viewportSize: CGSize) {
+        switch postureMode {
+        case .auto: setPostureMode(.laptop, viewportSize: viewportSize)
+        case .laptop: setPostureMode(.fullScreen, viewportSize: viewportSize)
+        case .fullScreen: setPostureMode(.auto, viewportSize: viewportSize)
         }
     }
 
@@ -689,7 +737,7 @@ function ai {
                 DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { [weak self] in self?.startOrRetry() }
             }
         }
-        if isVMRunning && !wasRunning && isLinux && !hardwareKeyboard { systemKeyboardVisible = true }
+        if isVMRunning && !wasRunning && isLinux && !hardwareKeyboard && !isLaptopLayoutActive { systemKeyboardVisible = true }
         isUnpacking = b.isUnpacking
         unpackProgress = b.unpackProgress
         jitStatusText = b.jitStatusText
