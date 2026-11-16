@@ -45,6 +45,11 @@ HUSK_REV="29abb512d81bf8cc08babcbe7f7007cb557208ef"
 RUST_TOOLCHAIN="${RUST_TOOLCHAIN:-stable}"
 IOS_TARGET="aarch64-apple-ios"
 
+# scripts/build_ios_deps.sh runs this with its iOS cross-compile environment exported; cargo's
+# build scripts and xcodebuild must not see it.
+unset CC CXX OBJCC AR NM RANLIB STRIP CFLAGS CXXFLAGS CPPFLAGS OBJCFLAGS LDFLAGS \
+      PKG_CONFIG PKG_CONFIG_LIBDIR SDKROOT
+
 die() { echo "error: $*" >&2; exit 1; }
 step() { echo "== $*"; }
 

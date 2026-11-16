@@ -1,7 +1,8 @@
 #!/bin/bash
 # SPDX-License-Identifier: GPL-2.0-or-later
 # Cross-compile libffi + glib + libslirp for arm64-apple-ios into ios/deps/,
-# and copy StikJIT.xcframework + build libhusk_rppairing.a for Built-in StikJIT.
+# then runs scripts/build_jit_deps.sh for Built-in JIT (StikJIT.xcframework, libhusk_rppairing.a)
+# unless SKIP_JIT_DEPS=1.
 set -euo pipefail
 
 export PATH="/opt/homebrew/bin:$HOME/.cargo/bin:$PATH"
@@ -163,10 +164,10 @@ for lib in libslirp.a libglib-2.0.a libintl.a libpcre2-8.a libffi.a; do
     fi
 done
 
-# Copy StikJIT.xcframework if available
-if [ -d "$HUSK_REF/src/app/Frameworks/StikJIT.xcframework" ]; then
-    rm -rf "$OUT_DEPS/StikJIT.xcframework"
-    ditto "$HUSK_REF/src/app/Frameworks/StikJIT.xcframework" "$OUT_DEPS/StikJIT.xcframework"
+# Built-in JIT: StikJIT.xcframework and libhusk_rppairing.a, built from source by their own script
+# (Rust via rustup). SKIP_JIT_DEPS=1 leaves them out (CI builds and caches them separately).
+if [ "${SKIP_JIT_DEPS:-0}" != 1 ]; then
+    "$ROOT/scripts/build_jit_deps.sh"
 fi
 
 echo "=== iOS dependencies staged in $OUT_DEPS ==="

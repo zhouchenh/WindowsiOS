@@ -2,7 +2,9 @@
 #
 # Builds the engine and its tests for macOS, the iOS static library and the iOS app (unsigned),
 # and uploads dist/AppleVM-Duo-unsigned.ipa as an artifact. The IPA has no 3D frameworks
-# (UTM's frameworks are not fetched here); see docs/building.md for a full local build.
+# (UTM's frameworks are not fetched here); see docs/building.md for a full local build. It has
+# Built-in JIT's helper (PlugIns/WinJITHelper.appex, Frameworks/StikJIT.framework), which
+# scripts/package_ipa.sh checks.
 name: Build
 
 on:
@@ -67,10 +69,39 @@ jobs:
       - name: Build iOS dependencies (scripts/build_ios_deps.sh)
         if: steps.ios-deps.outputs.cache-hit != 'true'
         run: |
-          if ! scripts/build_ios_deps.sh; then
+          if ! SKIP_JIT_DEPS=1 scripts/build_ios_deps.sh; then
             for f in work/ios_deps_build/*.log; do echo "::group::$f"; tail -60 "$f"; echo "::endgroup::"; done
             exit 1
           fi
+
+      # Built-in JIT (docs/builtin-jit.md): StikJIT 1.9.0 with our patch, and Husk's on-device pairing
+      # library (Rust). Both pinned to a commit in the script; cached by the script, the patch and the
+      # pairing header.
+      - name: Restore Built-in JIT dependencies (StikJIT, libhusk_rppairing)
+        id: jit-deps
+        uses: actions/cache@v5
+        with:
+          path: |
+            ios/deps/StikJIT.xcframework
+            ios/deps/lib/libhusk_rppairing.a
+            ios/deps/lib/.libhusk_rppairing.applevm-build
+          key: jit-deps-v1-xcode27-${{ runner.arch }}-${{ hashFiles('scripts/build_jit_deps.sh', 'ios/patches/**', 'ios/Sources/Native/HuskRPPairing.h') }}
+
+      - name: Build Built-in JIT dependencies (scripts/build_jit_deps.sh)
+        if: steps.jit-deps.outputs.cache-hit != 'true'
+        run: |
+          if ! command -v rustup >/dev/null; then
+            brew install rustup
+            echo "$(brew --prefix rustup)/bin" >> "$GITHUB_PATH"
+            export PATH="$(brew --prefix rustup)/bin:$PATH"
+          fi
+          if ! scripts/build_jit_deps.sh; then
+            for f in work/jit_deps/*.log; do echo "::group::$f"; tail -60 "$f"; echo "::endgroup::"; done
+            exit 1
+          fi
+          # The bundled licence notices are generated from Cargo.lock: say so if the committed copy is stale.
+          git diff --quiet -- ios/Sources/Resources/legal ||
+            echo "::warning::ios/Sources/Resources/legal differs from what scripts/build_jit_deps.sh generates"
 
       - name: iOS engine library (make ios-lib)
         run: make -j"$(sysctl -n hw.ncpu)" ios-lib
@@ -97,5 +128,6 @@ jobs:
           path: |
             build/package/*.log
             work/ios_deps_build/*.log
+            work/jit_deps/*.log
           if-no-files-found: ignore
           retention-days: 7
