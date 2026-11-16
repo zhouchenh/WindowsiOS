@@ -115,13 +115,13 @@ in Windows, who can connect, and on or off. Who can connect:
 | Scope | Listens on | Who reaches it |
 | --- | --- | --- |
 | This iPhone only | `127.0.0.1` and `[::1]` | apps on the iPhone (a Remote Desktop app connecting to `localhost`, Safari for OAuth redirects) |
-| Local network | `0.0.0.0` and `[::]` (every interface) | devices on the same Wi-Fi, on the iPhone's Personal Hotspot, and on a VPN |
+| Local network | the addresses of the Wi-Fi, wired and Personal Hotspot interfaces (`en…`, `bridge…`; IPv4, and IPv6 unique local `fc00::/7` only), followed as they change, plus `127.0.0.1` and `[::1]` | devices on the same Wi-Fi or wired network and on the iPhone's Personal Hotspot; not cellular (`pdp_ip…`), and not a global IPv6 address the internet may reach (`HV_NET_LAN_GLOBAL6=1` adds those) |
 | VPN | the address of the active VPN interface (`utun…`, `wg…`, `tun…`, `ppp…`, `ipsec…`, in that order of preference; one with an IPv4 address, or a unique local IPv6 address `fc00::/7`) | devices on the VPN (WireGuard and similar) |
 
 - **IPv4** is libslirp's own host forward (`slirp_add_hostfwd` / `slirp_remove_hostfwd`). The guest
   sees loopback clients as `10.0.2.2` and other clients with their own address.
 - **IPv6**: libslirp cannot take an IPv6 connection to the guest's IPv4 address, so a small relay of
-  the app's own listens on `[::1]`, `[::]` or the VPN's IPv6 address and hands each TCP connection,
+  the app's own listens on `[::1]`, the local network's IPv6 addresses or the VPN's and hands each TCP connection,
   and each UDP peer's datagrams (one IPv4 socket per peer, idle peers dropped after 2 minutes), to the
   IPv4 listener. Those clients appear in the guest as `10.0.2.2`. If only the IPv6 side cannot be
   opened, the forward still listens on IPv4 and shows the reason as a warning.
@@ -137,7 +137,8 @@ in Windows, who can connect, and on or off. Who can connect:
   and when the app's network monitor sees a change; a forward with no VPN connected waits ("no VPN")
   and opens when one comes. This works with VPNs that hand packets to iOS (the WireGuard app); a VPN
   app that runs its own network stack in user space never delivers incoming connections to other
-  apps. The local network scope also covers the VPN, since it listens everywhere.
+  apps. The local network scope does not cover the VPN: it listens on the local network's own addresses
+  only (looked up again every 3 seconds), never on every interface.
 - **Changes** may come from any thread; the network thread applies them, closing what changed before
   opening anything, so an edited forward never finds its own old listener in the way. A port another
   app holds is reported per forward (`in_use`; also `denied`, `no_address`, `no_vpn`) and tried again
@@ -145,7 +146,7 @@ in Windows, who can connect, and on or off. Who can connect:
 - **Foreground only.** iOS suspends the app in the background (Windows pauses with it), so nothing
   answers then. iOS may also take a suspended app's listening sockets away: the app opens every
   forward again when it returns to the foreground (`hv_net_fwd_reopen`).
-- **Local Network permission.** Listening on every interface is what iOS's *Local Network* privacy
+- **Local Network permission.** Listening on the local network is what iOS's *Local Network* privacy
   covers. The app declares `NSLocalNetworkUsageDescription`; when a local network forward is on, the
   settings browse for a Bonjour type of the app's own (`_applevm._tcp`, never advertised) to bring up
   iOS's prompt and to learn whether it was refused, and then show how to turn it on.
@@ -224,7 +225,8 @@ a comment). Restart the VM after changing them.
 | `HV_NET_FWD_FILE` | none (Mac) | The saved forwards' file for the Mac tool (on iOS it is the machine's `port_forwards.json`). |
 | `HV_NET_FWD_RULES` | on | `0`: saved forwards are listed but not opened (session forwards still are). |
 | `HV_NET_VPN_IF` | `utun,wg,tun,ppp,ipsec` | Which interfaces count as a VPN (name prefixes, comma-separated, preferred in this order). Only one with an IPv4 address or a unique local IPv6 address counts, so the carrier's Wi-Fi Calling / VoLTE tunnels (`ipsec…` with only a global IPv6 address) are not taken for a VPN. |
-| `HV_NET_LAN_IF` | `en,bridge` | Which interfaces' addresses the settings show for the local network. |
+| `HV_NET_LAN_IF` | `en,bridge` | Which interfaces make up the local network: local network forwards listen on their addresses, and the settings show them. |
+| `HV_NET_LAN_GLOBAL6` | off | `1`: local network forwards also listen on the local network's global IPv6 addresses (reachable from the internet where the network does not filter incoming IPv6). |
 
 ## Tests
 
@@ -238,8 +240,11 @@ a comment). Restart the VM after changing them.
   No network needed.
 - `make test-net` also runs `test_net_fwd`: port forwards through libslirp to a stand-in guest that
   echoes TCP and UDP. A forward saved before start-up opens; TCP, UDP and both, over IPv4 and IPv6;
-  remove, edit (moved port), off; the local network scope on `0.0.0.0` and `[::]` (and this Mac's own
-  LAN address when it has one); the VPN scope waiting for a VPN and following it (with `lo0` named
-  as the VPN); a port in use reported, then opened once free; a second forward of a port refused;
-  expose-port as a session forward; the guest's limits; reopening; the saved file, a damaged one,
-  and `HV_NET_FWD_RULES=0`.
+  remove, edit (moved port), off; the local network scope on loopback and this Mac's own LAN address
+  when it has one, never on every interface (with no local network interface, the LAN address
+  refuses); the VPN scope waiting for a VPN and following it (with `lo0` named as the VPN); a port
+  in use reported, then opened once free; a second forward of a port refused; expose-port as a
+  session forward; the guest's limits; reopening; the saved file, a damaged one, and
+  `HV_NET_FWD_RULES=0`; names that are not UTF-8 or are cut inside a character; a machine's saved
+  forwards loaded while session forwards hold their ports and slots; the IPv6 relay running out of
+  descriptors.

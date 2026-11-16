@@ -89,8 +89,8 @@ enum ForwardScope: Int, CaseIterable, Identifiable {
             return L("只有这台\(PortForwardText.device)上的 App 能连接（例如 iOS 上的远程桌面 App 连 localhost）。",
                      "Only apps on this \(PortForwardText.device) can connect (for example a Remote Desktop app here, to localhost).")
         case .localNetwork:
-            return L("同一 Wi-Fi、个人热点或 VPN 里的设备都能连接。",
-                     "Devices on the same Wi-Fi, on this \(PortForwardText.device)'s Personal Hotspot, or on a VPN can connect.")
+            return L("同一 Wi-Fi 或有线网络、或这台\(PortForwardText.device)个人热点上的设备能连接。蜂窝网络和互联网都连不进来。",
+                     "Devices on the same Wi-Fi or wired network, or on this \(PortForwardText.device)'s Personal Hotspot, can connect. Not over cellular, and not from the internet.")
         case .vpn:
             return L("只有 VPN（例如 WireGuard）里的设备能连接；VPN 地址变了会自动跟上。",
                      "Only devices on your VPN (for example WireGuard) can connect. Follows the VPN's address when it changes.")

@@ -28,7 +28,8 @@ extern uint64_t hv_net_tx_frames, hv_net_rx_frames;
 
 /* Who can connect: */
 #define HV_FWD_LOOPBACK 0 /* apps on this device only: 127.0.0.1 and [::1] */
-#define HV_FWD_LAN 1      /* every interface: 0.0.0.0 and [::] (the local network, a personal hotspot, a VPN) */
+#define HV_FWD_LAN 1      /* the local network: the Wi-Fi, wired and Personal Hotspot addresses (not cellular, no global
+                             IPv6 unless HV_NET_LAN_GLOBAL6=1), followed as they change, and loopback */
 #define HV_FWD_VPN 2      /* the address of the active VPN interface (utun...), followed when it changes */
 
 typedef struct HvFwdRule {

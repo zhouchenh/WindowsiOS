@@ -6,7 +6,8 @@
    Each scenario runs in its own process, since net_slirp.c attaches once:
    - rules: a forward saved in the store before the network starts is open once it runs (127.0.0.1 and [::1]); TCP,
      UDP and TCP+UDP forwards added at run time work over IPv4 and IPv6; removing one closes its ports; editing one
-     moves it; turning one off closes it; "local network" listens on every interface (0.0.0.0 and [::]); "VPN" waits
+     moves it; turning one off closes it; "local network" listens on loopback and the LAN interfaces' own addresses,
+     never on every interface, and follows them (HV_NET_LAN_IF names none: the LAN address refuses); "VPN" waits
      for a VPN interface and follows it when it appears (HV_NET_VPN_IF names lo0 as the VPN here); a port another
      program holds is reported as in use and tried again until it is free; a second forward of a port is refused;
      expose-port (hv_net_add_hostfwd) shows up as a session forward and is not saved; what the guest may ask for is
@@ -493,17 +494,22 @@ static int scenario_rules(void) {
     /* (Refused, not "can bind it": a relayed connection may linger in TIME_WAIT on the port.) */
     check("turned off: closed", tcp_closed("127.0.0.1", p_moved) && tcp_closed("::1", p_moved));
 
-    /* Local network: every interface. */
+    /* Local network: the LAN interfaces' own addresses and loopback, never every interface. */
     int p_lan = free_port();
     put(rule("lan", HV_FWD_BOTH, p_lan, 7, HV_FWD_LAN));
-    snprintf(what, sizeof what, "\"listen\":[\"0.0.0.0:%d\",\"[::]:%d\"]", p_lan, p_lan);
-    check("local network forward on 0.0.0.0 and [::]", wait_for("lan", what, 3000));
-    check("local network forward: 0.0.0.0 taken (TCP)", in_use(SOCK_STREAM, "0.0.0.0", p_lan));
-    check("local network forward: [::] taken (UDP)", in_use(SOCK_DGRAM, "::", p_lan));
+    snprintf(what, sizeof what, "\"127.0.0.1:%d\"", p_lan);
+    check("local network forward on 127.0.0.1", wait_for("lan", what, 3000));
+    snprintf(what, sizeof what, "\"[::1]:%d\"", p_lan);
+    check("local network forward on [::1]", has("lan", what));
+    check("local network forward: not on every interface", !has("lan", "\"0.0.0.0:") && !has("lan", "\"[::]:"));
+    check("local network forward: 127.0.0.1 taken (TCP)", in_use(SOCK_STREAM, "127.0.0.1", p_lan));
+    check("local network forward: [::1] taken (UDP)", in_use(SOCK_DGRAM, "::1", p_lan));
     check("local network forward: through loopback", tcp_echo("127.0.0.1", p_lan) && tcp_echo("::1", p_lan));
     check("local network forward: UDP", udp_echo("127.0.0.1", p_lan) && udp_echo("::1", p_lan));
     char lan[64];
     if (lan_ipv4(lan, sizeof lan)) {
+        snprintf(what, sizeof what, "\"%s:%d\"", lan, p_lan);
+        check("local network forward: on this Mac's own LAN address", has("lan", what));
         check("local network forward: through this Mac's own LAN address (TCP)", tcp_echo(lan, p_lan));
         check("local network forward: through this Mac's own LAN address (UDP)", udp_echo(lan, p_lan));
     } else {
@@ -513,6 +519,19 @@ static int scenario_rules(void) {
     check("addresses JSON", addrs && !strncmp(addrs, "{\"lan\":[", 8) && strstr(addrs, "\"vpn\":[]"));
     if (lan_ipv4(lan, sizeof lan)) check("addresses list the LAN address", addrs && strstr(addrs, lan));
     free(addrs);
+    if (lan_ipv4(lan, sizeof lan)) {
+        /* no interface counts as the local network (cellular only, say): this Mac's address is not open */
+        setenv("HV_NET_LAN_IF", "nothing", 1);
+        hv_net_fwd_refresh();
+        snprintf(what, sizeof what, "\"listen\":[\"127.0.0.1:%d\",\"[::1]:%d\"]", p_lan, p_lan);
+        check("no local network: loopback only", wait_for("lan", what, 3000));
+        check("no local network: the LAN address refuses", tcp_closed(lan, p_lan));
+        check("no local network: loopback still works", tcp_echo("127.0.0.1", p_lan) && tcp_echo("::1", p_lan));
+        unsetenv("HV_NET_LAN_IF");
+        hv_net_fwd_refresh();
+        snprintf(what, sizeof what, "\"%s:%d\"", lan, p_lan);
+        check("local network back: followed", wait_for("lan", what, 3000) && tcp_echo(lan, p_lan));
+    }
 
     /* VPN: none yet, then lo0 plays the VPN. */
     int p_vpn = free_port();
@@ -822,8 +841,9 @@ static int scenario_rules_off(void) {
                                                              tcp_echo("127.0.0.1", p_env));
     char what[96];
     snprintf(sid, sizeof sid, "session-tcp-%d", p_env_lan);
-    snprintf(what, sizeof what, "\"listen\":[\"0.0.0.0:%d\",\"[::]:%d\"]", p_env_lan, p_env_lan);
-    check("HV_NET_FWD lan:host:guest listens everywhere", wait_for(sid, what, 2000) && tcp_echo("::1", p_env_lan));
+    snprintf(what, sizeof what, "\"[::1]:%d\"", p_env_lan);
+    check("HV_NET_FWD lan:host:guest on the local network", wait_for(sid, what, 2000) && !has(sid, "\"0.0.0.0:") &&
+                                                                tcp_echo("::1", p_env_lan));
     check("HV_NET_FWD a.b.c.d:host:guest (outside the list)", tcp_echo("127.0.0.1", p_env_addr));
     guest_stop = 1;
     printf("fwd (HV_NET_FWD_RULES=0): %d failures\n", failures);

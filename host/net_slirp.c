@@ -237,10 +237,13 @@ static const SlirpCb callbacks = {
    closes the listeners, comparing what each rule wants with what it has (fwd_reconcile). It does so when told
    (fwd_changed), and every few seconds to follow the VPN's address and to retry forwards that failed.
 
-   IPv4 is libslirp's own host forward, on 127.0.0.1, 0.0.0.0 or the VPN's address. libslirp cannot take an IPv6
-   connection to the guest's IPv4 address, so IPv6 ([::1], [::], the VPN's IPv6 address) is a small relay of our
-   own (Bridge) that hands each TCP connection, or each UDP peer's datagrams, to the IPv4 listener. The guest then
-   sees those as coming from 10.0.2.2. Saved rules are a JSON file in the machine's folder (fwd_save). */
+   IPv4 is libslirp's own host forward, on 127.0.0.1, the local network's addresses or the VPN's address. libslirp
+   cannot take an IPv6 connection to the guest's IPv4 address, so IPv6 ([::1], the local network's private
+   addresses, the VPN's IPv6 address) is a small relay of our own (Bridge) that hands each TCP connection, or each
+   UDP peer's datagrams, to the IPv4 listener. The guest then sees those as coming from 10.0.2.2. The local network
+   is the addresses of the Wi-Fi, wired and Personal Hotspot interfaces (lan_ifs), followed as they change, never
+   every interface: not cellular, and not a global IPv6 address the internet may reach. Saved rules are a JSON
+   file in the machine's folder (fwd_save). */
 
 #define MAX_RULES 64
 #define MAX_SESSION_RULES 32
@@ -248,6 +251,8 @@ static const SlirpCb callbacks = {
 #define UDP_PEERS 32
 #define UDP_IDLE_MS 120000
 #define BRIDGE_PUMPS 64 /* TCP connections one IPv6 relay carries at once; more are refused */
+#define FWD_ADDRS 6      /* addresses of one family a forward listens on */
+#define FWD_LISTEN (2 * FWD_ADDRS)
 
 /* How many connections of one relay are being pumped; shared by the relay and its pump threads, which
    may outlive it (refs). */
@@ -272,11 +277,12 @@ typedef struct Bridge {
 typedef struct Applied { /* what is open for a rule: network thread only */
     int on;
     int proto, host_port, guest_port;
-    struct in_addr a4;
-    int tcp4, udp4;
-    int has6;
-    struct in6_addr a6;
-    Bridge *tcp6, *udp6;
+    int n4;
+    struct in_addr a4[FWD_ADDRS];
+    int tcp4[FWD_ADDRS], udp4[FWD_ADDRS];
+    int n6;
+    struct in6_addr a6[FWD_ADDRS];
+    Bridge *tcp6[FWD_ADDRS], *udp6[FWD_ADDRS];
 } Applied;
 
 typedef struct Rule {
@@ -289,7 +295,7 @@ typedef struct Rule {
     HvFwdRule cfg;
     /* state, from the network thread */
     char state[12], code[16], msg[160], warn[160];
-    char listen[4][64];
+    char listen[FWD_LISTEN][64];
     int nlisten;
     Applied ap; /* network thread only */
 } Rule;
@@ -886,7 +892,9 @@ static void bridge_stop(Bridge *br) {
 
 /* A relay of this forward broke (network thread). */
 static int bridge_dead(const Applied *ap) {
-    return (ap->tcp6 && atomic_load(&ap->tcp6->dead)) || (ap->udp6 && atomic_load(&ap->udp6->dead));
+    for (int k = 0; k < ap->n6; k++)
+        if ((ap->tcp6[k] && atomic_load(&ap->tcp6[k]->dead)) || (ap->udp6[k] && atomic_load(&ap->udp6[k]->dead))) return 1;
+    return 0;
 }
 
 /* ---- the device's interfaces ---- */
@@ -930,7 +938,7 @@ static int ula6(const struct sockaddr *sa) { /* fc00::/7: a private network's ow
 }
 static const char *lan_ifs(void) {
     const char *e = getenv("HV_NET_LAN_IF");
-    return e && *e ? e : "en,bridge"; /* Wi-Fi and wired, and the personal hotspot (bridge100) */
+    return e && *e ? e : "en,bridge"; /* Wi-Fi and wired, and the personal hotspot (bridge100); never pdp_ip (cellular) */
 }
 
 typedef struct VpnAddr {
@@ -972,6 +980,46 @@ static void vpn_lookup(VpnAddr *v) {
     freeifaddrs(ifa);
 }
 
+/* A local network's IPv6 address a forward may listen on: a unique local one (fc00::/7). A global one on the Wi-Fi
+   is reachable from the whole internet wherever the network does not filter incoming IPv6 (many carriers and public
+   networks do not), so it is only taken with HV_NET_LAN_GLOBAL6=1. */
+static int lan6_ok(const struct sockaddr *sa) {
+    if (!usable6(sa)) return 0;
+    if (ula6(sa)) return 1;
+    const char *e = getenv("HV_NET_LAN_GLOBAL6");
+    return e && *e && *e != '0';
+}
+
+typedef struct LanAddr {
+    int n4, n6;
+    struct in_addr a4[FWD_ADDRS - 1]; /* one place is loopback's */
+    struct in6_addr a6[FWD_ADDRS - 1];
+} LanAddr;
+
+/* The local network's addresses now: those of the lan_ifs() interfaces that are up. */
+static void lan_lookup(LanAddr *l) {
+    memset(l, 0, sizeof *l);
+    struct ifaddrs *ifa = NULL;
+    if (getifaddrs(&ifa) != 0) return;
+    const char *list = lan_ifs();
+    for (struct ifaddrs *i = ifa; i; i = i->ifa_next) {
+        if (!i->ifa_addr || !(i->ifa_flags & IFF_UP) || (i->ifa_flags & IFF_LOOPBACK) || !if_matches(i->ifa_name, list))
+            continue;
+        if (i->ifa_addr->sa_family == AF_INET && usable4(i->ifa_addr) && l->n4 < FWD_ADDRS - 1) {
+            struct in_addr a = ((struct sockaddr_in *)i->ifa_addr)->sin_addr;
+            int dup = 0;
+            for (int k = 0; k < l->n4; k++) dup |= l->a4[k].s_addr == a.s_addr;
+            if (!dup) l->a4[l->n4++] = a;
+        } else if (i->ifa_addr->sa_family == AF_INET6 && lan6_ok(i->ifa_addr) && l->n6 < FWD_ADDRS - 1) {
+            struct in6_addr a = ((struct sockaddr_in6 *)i->ifa_addr)->sin6_addr;
+            int dup = 0;
+            for (int k = 0; k < l->n6; k++) dup |= !memcmp(&l->a6[k], &a, sizeof a);
+            if (!dup) l->a6[l->n6++] = a;
+        }
+    }
+    freeifaddrs(ifa);
+}
+
 static void addr_list(Buf *b, struct ifaddrs *ifa, const char *list, const char *only_if) {
     int first = 1, n = 0;
     bstr(b, "[");
@@ -982,7 +1030,7 @@ static void addr_list(Buf *b, struct ifaddrs *ifa, const char *list, const char 
         char a[INET6_ADDRSTRLEN];
         if (fam == AF_INET && usable4(i->ifa_addr))
             inet_ntop(AF_INET, &((struct sockaddr_in *)i->ifa_addr)->sin_addr, a, sizeof a);
-        else if (fam == AF_INET6 && usable6(i->ifa_addr))
+        else if (fam == AF_INET6 && (only_if ? usable6(i->ifa_addr) : lan6_ok(i->ifa_addr))) /* what LAN forwards take */
             inet_ntop(AF_INET6, &((struct sockaddr_in6 *)i->ifa_addr)->sin6_addr, a, sizeof a);
         else
             continue;
@@ -1448,19 +1496,32 @@ static int fwd_rules_off(void) {
 typedef struct Want {
     int ok;
     char code[16], msg[160];
-    struct in_addr a4;
-    int show4; /* a4 is reachable as configured (not just the relay's way in) */
-    int has6;
-    struct in6_addr a6;
+    int n4;
+    struct in_addr a4[FWD_ADDRS];
+    int show4[FWD_ADDRS];  /* reachable as configured (not just the relays' way in) */
+    struct in_addr relay;  /* the IPv4 listener the IPv6 relays hand their connections to */
+    int n6;
+    struct in6_addr a6[FWD_ADDRS];
 } Want;
 
-static void want_for(const HvFwdRule *c, const VpnAddr *vpn, Want *w) {
+static void want4(Want *w, struct in_addr a, int show) {
+    if (w->n4 < FWD_ADDRS) w->a4[w->n4] = a, w->show4[w->n4++] = show;
+}
+static void want6(Want *w, const struct in6_addr *a) {
+    if (w->n6 < FWD_ADDRS) w->a6[w->n6++] = *a;
+}
+
+static void want_for(const HvFwdRule *c, const VpnAddr *vpn, const LanAddr *lan, Want *w) {
     memset(w, 0, sizeof *w);
-    w->ok = 1, w->show4 = 1, w->has6 = 1;
+    w->ok = 1;
+    struct in_addr lo4 = {.s_addr = htonl(INADDR_LOOPBACK)};
+    w->relay = lo4;
     switch (c->scope) {
-    case HV_FWD_LAN:
-        w->a4.s_addr = htonl(INADDR_ANY);
-        w->a6 = in6addr_any;
+    case HV_FWD_LAN: /* the local network's own addresses, and this device's apps */
+        for (int k = 0; k < lan->n4; k++) want4(w, lan->a4[k], 1);
+        want4(w, lo4, 1);
+        for (int k = 0; k < lan->n6; k++) want6(w, &lan->a6[k]);
+        want6(w, &in6addr_loopback);
         break;
     case HV_FWD_VPN:
         if (!vpn->has4 && !vpn->has6) {
@@ -1469,23 +1530,26 @@ static void want_for(const HvFwdRule *c, const VpnAddr *vpn, Want *w) {
             snprintf(w->msg, sizeof w->msg, "no VPN is connected");
             return;
         }
-        if (vpn->has4) w->a4 = vpn->a4;
-        else w->a4.s_addr = htonl(INADDR_LOOPBACK), w->show4 = 0; /* an IPv6-only VPN: the relay's way in */
-        w->has6 = vpn->has6;
-        if (vpn->has6) w->a6 = vpn->a6;
+        if (vpn->has4) want4(w, vpn->a4, 1), w->relay = vpn->a4;
+        else want4(w, lo4, 0); /* an IPv6-only VPN: the relay's way in */
+        if (vpn->has6) want6(w, &vpn->a6);
         break;
     default:
-        w->a4.s_addr = htonl(INADDR_LOOPBACK);
-        w->a6 = in6addr_loopback;
+        want4(w, lo4, 1);
+        want6(w, &in6addr_loopback);
         break;
     }
 }
 
 static void fwd_teardown(Applied *ap) {
-    if (ap->tcp4) slirp_remove_hostfwd(slirp, 0, ap->a4, ap->host_port);
-    if (ap->udp4) slirp_remove_hostfwd(slirp, 1, ap->a4, ap->host_port);
-    bridge_stop(ap->tcp6);
-    bridge_stop(ap->udp6);
+    for (int k = 0; k < ap->n4; k++) {
+        if (ap->tcp4[k]) slirp_remove_hostfwd(slirp, 0, ap->a4[k], ap->host_port);
+        if (ap->udp4[k]) slirp_remove_hostfwd(slirp, 1, ap->a4[k], ap->host_port);
+    }
+    for (int k = 0; k < ap->n6; k++) {
+        bridge_stop(ap->tcp6[k]);
+        bridge_stop(ap->udp6[k]);
+    }
     memset(ap, 0, sizeof *ap);
 }
 
@@ -1507,51 +1571,54 @@ static void errno_text(int e, int port, const char *proto, char *code, size_t cl
 
 typedef struct Outcome {
     char state[12], code[16], msg[160], warn[160];
-    char listen[4][64];
+    char listen[FWD_LISTEN][64];
     int nlisten;
 } Outcome;
 
 static void fwd_apply(const HvFwdRule *c, const Want *w, Applied *ap, Outcome *o) {
     struct in_addr guest;
     inet_pton(AF_INET, "10.0.2.15", &guest);
-    ap->proto = c->proto, ap->host_port = c->host_port, ap->guest_port = c->guest_port, ap->a4 = w->a4;
-    ap->has6 = w->has6, ap->a6 = w->a6;
-    for (int udp = 0; udp <= 1; udp++) {
-        if (!(c->proto & (udp ? HV_FWD_UDP : HV_FWD_TCP))) continue;
-        errno = 0;
-        if (slirp_add_hostfwd(slirp, udp, w->a4, c->host_port, guest, c->guest_port) != 0) {
-            int e = errno ? errno : EADDRINUSE;
-            fwd_teardown(ap);
-            snprintf(o->state, sizeof o->state, "error");
-            errno_text(e, c->host_port, udp ? "UDP" : "TCP", o->code, sizeof o->code, o->msg, sizeof o->msg);
-            return;
+    ap->proto = c->proto, ap->host_port = c->host_port, ap->guest_port = c->guest_port;
+    ap->n4 = w->n4, ap->n6 = w->n6;
+    memcpy(ap->a4, w->a4, sizeof ap->a4);
+    memcpy(ap->a6, w->a6, sizeof ap->a6);
+    for (int k = 0; k < w->n4; k++)
+        for (int udp = 0; udp <= 1; udp++) {
+            if (!(c->proto & (udp ? HV_FWD_UDP : HV_FWD_TCP))) continue;
+            errno = 0;
+            if (slirp_add_hostfwd(slirp, udp, w->a4[k], c->host_port, guest, c->guest_port) != 0) {
+                int e = errno ? errno : EADDRINUSE;
+                fwd_teardown(ap);
+                snprintf(o->state, sizeof o->state, "error");
+                errno_text(e, c->host_port, udp ? "UDP" : "TCP", o->code, sizeof o->code, o->msg, sizeof o->msg);
+                return;
+            }
+            if (udp) ap->udp4[k] = 1;
+            else ap->tcp4[k] = 1;
         }
-        if (udp) ap->udp4 = 1;
-        else ap->tcp4 = 1;
-    }
     ap->on = 1;
     snprintf(o->state, sizeof o->state, "listening");
     char a[INET6_ADDRSTRLEN];
-    if (w->show4) {
-        inet_ntop(AF_INET, &w->a4, a, sizeof a);
+    for (int k = 0; k < w->n4 && o->nlisten < FWD_LISTEN; k++) {
+        if (!w->show4[k]) continue;
+        inet_ntop(AF_INET, &w->a4[k], a, sizeof a);
         snprintf(o->listen[o->nlisten++], sizeof o->listen[0], "%s:%d", a, c->host_port);
     }
-    if (!w->has6) return;
     int e6 = 0;
     const char *p6 = NULL;
-    struct in_addr target = w->a4; /* the relay's way in: the IPv4 listener (on loopback when it is on every interface) */
-    if (target.s_addr == htonl(INADDR_ANY)) target.s_addr = htonl(INADDR_LOOPBACK);
-    for (int udp = 0; udp <= 1; udp++) {
-        if (!(c->proto & (udp ? HV_FWD_UDP : HV_FWD_TCP))) continue;
-        int e = 0;
-        Bridge *br = bridge_start(udp, &w->a6, c->host_port, target, &e);
-        if (udp) ap->udp6 = br;
-        else ap->tcp6 = br;
-        if (!br && !e6) e6 = e, p6 = udp ? "UDP" : "TCP";
-    }
-    if (ap->tcp6 || ap->udp6) {
-        inet_ntop(AF_INET6, &w->a6, a, sizeof a);
-        snprintf(o->listen[o->nlisten++], sizeof o->listen[0], "[%s]:%d", a, c->host_port);
+    for (int k = 0; k < w->n6; k++) {
+        for (int udp = 0; udp <= 1; udp++) {
+            if (!(c->proto & (udp ? HV_FWD_UDP : HV_FWD_TCP))) continue;
+            int e = 0;
+            Bridge *br = bridge_start(udp, &w->a6[k], c->host_port, w->relay, &e);
+            if (udp) ap->udp6[k] = br;
+            else ap->tcp6[k] = br;
+            if (!br && !e6) e6 = e, p6 = udp ? "UDP" : "TCP";
+        }
+        if ((ap->tcp6[k] || ap->udp6[k]) && o->nlisten < FWD_LISTEN) {
+            inet_ntop(AF_INET6, &w->a6[k], a, sizeof a);
+            snprintf(o->listen[o->nlisten++], sizeof o->listen[0], "[%s]:%d", a, c->host_port);
+        }
     }
     if (e6) {
         char code[16], msg[140];
@@ -1561,8 +1628,14 @@ static void fwd_apply(const HvFwdRule *c, const Want *w, Applied *ap, Outcome *o
 }
 
 static int same_place(const Applied *ap, const HvFwdRule *c, const Want *w) {
-    return ap->on && ap->proto == c->proto && ap->host_port == c->host_port && ap->guest_port == c->guest_port &&
-           ap->a4.s_addr == w->a4.s_addr && ap->has6 == w->has6 && (!w->has6 || !memcmp(&ap->a6, &w->a6, 16));
+    if (!ap->on || ap->proto != c->proto || ap->host_port != c->host_port || ap->guest_port != c->guest_port ||
+        ap->n4 != w->n4 || ap->n6 != w->n6)
+        return 0;
+    for (int k = 0; k < w->n4; k++)
+        if (ap->a4[k].s_addr != w->a4[k].s_addr) return 0;
+    for (int k = 0; k < w->n6; k++)
+        if (memcmp(&ap->a6[k], &w->a6[k], sizeof w->a6[k])) return 0;
+    return 1;
 }
 
 typedef struct Snap {
@@ -1582,7 +1655,7 @@ static void fwd_reconcile(int periodic) {
     int act[MAX_RULES]; /* 0: as it is, 1: a new state, 2: a new state after opening */
     pthread_mutex_lock(&fwd_mu);
     uint64_t gen = fwd_change_gen;
-    int need_vpn = 0;
+    int need_vpn = 0, need_lan = 0;
     for (int i = 0; i < MAX_RULES; i++) {
         Rule *r = &rules[i];
         memset(&s[i], 0, sizeof s[i]);
@@ -1597,11 +1670,15 @@ static void fwd_reconcile(int periodic) {
         memcpy(s[i].listen0, r->nlisten ? r->listen[0] : "", r->nlisten ? sizeof s[i].listen0 : 1);
         r->dirty = 0;
         need_vpn |= r->used && !r->removed && r->cfg.enabled && r->cfg.scope == HV_FWD_VPN;
+        need_lan |= r->used && !r->removed && r->cfg.enabled && r->cfg.scope == HV_FWD_LAN;
     }
     pthread_mutex_unlock(&fwd_mu);
     VpnAddr vpn;
     memset(&vpn, 0, sizeof vpn);
     if (need_vpn) vpn_lookup(&vpn);
+    LanAddr lan;
+    memset(&lan, 0, sizeof lan);
+    if (need_lan) lan_lookup(&lan); /* followed on every pass, as the VPN's address is */
     int off = fwd_rules_off();
 
     for (int i = 0; i < MAX_RULES; i++) {
@@ -1621,7 +1698,7 @@ static void fwd_reconcile(int periodic) {
             }
             continue;
         }
-        want_for(c, &vpn, &w[i]);
+        want_for(c, &vpn, &lan, &w[i]);
         if (!w[i].ok) {
             if (ap->on) fwd_teardown(ap);
             snprintf(o[i].state, sizeof o[i].state, "error");
