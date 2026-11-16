@@ -186,6 +186,7 @@ static void reply(Query *q, int rcode) {
     wr16(dns + 4, 1);
     wr16(dns + 8, 0);
     uint32_t limit = q->udp_max, n = qlen, nans = 0;
+    if (limit > cap - 14 - 20 - 8) limit = (uint32_t)(cap - 14 - 20 - 8); /* never past the buffer above */
     int truncated = 0;
     for (int i = 0; i < q->nans; i++) {
         const Answer *a = &q->ans[i];
@@ -293,6 +294,9 @@ int hv_dns_proxy_take(const uint8_t *p, uint32_t len, HvDnsSend send) {
     if ((rd16(ip + 6) & 0x3fff) != 0) return 0;                            /* fragments: libslirp's */
     uint32_t iplen = rd16(ip + 2);
     if (iplen > len - 14 || iplen < ihl + 8 + 12) return 0;
+    /* The whole IP packet is kept (to hand back as it came), so it must fit Query.frame: a total length past the
+       UDP datagram's end would otherwise run over the fields after it. Real queries end with their UDP payload. */
+    if (14 + iplen > sizeof ((Query *)0)->frame) return 0;
     const uint8_t *udp = ip + ihl;
     if (rd16(udp + 2) != 53) return 0;
     uint32_t udplen = rd16(udp + 4);
