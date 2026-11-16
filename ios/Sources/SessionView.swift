@@ -61,6 +61,7 @@ struct SessionView: View {
         .persistentSystemOverlays(chrome.hidesSystemUI ? .hidden : .automatic)
         .defersSystemGestures(on: chrome.hidesSystemUI ? .all : (vm.isVMRunning ? .bottom : []))
         .onOpenURL { JITSetup.shared.handleOpenURL($0) } // app-jit hook
+        .clipboardSync() // clipboard hook
         .onAppear {
             WinIOSBridge.shared.updateScreenSize(UIScreen.main.bounds.size, scale: UIScreen.main.scale)
             chrome.updateSessionActive(sessionActive)
@@ -751,6 +752,8 @@ private struct SettingsSheet: View {
                 Text(L("也可以直接把键盘按钮拖到另一侧。连着外接键盘时不显示。",
                        "You can also drag the keyboard button to the other side. Hidden while a hardware keyboard is attached."))
             }
+
+            if !vm.isLinux { ClipboardSettingsSection() } // clipboard hook
 
             if vm.supportsLaptopPosture {
                 Section {

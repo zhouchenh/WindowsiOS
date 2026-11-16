@@ -185,4 +185,23 @@ extern NSNotificationName const WinIOSDisplayWillReshapeNotification;
 /// decoded JSON object (see winkit/FocusAgent.cs).
 extern NSNotificationName const WinIOSFocusReportNotification;
 
+/* The clipboard shared with Windows (host/share.c, docs/clipboard.md). */
+extern NSNotificationName const WinIOSGuestClipboardDidChangeNotification; /* posted on the main queue */
+
+@interface WinIOSBridge (Clipboard)
+/// Starts posting WinIOSGuestClipboardDidChangeNotification when Windows copies text. Safe to call again.
+- (void)startClipboardObserver;
+/// What Windows last copied, once; nil when nothing is new.
+- (nullable NSString *)takeGuestClipboard;
+/// Text for Windows' clipboard: its sequence number, or 0 when it is not taken: empty or over 1 MB, or
+/// (unless force) the text the shared clipboard holds already, which is how text from Windows stops going round.
+- (NSUInteger)sendClipboardToGuest:(NSString *)text force:(BOOL)force;
+/// Seconds since the clipboard helper in Windows was last heard from: 0 while it waits for news, -1 never.
+- (NSInteger)clipboardAgentSeenSeconds;
+/// The newest sequence number the helper has put on Windows' clipboard (see hv_share_clipboard_agent_has).
+- (NSUInteger)clipboardAgentHasSeq;
+/// Ctrl+V through the virtual keyboard.
+- (void)sendPasteShortcut;
+@end
+
 NS_ASSUME_NONNULL_END

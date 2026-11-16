@@ -68,6 +68,25 @@ Windows 这边要先把服务打开、把防火墙放行：
 - **排查**：App 设置里每条转发都显示状态（正在监听哪些地址、端口被占用、没有 VPN 等）；App 文件夹里的 `winvm.log` 里有 `winvm: net: forward` 开头的记录。
   Windows 里的程序也可以用 `http://10.0.2.4/.henge/forwards` 查看所有转发（JSON）。
 
+## 剪贴板和 iPhone 同步
+
+Windows 里拷贝的文字会自动出现在 iPhone 的剪贴板上；iPhone 上拷贝的文字点一下 App 工具栏里的**粘贴按钮**（系统的“粘贴”按钮）就到了 Windows 的剪贴板里。只同步文字，最多 1 MB。
+
+1. **安装**：`START.bat` 会自动装（“Clipboard shared with the iPhone”那一步）；以前跑过旧版 WinKit 的，双击 WINKIT 盘（或 `C:\WinKit`）里的 `CLIPBOARD.bat`，不需要管理员。
+   它用 Windows 自带的 .NET 把 `clipboard_agent.cs` 编译成 `%LOCALAPPDATA%\WinKit\WinKitClipboard.exe`（没有窗口），
+   并建一个计划任务 **WinKit Clipboard**：每次登录时在你自己的会话里启动它，之后每 5 分钟检查一次，意外退出会被重新拉起。可以重复运行。
+2. **Windows → iPhone**：Windows 里拷贝文字，App 在前台时立刻写进 iPhone 剪贴板（屏幕下方提示“已从 Windows 拷贝”）；App 不在前台时，等回到 App 再写。
+   App 设置 → **剪贴板** → “Windows → iPhone 自动同步”可以关掉。密码管理器标记为不记录的内容（如 KeePass、1Password 拷贝的密码）不会发过来。
+3. **iPhone → Windows**：点工具栏里的粘贴按钮（或 App 设置 → 剪贴板 → “粘贴到 Windows”），iOS 不会弹“允许粘贴”。
+   打开“发送后在 Windows 里粘贴（Ctrl+V）”，文字到了 Windows 剪贴板后会自动按一次 Ctrl+V，粘到光标处。
+4. **回到 App 时自动发送（可选）**：App 自己读剪贴板时 iOS 默认每次都会问“允许粘贴吗”。想不被打扰地自动发送，先打开“回到 App 时 iPhone → Windows”，
+   再到 iOS **设置 › Apple VM › 从其他 App 粘贴** 选 **允许**（这一项在 App 第一次读剪贴板之后才会出现），回到 App 设置里点“检查”。
+   只有检查结果是“允许”时，App 才会在回到前台、而且剪贴板里有新文字时自动发送；之后如果 iOS 又开始询问，自动发送会暂停，直到你再点“检查”。
+
+- **状态**：App 设置 → 剪贴板 → “Windows 里的剪贴板小助手”显示“运行中”说明 Windows 这边正常。
+- **卸载**：在命令提示符里运行 `CLIPBOARD.bat remove`，或右键 `C:\WinKit\uninstall_clipboard.ps1` → 使用 PowerShell 运行，删除计划任务、程序和日志。
+- **排查**：Windows 里的 `%LOCALAPPDATA%\WinKit\clipboard.log`。工作原理见 [剪贴板说明（英文）](../docs/clipboard.md)。
+
 ## 用 StikDebug 开 JIT
 
 1. 安装 StikDebug，按它的说明做一次性配置，打开它的 VPN。

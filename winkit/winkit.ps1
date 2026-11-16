@@ -90,6 +90,7 @@ try { & (Join-Path $home3d 'oauth_setup.ps1') } catch { Write-Host "  skipped: $
 
 # The background helper the app's toolbar uses (Claude Code); also removes the old command-line mode's logon hook.
 try { & (Join-Path $home3d 'cli_setup.ps1') | Out-Null } catch {}
+Say 'Clipboard shared with the iPhone'; try { & (Join-Path $home3d 'clipboard_setup.ps1') } catch { Write-Host "  skipped: $($_.Exception.Message)" -ForegroundColor Yellow }  # clipboard hook
 
 Say 'Optional: user name'
 Write-Host '  The image signs in as the account it was made with. You can give it your own name'

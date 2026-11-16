@@ -27,6 +27,9 @@ instead.
 off). Addresses, DNS, port forwards, why there is no bridged mode and what to use instead:
 [docs/networking.md](docs/networking.md).
 
+**Clipboard:** text copied in Windows is on the iPhone's clipboard, and the toolbar's paste button
+sends the iPhone's to Windows (WinKit's clipboard helper): [docs/clipboard.md](docs/clipboard.md).
+
 **Licences and credits:** the source is GPL-2.0-or-later ([`LICENSE`](LICENSE)), from the projects
 above. Built apps may also contain unmodified frameworks from [UTM](https://github.com/utmapp/UTM)'s
 iOS build (virglrenderer, DXMT, ANGLE, libepoxy, the Vulkan loader, MoltenVK, KosmicKrisp, zstd),

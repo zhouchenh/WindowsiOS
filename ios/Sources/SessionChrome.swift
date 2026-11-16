@@ -511,6 +511,11 @@ struct SessionToolbarItems {
         if !compact {
             ClipboardMenu()
         }
+        if !vm.isLinux {
+            // Paste to Windows: the system paste button, so iOS never asks (ClipboardViews.swift). A paste
+            // control cannot sit inside a menu, so it stays in the bar on narrow screens too.
+            ClipboardButton() // clipboard hook
+        }
     }
 
     // [Immersive, More]
