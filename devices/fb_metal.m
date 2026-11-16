@@ -5,8 +5,11 @@
 #import <ImageIO/ImageIO.h>
 #import <TargetConditionals.h>
 
+#include <mach/mach_time.h>
+#include <math.h>
 #include <os/lock.h>
 #include <stdatomic.h>
+#include <time.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -22,6 +25,114 @@ void hv_fb_metal_set_fps(int fps) {
 }
 
 int hv_fb_metal_fps(void) { return atomic_load(&g_target_fps); }
+
+/* ---- presentation engine state (one presenter per process) ---- */
+
+static uint64_t fb_ns_to_mach(uint64_t ns) {
+    static mach_timebase_info_data_t tb;
+    if (!tb.denom) mach_timebase_info(&tb);
+    return ns * tb.denom / tb.numer;
+}
+
+/* Hold the last good frame while the guest takes a new size (bridge: reshape pipeline). */
+static _Atomic uint32_t g_hold_w, g_hold_h;
+static _Atomic uint64_t g_hold_until; /* mach_absolute_time deadline, 0: no hold */
+static _Atomic uint64_t g_last_input; /* mach_absolute_time of the last touch, key or pointer event */
+static _Atomic int g_legacy_fit;
+
+static os_unfair_lock g_stats_lock = OS_UNFAIR_LOCK_INIT;
+static HvFbMetalStats g_stats;
+
+void hv_fb_metal_hold_for_size(uint32_t w, uint32_t h, uint32_t ms) {
+    atomic_store(&g_hold_until, 0);
+    if (!w || !h || !ms) return;
+    atomic_store(&g_hold_w, w);
+    atomic_store(&g_hold_h, h);
+    atomic_store(&g_hold_until, mach_absolute_time() + fb_ns_to_mach((uint64_t)ms * 1000000ull));
+}
+
+void hv_fb_metal_note_input(void) { atomic_store(&g_last_input, mach_absolute_time()); }
+
+void hv_fb_metal_set_legacy_fit(int legacy) { atomic_store(&g_legacy_fit, legacy ? 1 : 0); }
+
+void hv_fb_metal_get_stats(HvFbMetalStats *out) {
+    if (!out) return;
+    os_unfair_lock_lock(&g_stats_lock);
+    *out = g_stats;
+    os_unfair_lock_unlock(&g_stats_lock);
+    out->holding = atomic_load(&g_hold_until) != 0;
+}
+
+/* 1 while a frame of w x h must not be shown yet: a hold for another size is in effect. A frame of the
+   awaited size, or the deadline passing, ends the hold. */
+static int fb_hold_blocks(uint32_t w, uint32_t h) {
+    uint64_t until = atomic_load(&g_hold_until);
+    if (!until) return 0;
+    if ((w == atomic_load(&g_hold_w) && h == atomic_load(&g_hold_h)) || mach_absolute_time() >= until) {
+        atomic_store(&g_hold_until, 0);
+        return 0;
+    }
+    os_unfair_lock_lock(&g_stats_lock);
+    g_stats.held++;
+    os_unfair_lock_unlock(&g_stats_lock);
+    return 1;
+}
+
+/* Where a frame of sw x sh goes in a drawable of dw x dh pixels. Whole-pixel placement: when the frame
+   fits an integer number of times with a margin under two guest pixels (1:1 at Sharp, exactly 2x at
+   Balanced: the mode was rounded to even sizes), it is drawn at that integer scale on whole pixels with
+   nearest sampling: one guest pixel is exactly m x m panel pixels. Anything else (a frame of the old size
+   after a hold, a kept resolution in immersive mode, a legacy point-sized mode) is fitted with its aspect
+   kept and filtered linearly. Either way the picture is where an aspect fit puts it (to within 2 px), which
+   is what the touch mapping (MetalCanvasUIView.normalizedPoint) assumes. */
+typedef struct FbPlacement {
+    MTLViewport vp;
+    uint32_t nearest;
+    float scale;
+} FbPlacement;
+
+static FbPlacement fb_place(uint32_t sw, uint32_t sh, double dw, double dh) {
+    FbPlacement p = {.vp = {0, 0, dw, dh, 0.0, 1.0}, .nearest = 0, .scale = 1.0f};
+    if (!sw || !sh || dw < 1 || dh < 1) return p;
+    int legacy = atomic_load(&g_legacy_fit);
+    if (!legacy) {
+        uint32_t m = (uint32_t)fmin(floor(dw / sw), floor(dh / sh));
+        if (m >= 1) {
+            double mw = dw - (double)sw * m, mh = dh - (double)sh * m;
+            if (mw <= 2.0 * m && mh <= 2.0 * m) {
+                p.vp.originX = floor(mw / 2);
+                p.vp.originY = floor(mh / 2);
+                p.vp.width = (double)sw * m;
+                p.vp.height = (double)sh * m;
+                p.nearest = 1;
+                p.scale = (float)m;
+                return p;
+            }
+        }
+    }
+    double s = fmin(dw / sw, dh / sh);
+    double w = sw * s, h = sh * s;
+    if (!legacy) {
+        w = fmax(1, round(w));
+        h = fmax(1, round(h));
+    }
+    p.vp.originX = legacy ? (dw - w) / 2 : floor((dw - w) / 2);
+    p.vp.originY = legacy ? (dh - h) / 2 : floor((dh - h) / 2);
+    p.vp.width = w;
+    p.vp.height = h;
+    p.scale = (float)s;
+    return p;
+}
+
+static void fb_note_present(FbPlacement pl, uint32_t sw, uint32_t sh, CGSize dsize, uint64_t uploaded) {
+    os_unfair_lock_lock(&g_stats_lock);
+    g_stats.nearest = (int)pl.nearest;
+    g_stats.src_w = sw; g_stats.src_h = sh;
+    g_stats.dst_w = (uint32_t)dsize.width; g_stats.dst_h = (uint32_t)dsize.height;
+    g_stats.scale_x100 = (uint32_t)lround(pl.scale * 100.0f);
+    g_stats.upload_bytes += uploaded;
+    os_unfair_lock_unlock(&g_stats_lock);
+}
 
 /* The guest draws sRGB values (Windows' and Linux's desktops are sRGB). Tagging the layer sRGB has Core
    Animation colour-match them to the screen. An untagged layer goes to a wide-gamut (Display P3) panel
@@ -53,9 +164,10 @@ static NSString *const kFbShaderSource =
      "    o.uv  = uvr.xy + uvs[vid] * uvr.zw;\n"
      "    return o;\n"
      "}\n"
-     "fragment float4 fb_fs(VOut in [[stage_in]], texture2d<float> tex [[texture(0)]]) {\n"
-     "    constexpr sampler s(mag_filter::linear, min_filter::linear, address::clamp_to_edge);\n"
-     "    float4 c = tex.sample(s, in.uv);\n"
+     "fragment float4 fb_fs(VOut in [[stage_in]], texture2d<float> tex [[texture(0)]], constant uint &nearest [[buffer(0)]]) {\n"
+     "    constexpr sampler sl(mag_filter::linear, min_filter::linear, address::clamp_to_edge);\n"
+     "    constexpr sampler sn(mag_filter::nearest, min_filter::nearest, address::clamp_to_edge);\n"
+     "    float4 c = nearest ? tex.sample(sn, in.uv) : tex.sample(sl, in.uv);\n"
      "    return float4(c.rgb, 1.0);\n"
      "}\n"
      "vertex VOut cur_vs(uint vid [[vertex_id]], constant float4 &r [[buffer(0)]]) {\n"
@@ -91,11 +203,13 @@ static NSString *const kFbShaderSource =
     _Atomic(uint64_t) framesPresented;
     uint64_t lastHash;
     CGSize lastDrawableSize;
+    uint64_t lastPresentMach; /* when a frame last went out (idle throttling) */
+    int linkPreferred;        /* the rate last given to the display link */
 }
 - (instancetype)initWithDisplay:(HvFbDisplay *)display;
 - (void)setTargetLayer:(CAMetalLayer *)newLayer;
 - (void)tick;
-- (BOOL)presentTexture;
+- (BOOL)presentTexture:(BOOL *)presented;
 #if TARGET_OS_IPHONE
 + (void)applyRate:(CADisplayLink *)l;
 #endif
@@ -205,13 +319,40 @@ static NSString *const kFbShaderSource =
     else l.preferredFramesPerSecond = fps;
 }
 
+/* Idle throttling: after 1.5 s with no new guest frame and no input the link slows to about 20 Hz (it
+   still looks for new frames, so a spinner keeps turning); a new frame or any input brings the full rate
+   back at once. HV_DISPLAY_NO_IDLE=1 keeps the full rate. */
+static int fb_idle_allowed(void) {
+    static int allowed = -1;
+    if (allowed < 0) {
+        const char *v = getenv("HV_DISPLAY_NO_IDLE");
+        allowed = !(v && *v && *v != '0');
+    }
+    return allowed;
+}
+
 - (void)onLink:(CADisplayLink *)l {
     /* a changed setting: the link follows it here, on its own thread */
     int fps = atomic_load(&g_target_fps);
-    BOOL differs;
-    if (@available(iOS 15.0, *)) differs = (int)l.preferredFrameRateRange.preferred != fps;
-    else differs = l.preferredFramesPerSecond != fps;
-    if (differs) [HvFbMetalPresenter applyRate:l];
+    uint64_t now = mach_absolute_time();
+    uint64_t quiet = fb_ns_to_mach(1500ull * 1000000ull);
+    int idle = fb_idle_allowed() && atomic_load(&g_hold_until) == 0 && now - lastPresentMach > quiet &&
+               now - atomic_load(&g_last_input) > quiet;
+    int pref = idle ? (fps < 20 ? fps : 20) : fps;
+    if (pref != linkPreferred) {
+        linkPreferred = pref;
+        if (@available(iOS 15.0, *)) {
+            float lo = idle ? (fps < 10 ? fps : 10) : (fps < 60 ? fps : 60);
+            float hi = idle ? (fps < 30 ? fps : 30) : fps;
+            l.preferredFrameRateRange = CAFrameRateRangeMake(lo, hi, pref);
+        } else {
+            l.preferredFramesPerSecond = pref;
+        }
+        os_unfair_lock_lock(&g_stats_lock);
+        g_stats.link_hz = pref;
+        g_stats.idle = idle;
+        os_unfair_lock_unlock(&g_stats_lock);
+    }
     [self tick];
 }
 #endif
@@ -268,7 +409,7 @@ static uint64_t quick_frame_hash(const uint8_t *px, uint32_t w, uint32_t h, uint
     return hash ? hash : 1;
 }
 
-- (BOOL)presentTexture {
+- (BOOL)presentTexture:(BOOL *)presented {
     void *tref = NULL;
     uint32_t tw = 0, th = 0, rx = 0, ry = 0, rw = 0, rh = 0;
     if (hv_fb_display_get_texture(fb, &tref, &tw, &th, &rx, &ry, &rw, &rh) != 0) return NO;
@@ -283,7 +424,7 @@ static uint64_t quick_frame_hash(const uint8_t *px, uint32_t w, uint32_t h, uint
     uint64_t serial = __atomic_load_n(&fb->ovr_serial, __ATOMIC_RELAXED);
     uint64_t hval = (serial * 0xff51afd7ed558ccdull) ^ (uint64_t)(uintptr_t)tref ^ 0x5bd1e995 ^ cursor_hash(fb);
     if (dsize.width < 4 || dsize.height < 4 ||
-        (hval == lastHash && CGSizeEqualToSize(dsize, lastDrawableSize))) {
+        (hval == lastHash && CGSizeEqualToSize(dsize, lastDrawableSize)) || fb_hold_blocks(rw, rh)) {
         os_unfair_lock_unlock(&lock);
         return YES;
     }
@@ -292,11 +433,8 @@ static uint64_t quick_frame_hash(const uint8_t *px, uint32_t w, uint32_t h, uint
         os_unfair_lock_unlock(&lock);
         return YES;
     }
-    float dstAspect = (float)(dsize.width / dsize.height);
-    float srcAspect = (float)rw / (float)rh;
-    float scale[2] = {1.0f, 1.0f};
-    if (dstAspect > srcAspect) scale[0] = srcAspect / dstAspect;
-    else scale[1] = dstAspect / srcAspect;
+    FbPlacement pl = fb_place(rw, rh, dsize.width, dsize.height);
+    static const float scale[2] = {1.0f, 1.0f};
     float uvr[4] = {(float)rx / tw, (float)ry / th, (float)rw / tw, (float)rh / th};
     MTLRenderPassDescriptor *rp = [MTLRenderPassDescriptor renderPassDescriptor];
     rp.colorAttachments[0].texture = drawable.texture;
@@ -305,9 +443,11 @@ static uint64_t quick_frame_hash(const uint8_t *px, uint32_t w, uint32_t h, uint
     rp.colorAttachments[0].storeAction = MTLStoreActionStore;
     id<MTLCommandBuffer> cb = [queue commandBuffer];
     id<MTLRenderCommandEncoder> enc = [cb renderCommandEncoderWithDescriptor:rp];
+    [enc setViewport:pl.vp];
     [enc setRenderPipelineState:pipeline];
     [enc setVertexBytes:scale length:sizeof(scale) atIndex:0];
     [enc setVertexBytes:uvr length:sizeof(uvr) atIndex:1];
+    [enc setFragmentBytes:&pl.nearest length:sizeof(pl.nearest) atIndex:0];
     [enc setFragmentTexture:src atIndex:0];
     [enc drawPrimitives:MTLPrimitiveTypeTriangleStrip vertexStart:0 vertexCount:4];
     draw_cursor(self, enc, scale, rw, rh);
@@ -318,12 +458,29 @@ static uint64_t quick_frame_hash(const uint8_t *px, uint32_t w, uint32_t h, uint
     lastDrawableSize = dsize;
     atomic_fetch_add_explicit(&framesPresented, 1, memory_order_relaxed);
     os_unfair_lock_unlock(&lock);
+    fb_note_present(pl, rw, rh, dsize, 0);
+    *presented = YES;
     return YES;
 }
 
 - (void)tick {
+    uint64_t cpu0 = clock_gettime_nsec_np(CLOCK_THREAD_CPUTIME_ID);
+    BOOL presented = NO;
     @autoreleasepool {
-        if ([self presentTexture]) return;
+        [self tickPresenting:&presented];
+    }
+    uint64_t cpu1 = clock_gettime_nsec_np(CLOCK_THREAD_CPUTIME_ID);
+    if (presented) lastPresentMach = mach_absolute_time();
+    os_unfair_lock_lock(&g_stats_lock);
+    g_stats.ticks++;
+    if (presented) g_stats.frames++;
+    if (cpu1 > cpu0) g_stats.cpu_ns += cpu1 - cpu0;
+    os_unfair_lock_unlock(&g_stats_lock);
+}
+
+- (void)tickPresenting:(BOOL *)presented {
+    {
+        if ([self presentTexture:presented]) return;
         const uint8_t *px = NULL;
         uint32_t w = 0, h = 0, stride = 0;
         if (hv_fb_display_get_frame(fb, &px, &w, &h, &stride) != 0) return;
@@ -344,7 +501,7 @@ static uint64_t quick_frame_hash(const uint8_t *px, uint32_t w, uint32_t h, uint
         uint64_t hval = quick_frame_hash(px, w, h, stride) ^
                         (__atomic_load_n(&fb->ovr_serial, __ATOMIC_RELAXED) * 0xff51afd7ed558ccdull) ^ cursor_hash(fb);
         BOOL sizeChanged = !CGSizeEqualToSize(dsize, lastDrawableSize);
-        if (hval == lastHash && !sizeChanged && texW == w && texH == h) {
+        if ((hval == lastHash && !sizeChanged && texW == w && texH == h) || fb_hold_blocks(w, h)) {
             os_unfair_lock_unlock(&lock);
             return;
         }
@@ -371,14 +528,8 @@ static uint64_t quick_frame_hash(const uint8_t *px, uint32_t w, uint32_t h, uint
             return;
         }
 
-        float dstAspect = (float)(dsize.width / dsize.height);
-        float srcAspect = (float)w / (float)h;
-        float scale[2] = {1.0f, 1.0f};
-        if (dstAspect > srcAspect) {
-            scale[0] = srcAspect / dstAspect;
-        } else {
-            scale[1] = dstAspect / srcAspect;
-        }
+        FbPlacement pl = fb_place(w, h, dsize.width, dsize.height);
+        static const float scale[2] = {1.0f, 1.0f};
 
         MTLRenderPassDescriptor *rp = [MTLRenderPassDescriptor renderPassDescriptor];
         rp.colorAttachments[0].texture = drawable.texture;
@@ -388,10 +539,12 @@ static uint64_t quick_frame_hash(const uint8_t *px, uint32_t w, uint32_t h, uint
 
         id<MTLCommandBuffer> cb = [queue commandBuffer];
         id<MTLRenderCommandEncoder> enc = [cb renderCommandEncoderWithDescriptor:rp];
+        [enc setViewport:pl.vp];
         [enc setRenderPipelineState:pipeline];
         [enc setVertexBytes:scale length:sizeof(scale) atIndex:0];
         static const float uvr_full[4] = {0, 0, 1, 1};
         [enc setVertexBytes:uvr_full length:sizeof(uvr_full) atIndex:1];
+        [enc setFragmentBytes:&pl.nearest length:sizeof(pl.nearest) atIndex:0];
         [enc setFragmentTexture:texture atIndex:0];
         [enc drawPrimitives:MTLPrimitiveTypeTriangleStrip vertexStart:0 vertexCount:4];
         draw_cursor(self, enc, scale, w, h);
@@ -403,6 +556,8 @@ static uint64_t quick_frame_hash(const uint8_t *px, uint32_t w, uint32_t h, uint
         lastDrawableSize = dsize;
         atomic_fetch_add_explicit(&framesPresented, 1, memory_order_relaxed);
         os_unfair_lock_unlock(&lock);
+        fb_note_present(pl, w, h, dsize, (uint64_t)stride * h);
+        *presented = YES;
     }
 }
 
