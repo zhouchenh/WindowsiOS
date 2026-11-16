@@ -22,8 +22,11 @@ foreach ($f in (Join-Path $dir 'shell.cmd'), (Join-Path $dir 'restore.cmd'), (Jo
     Remove-Item $f -ErrorAction SilentlyContinue
 }
 
-# ---- a helper already running: stopped (started again below unless -Remove)
-Get-CimInstance Win32_Process -Filter "Name='powershell.exe'" -ErrorAction SilentlyContinue | Where-Object { $_.CommandLine -like '*WinKit\agent.ps1*' } |
+# ---- a helper already running in this session: stopped (started again below unless -Remove). Run as
+# administrator, Win32_Process lists every session's: other users' helpers are theirs, and stay.
+$session = (Get-Process -Id $PID).SessionId
+Get-CimInstance Win32_Process -Filter "Name='powershell.exe'" -ErrorAction SilentlyContinue |
+    Where-Object { $_.SessionId -eq $session -and $_.CommandLine -like '*WinKit\agent.ps1*' } |
     ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
 
 if ($Remove) {
@@ -111,7 +114,8 @@ Write-Host 'Start > Power once (do not just close the app) so that Windows keeps
 $focusSrc = Join-Path $PSScriptRoot 'FocusAgent.cs'
 $focusHost = Join-Path $dir 'focus.ps1'
 $focusLink = Join-Path $startup 'WinKitFocus.lnk'
-Get-CimInstance Win32_Process -Filter "Name='powershell.exe'" -ErrorAction SilentlyContinue | Where-Object { $_.CommandLine -like '*WinKit\focus.ps1*' } |
+Get-CimInstance Win32_Process -Filter "Name='powershell.exe'" -ErrorAction SilentlyContinue |
+    Where-Object { $_.SessionId -eq $session -and $_.CommandLine -like '*WinKit\focus.ps1*' } |
     ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
 if ($PSScriptRoot -and (Test-Path $focusSrc)) {
     Copy-Item $focusSrc (Join-Path $dir 'FocusAgent.cs') -Force
