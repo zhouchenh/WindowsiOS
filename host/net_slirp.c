@@ -474,13 +474,34 @@ int hv_net_attach(HvMachine *m, HvVirtioNet *n) {
     hv_dns_proxy_set_nameserver6(v6 ? dns6.s6_addr : NULL);
     hv_dns_proxy_start(); /* before the guest can transmit: queries to 10.0.2.3 (and ::3) go to the host's resolver */
     fprintf(stderr, "winvm: net: IPv4 10.0.2.15/24%s\n", v6 ? ", IPv6 " V6_PREFIX "/64 (SLAAC)" : ", IPv6 off (HV_IPV6=0)");
-    if (getenv("HV_NET_FWD")) { /* debugging: "hostport:guestport", from this Mac's loopback into the guest */
-        int hp, gp;
-        struct in_addr h, g;
-        if (sscanf(getenv("HV_NET_FWD"), "%d:%d", &hp, &gp) == 2) {
-            inet_pton(AF_INET, "127.0.0.1", &h);
+    if (getenv("HV_NET_FWD")) {
+        /* TCP forwards into the guest, comma-separated: "hostport:guestport" listens on the host's loopback,
+           "lan:hostport:guestport" on every interface (other devices on the Wi-Fi or a VPN can connect;
+           iOS asks for Local Network access), "a.b.c.d:hostport:guestport" on one IPv4 address. */
+        char spec[256];
+        snprintf(spec, sizeof spec, "%s", getenv("HV_NET_FWD"));
+        char *save = NULL;
+        for (char *item = strtok_r(spec, ", ", &save); item; item = strtok_r(NULL, ", ", &save)) {
+            char bind[64] = "127.0.0.1";
+            int hp = 0, gp = 0;
+            if (sscanf(item, "%d:%d", &hp, &gp) == 2 && !strchr(strchr(item, ':') + 1, ':')) {
+                /* loopback */
+            } else if (sscanf(item, "%63[^:]:%d:%d", bind, &hp, &gp) == 3) {
+                if (!strcmp(bind, "lan")) snprintf(bind, sizeof bind, "0.0.0.0");
+            } else {
+                fprintf(stderr, "winvm: net: HV_NET_FWD: cannot read \"%s\"\n", item);
+                continue;
+            }
+            struct in_addr h, g;
+            if (hp < 1 || hp > 65535 || gp < 1 || gp > 65535 || inet_pton(AF_INET, bind, &h) != 1) {
+                fprintf(stderr, "winvm: net: HV_NET_FWD: bad forward \"%s\"\n", item);
+                continue;
+            }
             inet_pton(AF_INET, "10.0.2.15", &g);
-            if (slirp_add_hostfwd(slirp, 0, h, hp, g, gp) != 0) fprintf(stderr, "hengevm: no forward for port %d\n", hp);
+            if (slirp_add_hostfwd(slirp, 0, h, hp, g, gp) != 0)
+                fprintf(stderr, "winvm: net: no forward for %s:%d (port in use?)\n", bind, hp);
+            else
+                fprintf(stderr, "winvm: net: forwarded %s:%d -> 10.0.2.15:%d (HV_NET_FWD)\n", bind, hp, gp);
         }
     }
     if (share_socket[0]) { /* 10.0.2.4:80 is the shared folder and clipboard: see share.c */

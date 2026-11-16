@@ -49,6 +49,8 @@
 	<true/>
 	<key>LSSupportsOpeningDocumentsInPlace</key>
 	<true/>
+	<key>NSLocalNetworkUsageDescription</key>
+	<string>Lets other devices on your network or VPN connect to Windows through port forwards you set up (for example SSH or Remote Desktop).</string>
 	<key>NSMicrophoneUsageDescription</key>
 	<string>Windows uses the microphone for voice input and audio recording.</string>
 	<key>UIBackgroundModes</key>

@@ -38,6 +38,7 @@ targets:
         CADisableMinimumFrameDurationOnPhone: true
         UIViewControllerBasedStatusBarAppearance: false
         NSMicrophoneUsageDescription: "Windows uses the microphone for voice input and audio recording."
+        NSLocalNetworkUsageDescription: "Lets other devices on your network or VPN connect to Windows through port forwards you set up (for example SSH or Remote Desktop)."
         # applevm:// brings the app back from LocalDevVPN (localdevvpn://enable?scheme=applevm);
         # applevm://enable-jit asks StikDebug for JIT (JITSetup.swift)
         CFBundleURLTypes:
