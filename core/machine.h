@@ -108,6 +108,7 @@ typedef struct HvStats {
     uint64_t kind_insns[16], kind_words[16]; /* --stats: inline words by instruction kind (HvInsnKind), as translated */
     uint64_t posted_kind[4];
     uint64_t race_kind[3];    /* remote drops that raced: walk under way, cache fill under way, either during the drop */  /* TLBIs other CPUs had to do themselves: a page or small range that raced, a big range, the rest (ASID, all) */
+    uint64_t race_other_page; /* HV_WALK_LOG: remote drops not counted as raced, the walks meanwhile being elsewhere */
     uint64_t range_spared;    /* big user-range TLBIs that needed no cached targets dropped */
     uint64_t code_ijc[3];     /* code changes: no cached target into the page, its VA page's targets dropped, all dropped (HV_IJC_PAGES) */
     uint64_t kernel_ranges;   /* big kernel-range TLBIs, dropped by range rather than with everything */
@@ -203,6 +204,7 @@ typedef struct HvPerCpu {
        may be using TLB entries right now. */
     int active, tlb_live;
     uint32_t walk_seq;           /* odd while it walks page tables and fills its TLB (see hv_tlbi_drop_remote_va) */
+    uint64_t walk_page[8];       /* the page walk k (walk_seq 2k -> 2k+1) fills, at [k % 8]; ~0: a process switch (HV_WALK_LOG) */
     uint32_t ijc_seq;            /* odd while it checks a block's mapping in its TLB and caches it (hv_ijc_fill_checked) */
     HvTlbStash stash[HV_STASHES];
     uint64_t stash_clock;
@@ -327,7 +329,7 @@ int hv_ic_ivau_drops(void);
    ones after it) are read in init_rest with their defaults, so the Mac tool and the tests can set them too
    (Documents/env.txt on iOS): 0 turns one off. */
 enum { HV_K_NO_RAS, HV_K_SUPERBLOCKS, HV_K_GROUPS, HV_K_WFI_SPIN, HV_K_FLUSH, HV_K_TEST1, HV_K_TEST2, HV_K_TEST3, HV_K_TLBT, HV_K_JITCAP, HV_K_RECHECK,
-       HV_K_FASTICACHE, HV_K_IJCTTBKEY, HV_K_LOGFLUSH, HV_K_IJCPAGES, HV_K_XCHAINPAGES, HV_K_STASHVA, HV_K_COUNT };
+       HV_K_FASTICACHE, HV_K_IJCTTBKEY, HV_K_LOGFLUSH, HV_K_IJCPAGES, HV_K_XCHAINPAGES, HV_K_STASHVA, HV_K_WALKLOG, HV_K_COUNT };
 extern int hv_knob[HV_K_COUNT];
 int hv_knob_set(HvMachine *m, const char *name, int value);
 const char *hv_knob_name(int k); /* its environment variable */

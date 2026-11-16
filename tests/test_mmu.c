@@ -436,6 +436,68 @@ static void test_stash_va(HvMachine *m, HvCpu *cpu, HvCpu *cpu1) {
     hv_cpu_reset_index(cpu1, m, 1);
 }
 
+/* HV_WALK_LOG: which of another CPU's page walks a TLBI of a page done from here may let through. Its walk log and
+   walk_seq are set by hand: walk k logged at walk_page[k % 8], walk_seq 2k + 1 while it runs. */
+static void test_walk_log(HvMachine *m, HvCpu *cpu, HvCpu *cpu1) {
+    tlb_tables();
+    hv_cpu_reset(cpu, m);
+    hv_cpu_reset_index(cpu1, m, 1);
+    tlb_mmu_on(cpu, 5);
+    tlb_mmu_on(cpu1, 5);
+    HvPerCpu *p = cpu1->pc_state;
+    const int on = hv_knob[HV_K_WALKLOG];
+    const uint64_t m56 = 0x00ffffffffffffffull;
+    const uint64_t P = UPAGES + (10 << 12);                /* the page of the TLBI */
+    const uint64_t near = (UPAGES + (300 << 12)) & m56;   /* another page, the same 2 MB and 1 GB */
+    const uint64_t gb = (UPAGES + (1ull << 30)) & m56;    /* the next 1 GB: not the same 2 MB block either */
+    const uint64_t far = KPAGES & m56;                     /* the kernel half */
+    uint32_t saved = p->walk_seq;
+    uint32_t k0 = (saved >> 1) + 16; /* past whatever ran: a log entry of its own */
+    struct { const char *what; uint32_t s1, s2, now; uint64_t log0, log1; uint64_t npages; int bloom, want_on; } cases[] = {
+        {"no walk", 2 * k0, 2 * k0, 2 * k0, 0, 0, 1, 0, 1},
+        {"running, the kernel half", 2 * k0 + 1, 2 * k0 + 1, 2 * k0 + 1, far, 0, 1, 0, 1},
+        {"running, the next 1 GB", 2 * k0 + 1, 2 * k0 + 1, 2 * k0 + 1, gb, 0, 1, 0, 1},
+        {"running, that page", 2 * k0 + 1, 2 * k0 + 1, 2 * k0 + 1, P & m56, 0, 1, 0, 0},
+        {"running, another page in its 1 GB", 2 * k0 + 1, 2 * k0 + 1, 2 * k0 + 1, near, 0, 1, 0, 0},
+        {"running, a process switch", 2 * k0 + 1, 2 * k0 + 1, 2 * k0 + 1, ~0ull, 0, 1, 0, 0},
+        {"finished, another page in its 1 GB", 2 * k0, 2 * k0 + 2, 2 * k0 + 2, near, 0, 1, 0, 1},
+        {"finished, another page, its 2 MB in a large page", 2 * k0, 2 * k0 + 2, 2 * k0 + 2, near, 0, 1, 1, 0},
+        {"finished, another page, its 1 GB in a large page", 2 * k0, 2 * k0 + 2, 2 * k0 + 2, near, 0, 1, 2, 0},
+        {"finished, that page", 2 * k0, 2 * k0 + 2, 2 * k0 + 2, P & m56, 0, 1, 0, 0},
+        {"finished, a process switch", 2 * k0, 2 * k0 + 2, 2 * k0 + 2, ~0ull, 0, 1, 0, 0},
+        {"finished, then one running in its 1 GB", 2 * k0, 2 * k0 + 3, 2 * k0 + 3, far, near, 1, 0, 0},
+        {"finished, then one running elsewhere", 2 * k0, 2 * k0 + 3, 2 * k0 + 3, near, far, 1, 0, 1},
+        {"more walks than the log holds", 2 * k0, 2 * k0 + 18, 2 * k0 + 18, far, far, 1, 0, 0},
+        {"the log rewritten while read", 2 * k0, 2 * k0 + 2, 2 * k0 + 16, far, 0, 1, 0, 0},
+        {"a range, finished in its last page", 2 * k0, 2 * k0 + 2, 2 * k0 + 2, (P + (3 << 12)) & m56, 0, 4, 0, 0},
+        {"a range, finished just past it", 2 * k0, 2 * k0 + 2, 2 * k0 + 2, (P + (4 << 12)) & m56, 0, 4, 0, 1},
+    };
+    for (size_t i = 0; i < sizeof cases / sizeof cases[0]; i++) {
+        p->walk_page[k0 & 7] = cases[i].log0;
+        p->walk_page[(k0 + 1) & 7] = cases[i].log1;
+        p->walk_seq = cases[i].now;
+        uint32_t h2 = hv_large_2m_bit(P), hb = hv_large_big_bit(P);
+        if (cases[i].bloom == 1) p->large_2m_bloom[h2 >> 6] |= 1ull << (h2 & 63);
+        if (cases[i].bloom == 2) p->large_big_bloom[hb >> 6] |= 1ull << (hb & 63);
+        int got = hv_walks_elsewhere(cpu1, cases[i].s1, cases[i].s2, P, cases[i].npages);
+        int want = cases[i].s1 == cases[i].s2 && !(cases[i].s1 & 1) ? 1 : on && cases[i].want_on;
+        check_that(got == want, "walk log, %s: %s (HV_WALK_LOG=%d)", cases[i].what, got ? "let through" : "a race", on);
+        memset(p->large_2m_bloom, 0, sizeof p->large_2m_bloom);
+        memset(p->large_big_bloom, 0, sizeof p->large_big_bloom);
+    }
+    /* The whole drop, with a walk of the kernel half running there: done from here with the log. */
+    p->walk_seq = 2 * k0;
+    tlb_touch(cpu1, P, 1, 0, 1);
+    p->walk_page[k0 & 7] = far;
+    p->walk_seq = 2 * k0 + 1;
+    int r = hv_tlbi_drop_remote_va(cpu1, P, 5);
+    check_that(r == (on ? 1 : 0) && (!on || !tlb_has_user(cpu1, P)), "walk log: a remote drop with a walk elsewhere running gave %d", r);
+    p->walk_seq = 2 * k0 + 2;
+    (void)saved;
+    hv_cpu_reset(cpu, m);
+    hv_cpu_reset_index(cpu1, m, 1);
+}
+
 int main(void) {
     static HvMachine m;
     static HvCpu cpu, cpu1;
@@ -802,6 +864,7 @@ int main(void) {
     test_logged_flush(&m, &cpu);
     test_code_page_drops(&m, &cpu, &cpu1);
     test_stash_va(&m, &cpu, &cpu1);
+    test_walk_log(&m, &cpu, &cpu1);
 
     printf("%d checks, %d failures\n", checks, failures);
     return failures != 0;

@@ -799,18 +799,79 @@ static void tlb_fill(HvCpu *cpu, uint64_t va, int el, const HvWalk *w) {
 
 /* Walks that may fill the TLB are bracketed by the CPU's walk_seq (odd while
    one runs), so another CPU's TLBI can drop entries here itself and know no
-   fill from an old page table raced it (hv_tlbi_drop_remote_va). */
-static void walk_begin(HvCpu *cpu) {
-    if (cpu->pc_state) __atomic_add_fetch(&cpu->pc_state->walk_seq, 1, __ATOMIC_SEQ_CST);
+   fill from an old page table raced it (hv_tlbi_drop_remote_va).
+   Henge aaba70b (with 1ed86bd, 17e9ed9): each walk first logs the page it may fill (walk_page), so a TLBI of another
+   page need not count it as a race (HV_WALK_LOG, see hv_walks_elsewhere). HV_WALK_ANY: a process switch, which saves
+   and restores many entries and the stashes. */
+#define HV_WALK_ANY (~0ull)
+#define WALK_LOG 8
+#define WALK_PAGE_BITS (0x00ffffffffffffffull & ~(uint64_t)PAGE_MASK) /* by the low 56 bits, as drops compare tagged addresses */
+/* The largest mapping a walk can fill a 4 KB entry from lies in one 1 GB-aligned region: 1 GB blocks (4 KB granule,
+   level 1), 512 MB (64 KB granule) and 32 MB (16 KB granule) blocks at level 2. */
+#define WALK_REGION_BITS 30
+_Static_assert((WALK_LOG & (WALK_LOG - 1)) == 0, "the walk log is indexed by walk number mod WALK_LOG");
+_Static_assert(HV_TLB_PAGE_BITS < 21 && 21 < WALK_REGION_BITS, "a TLB page lies in one 2 MB and one 1 GB region");
+_Static_assert(sizeof(((HvPerCpu *)0)->walk_page) / sizeof(uint64_t) == WALK_LOG, "walk_page holds WALK_LOG walks");
+
+static void walk_begin(HvCpu *cpu, uint64_t va) {
+    HvPerCpu *p = cpu->pc_state;
+    if (!p) return;
+    uint32_t k = p->walk_seq >> 1; /* only this CPU moves it */
+    /* The entry is walk k - WALK_LOG's too: a reader that sees it rewritten must also see walk_seq at 2k or past it.
+       A release store (hv_walks_elsewhere's acquire fence pairs with it; walk_end's release does not order a later
+       store). Logged whatever HV_WALK_LOG says: only readers look at the knob. */
+    __atomic_store_n(&p->walk_page[k & (WALK_LOG - 1)], va == HV_WALK_ANY ? HV_WALK_ANY : va & WALK_PAGE_BITS, __ATOMIC_RELEASE);
+    __atomic_add_fetch(&p->walk_seq, 1, __ATOMIC_SEQ_CST); /* after the log entry, as its release */
 }
 
 static void walk_end(HvCpu *cpu) {
     if (cpu->pc_state) __atomic_add_fetch(&cpu->pc_state->walk_seq, 1, __ATOMIC_RELEASE);
 }
 
+static int bloom_hit(const HvPerCpu *p, uint64_t va) {
+    uint32_t h2 = hv_large_2m_bit(va), hb = hv_large_big_bit(va);
+    return (__atomic_load_n(&p->large_2m_bloom[h2 >> 6], __ATOMIC_RELAXED) >> (h2 & 63) & 1) ||
+           (__atomic_load_n(&p->large_big_bloom[hb >> 6], __ATOMIC_RELAXED) >> (hb & 63) & 1);
+}
+
+/* Whether target's walks that ran (or were running) while its walk_seq went from s1 to s2 cannot have refilled any of
+   the npages 4 KB pages from va from the old page tables. Without HV_WALK_LOG only "no walk at all" passes. With it,
+   by the log of the last WALK_LOG walks (a process switch counts as every page):
+   - a walk finished by s2 must have been of a page outside them. It filled only its own page, and if that page is part
+     of a larger mapping that holds one of them too (which a TLBI of that one drops whole), the walk set the large-page
+     filter bit before it finished: looked at again here, after s2, and then this does not pass;
+   - a walk still running at s2 has not filled yet, and may yet fill from such a mapping, its filter bit not set yet:
+     it must be of a page outside every 1 GB region they touch (WALK_REGION_BITS: the largest such mapping).
+   Henge compares pages only (16 KB): it has no large-page filters, and WindowsiOS's 4 KB TLB holds blocks as pages. */
+int hv_walks_elsewhere(HvCpu *target, uint32_t s1, uint32_t s2, uint64_t va, uint64_t npages) {
+    if (s1 == s2 && !(s1 & 1)) return 1;
+    if (!hv_knob[HV_K_WALKLOG]) return 0;
+    HvPerCpu *p = target->pc_state;
+    uint32_t k1 = s1 >> 1, k2 = (s2 + 1) >> 1; /* walks k1 .. k2 - 1, the last still running if s2 is odd */
+    if (k2 - k1 > WALK_LOG) return 0;
+    const uint64_t m56 = 0x00ffffffffffffffull, rmask = (1ull << WALK_REGION_BITS) - 1;
+    uint64_t lo = va & WALK_PAGE_BITS, span = npages << HV_TLB_PAGE_BITS;
+    uint64_t rlo = lo & ~rmask, rspan = (((lo + span - 1) & m56 & ~rmask) - rlo + rmask + 1) & m56;
+    for (uint32_t k = k1; k != k2; k++) {
+        uint64_t pg = __atomic_load_n(&p->walk_page[k & (WALK_LOG - 1)], __ATOMIC_RELAXED);
+        if (pg == HV_WALK_ANY) return 0;
+        int running = (s2 & 1) && k == k2 - 1;
+        if (running ? ((pg - rlo) & m56) < rspan : ((pg - lo) & m56) < span) return 0;
+    }
+    /* and no later walk wrote over an entry while it was read: walk k1 + WALK_LOG writes k1's entry once walk_seq is
+       2 (k1 + WALK_LOG), before it goes odd (Henge 1ed86bd) */
+    __atomic_thread_fence(__ATOMIC_ACQUIRE);
+    uint32_t s3 = __atomic_load_n(&p->walk_seq, __ATOMIC_SEQ_CST);
+    if ((s3 >> 1) - k1 >= WALK_LOG) return 0;
+    /* A finished walk of a page of a large mapping holding one of the pages: its filter bit, set before walk_end. */
+    if (bloom_hit(p, lo) || bloom_hit(p, (lo + span - 1) & m56)) return 0;
+    if (target->m && target->m->stats_interval) target->m->stats.race_other_page++;
+    return 1;
+}
+
 uint32_t hv_mmu_access(HvCpu *cpu, uint64_t va, HvAccess acc, int el, uint64_t *pa) {
     HvWalk w;
-    walk_begin(cpu);
+    walk_begin(cpu, va);
     hv_mmu_walk(cpu, va, acc, el, &w);
     if (!w.fsc) tlb_fill(cpu, va, el, &w);
     walk_end(cpu);
@@ -825,7 +886,8 @@ int hv_tlbi_drop_remote_va(HvCpu *target, uint64_t va, int asid) {
     if ((p->large_2m_bloom[h2 >> 6] >> (h2 & 63) & 1) || (p->large_big_bloom[hb >> 6] >> (hb & 63) & 1))
         return -1; /* large-block sub-pages may exist on target: let target flush them */
     uint32_t s1 = __atomic_load_n(&p->walk_seq, __ATOMIC_SEQ_CST);
-    if (s1 & 1) { if (target->m->stats_interval) target->m->stats.race_kind[0]++; return 0; } /* mid-walk: it may be about to fill from the old table */
+    /* mid-walk: it may be about to fill from the old table, unless (HV_WALK_LOG) the walk is far enough away */
+    if ((s1 & 1) && !hv_walks_elsewhere(target, s1, s1, va, 1)) { if (target->m->stats_interval) target->m->stats.race_kind[0]++; return 0; }
     uint32_t c1 = __atomic_load_n(&p->ijc_seq, __ATOMIC_SEQ_CST);
     if (c1 & 1) { if (target->m->stats_interval) target->m->stats.race_kind[1]++; return 0; } /* caching a block it may have looked up through the old mapping */
     if (!((va >> 55) & 1)) {
@@ -848,7 +910,7 @@ int hv_tlbi_drop_remote_va(HvCpu *target, uint64_t va, int asid) {
        during it changed ijc_seq. */
     if (!ijc_drop_va(target, va, asid, 1)) return -1; /* only target can do it: no use trying again */
     __atomic_thread_fence(__ATOMIC_SEQ_CST);
-    int ok = __atomic_load_n(&p->walk_seq, __ATOMIC_SEQ_CST) == s1 && /* no fill in between */
+    int ok = hv_walks_elsewhere(target, s1, __atomic_load_n(&p->walk_seq, __ATOMIC_SEQ_CST), va, 1) && /* no fill of it in between */
              __atomic_load_n(&p->ijc_seq, __ATOMIC_SEQ_CST) == c1;
     if (!ok) {
         if (target->m->stats_interval) target->m->stats.race_kind[2]++;
@@ -877,7 +939,7 @@ const uint32_t *hv_mmu_fetch(HvCpu *cpu, uint64_t va, uint64_t *pa, uint32_t *av
     }
     HvWalk w;
     cpu->m->stats.fetch_walks++;
-    walk_begin(cpu);
+    walk_begin(cpu, va);
     hv_mmu_walk(cpu, va, HV_ACC_EXEC, cpu->el, &w);
     if (!w.fsc) tlb_fill(cpu, va, cpu->el, &w);
     walk_end(cpu);
@@ -926,7 +988,7 @@ int hv_tlb_refill(HvCpu *cpu, uint64_t va, uint32_t flags) {
         cpu->pc_state->last_refill_key = rkey;
     }
     HvWalk w;
-    walk_begin(cpu);
+    walk_begin(cpu, va);
     hv_mmu_walk(cpu, va, write ? HV_ACC_WRITE : HV_ACC_READ, el, &w);
     if (!w.fsc) tlb_fill(cpu, va, el, &w);
     walk_end(cpu);
@@ -1088,7 +1150,7 @@ static void *ijc_resolve(HvCpu *cpu, uint64_t va, uint32_t flags) {
            walk for it here, as hv_tlb_refill does for data. A fault is for the
            dispatcher to take. */
         HvWalk w;
-        walk_begin(cpu);
+        walk_begin(cpu, va);
         hv_mmu_walk(cpu, va, HV_ACC_EXEC, kernel ? 1 : 0, &w);
         if (!w.fsc) tlb_fill(cpu, va, kernel ? 1 : 0, &w);
         walk_end(cpu);
@@ -1241,7 +1303,7 @@ void hv_tlb_switch_user(HvCpu *cpu, uint64_t old, uint64_t now) {
         hv_tlb_flush_user(cpu);
         return;
     }
-    walk_begin(cpu);
+    walk_begin(cpu, HV_WALK_ANY);
     m->stats.tlb_flushes++;
     uint32_t n = cpu->nuser_fills;
     cpu->nuser_fills = 0;
