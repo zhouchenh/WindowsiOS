@@ -2,8 +2,16 @@ Apple VM: licences of the Built-in JIT components
 ================================================
 
 Apple VM is free software under the GNU General Public License, version 2 or (at your
-option) any later version. Its source code, including the build scripts named below, is at
-https://github.com/zhouchenh/WindowsiOS (branch duo).
+option) any later version (LICENSE-GPL-2.0.txt). Its source code, including the build scripts
+named below, is at https://github.com/zhouchenh/WindowsiOS (branch duo).
+
+This app as built and distributed combines that GPL code with code under the Apache License
+2.0 (among others ring, in the on-device pairing library, and AWS-LC, in StikJIT's idevice
+library; see the crate lists named below). The Apache License 2.0 is compatible with version 3
+of the GPL but not with version 2, so the app's binaries are distributed under the GNU General
+Public License, version 3 (LICENSE-GPL-3.0.txt), which "any later version" permits. Apple VM's
+source code stays under GPL-2.0-or-later, as do Henge and Husk (whose licence text is the same
+as LICENSE-GPL-2.0.txt).
 
 Built-in JIT ships two third-party components inside this app:
 

@@ -15,7 +15,8 @@
 # and refreshes, in ios/Sources/Resources/legal (bundled as the app's legal/ folder),
 # LICENSES-rppairing-crates.txt (the licence notices of every crate in libhusk_rppairing.a),
 # LICENSES-stikjit-idevice-crates.txt (the same for idevice's FFI inside StikJIT.framework),
-# LICENSE-StikJIT-MPL-2.0.txt and a copy of the StikJIT patch.
+# LICENSE-StikJIT-MPL-2.0.txt, a copy of the StikJIT patch and LICENSE-GPL-2.0.txt (Husk's
+# licence, the same as Apple VM's). LICENSE-GPL-3.0.txt there is kept by hand (legal/README.txt).
 #
 #   scripts/build_jit_deps.sh [--force]
 #
@@ -204,6 +205,15 @@ build_rppairing() {
     step "crate licence notices"
     (cd "$crate" && PATH="$(dirname "$cargo"):$PATH" RUSTC="$rustc" \
         python3 "$crate/notices.py" "$LEGAL/LICENSES-rppairing-crates.txt")
+    # GPL-2.0 section 1: the licence goes with the program. Husk's is the same GPL-2.0 text as
+    # Apple VM's own LICENSE; ship it once, and say so if that ever changes.
+    if cmp -s "$src/LICENSE" "$ROOT/LICENSE"; then
+        cp "$src/LICENSE" "$LEGAL/LICENSE-GPL-2.0.txt"
+    else
+        cp "$ROOT/LICENSE" "$LEGAL/LICENSE-GPL-2.0.txt"
+        cp "$src/LICENSE" "$LEGAL/LICENSE-Husk.txt"
+        echo "warning: Husk's LICENSE differs from Apple VM's; it is in legal/LICENSE-Husk.txt: list it in legal/README.txt and package_ipa.sh" >&2
+    fi
     echo "$want" > "$stamp"
     echo "-> ios/deps/lib/libhusk_rppairing.a"
 }

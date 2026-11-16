@@ -2,6 +2,8 @@
 
 `WindowsiOS` is licensed as a whole under the **GNU General Public License v2.0 or later** (`GPL-2.0-or-later`; see [`LICENSE`](LICENSE)), preserving all upstream copyright notices and copyleft obligations from [`Leviidev/Henge`](https://github.com/Leviidev/Henge) and [`Leviidev/Husk`](https://github.com/Leviidev/Husk).
 
+The iOS app as built (the IPA) also contains code under the Apache License 2.0 (for example `ring` in the on-device pairing library and AWS-LC in StikJIT's idevice library), which is compatible with GPL version 3 but not version 2; its binaries are therefore distributed under **GPL-3.0**, as "or later" permits. Both GPL texts travel inside the app in `legal/` (`ios/Sources/Resources/legal/LICENSE-GPL-2.0.txt`, `LICENSE-GPL-3.0.txt`; see `legal/README.txt`).
+
 This project stands on the shoulders of extraordinary open-source systems engineering across the iOS binary-translation, virtualization, and firmware ecosystems. Every upstream project, library, firmware package, and driver that helped make `WindowsiOS` possible is credited below along with its governing license terms.
 
 ---

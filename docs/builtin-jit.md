@@ -128,6 +128,8 @@ and `JITSetup.swift` (the requests, shared with StikDebug). The JIT protocol on 
 (`winios_jit.c`, `winios_brk.S`, `henge-jit.js`) is the same as for StikDebug.
 
 The licences that ship in the app are in `ios/Sources/Resources/legal` (the app's `legal/` folder):
-StikJIT's MPL-2.0 with our patch, idevice's MIT licence, and the licence notices of every Rust
+the GPL-2.0 and GPL-3.0 texts (the app's binaries contain Apache-2.0 code, so they are distributed
+under GPL-3.0; `legal/README.txt` says why), StikJIT's MPL-2.0 with our patch, idevice's MIT
+licence, and the licence notices of every Rust
 crate in StikJIT's idevice library (`LICENSES-stikjit-idevice-crates.txt`) and in the pairing
 library (`LICENSES-rppairing-crates.txt`). See also `THIRD_PARTY_NOTICES.md`.
