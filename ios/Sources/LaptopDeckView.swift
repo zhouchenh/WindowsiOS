@@ -509,6 +509,12 @@ struct LaptopDeckView: View {
             // Leaving Laptop (or the deck going away): a modifier the deck pressed must not stay down
             // in Windows. Each held keycap sends its own key-up in its onDisappear.
             releaseLatchedModifiers()
+            // F9's drag lock holds the left button in the shared PointerController; this view's
+            // state goes away with the deck, so let the button up or Studio would drag on every touch.
+            if dragLocked {
+                dragLocked = false
+                PointerController.shared.setHeldButton(1, down: false)
+            }
         }
     }
 
