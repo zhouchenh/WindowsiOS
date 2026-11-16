@@ -43,6 +43,7 @@ static WinIOSBridge *s_shared_bridge = nil;
     CGFloat _screenScale;
     NSInteger _hingeStatus;
     double _hingeAngleDegrees;
+    BOOL _pausedInBackground;   /* the guest was stopped because the app went to the background */
 }
 - (void)handleVMExitWithReason:(NSString *)reason;
 - (void)updateUnpackProgress:(double)frac;
@@ -146,8 +147,12 @@ static void winios_capture_stderr(NSString *docs) {
         NSNotificationCenter *nc = [NSNotificationCenter defaultCenter];
         /* iOS refuses GPU work from the background while this app keeps running there (audio):
            everything Windows drew meanwhile was lost (missing tray, Start menu, text). So the guest
-           CPUs stop as the app leaves the front and go on when it is back. */
-        [nc addObserver:self selector:@selector(onAppInactive:) name:UIApplicationWillResignActiveNotification object:nil];
+           CPUs stop when the app goes to the background and go on when it is back in front.
+           Only the background counts: an app that is merely inactive (Control Center, a notification
+           banner, the Face ID or passkey sheet during a Safari sign-in) is still on screen and may
+           still use the GPU, and stopping Windows then would stall the sign-in it is waiting for. */
+        [nc addObserver:self selector:@selector(onAppBackground:) name:UIApplicationDidEnterBackgroundNotification object:nil];
+        [nc addObserver:self selector:@selector(onAppForeground:) name:UIApplicationWillEnterForegroundNotification object:nil];
         [nc addObserver:self selector:@selector(onAppActive:) name:UIApplicationDidBecomeActiveNotification object:nil];
         [nc addObserver:self selector:@selector(onAppBackgroundOrTerminate:) name:UIApplicationDidEnterBackgroundNotification object:nil];
         [nc addObserver:self selector:@selector(onAppBackgroundOrTerminate:) name:UIApplicationWillTerminateNotification object:nil];
@@ -191,20 +196,39 @@ static void winios_capture_stderr(NSString *docs) {
     }
 }
 
-- (void)onAppInactive:(NSNotification *)note {
+- (void)onAppBackground:(NSNotification *)note {
     (void)note;
     if (_vmRunning && !getenv("WINIOS_RUN_IN_BACKGROUND")) {
         hv_winvm_set_paused(1);
-        fprintf(stderr, "winvm: paused (app not in front)\n");
+        _pausedInBackground = YES;
+        fprintf(stderr, "winvm: paused (app in the background)\n");
     }
 }
 
-- (void)onAppActive:(NSNotification *)note {
-    (void)note;
+- (void)resumeFromBackground {
+    if (!_pausedInBackground) return;
+    _pausedInBackground = NO;
     if (_vmRunning) {
         hv_winvm_set_paused(0);
         fprintf(stderr, "winvm: resumed\n");
     }
+}
+
+- (void)onAppForeground:(NSNotification *)note {
+    (void)note;
+    /* While this notification is delivered the app is still in the background state, where GPU
+       work is refused: go on once UIKit has finished moving it to the foreground (DidBecomeActive
+       also resumes, for when that comes first). */
+    dispatch_async(dispatch_get_main_queue(), ^{
+        if ([UIApplication sharedApplication].applicationState != UIApplicationStateBackground) {
+            [self resumeFromBackground];
+        }
+    });
+}
+
+- (void)onAppActive:(NSNotification *)note {
+    (void)note;
+    [self resumeFromBackground];
 }
 
 - (void)onAppBackgroundOrTerminate:(NSNotification *)note {
