@@ -47,7 +47,9 @@ private enum WinJITWork {
                 throw NSError(domain: "WinJITHelper", code: 1,
                               userInfo: [NSLocalizedDescriptionKey: "The pairing file was not provided."])
             }
-            let pairingURL = root.appendingPathComponent("pairingFile-\(UUID().uuidString).plist")
+            removeStalePairingFiles(in: root)
+            let pairingURL = root.appendingPathComponent(
+                "\(pairingFilePrefix)\(getpid())-\(UUID().uuidString).plist")
             try pairingData.write(to: pairingURL, options: [.atomic, .completeFileProtectionUntilFirstUserAuthentication])
             defer { try? manager.removeItem(at: pairingURL) }
             if needsScan {
@@ -100,6 +102,28 @@ private enum WinJITWork {
         } catch {
             return .init(success: false, message: error.localizedDescription + portNote,
                          txmPresent: StikJIT.isTXMPresent)
+        }
+    }
+
+    /// Each request's copy of the pairing file is "pairingFile-<helper pid>-<UUID>.plist".
+    private static let pairingFilePrefix = "pairingFile-"
+
+    /// A request removes its copy of the pairing file (it holds the device's pairing key) when it ends,
+    /// but not when the helper dies first: Apple VM closed or crashed while the helper was attaching, or
+    /// iOS reclaimed the suspended extension. Such leftovers are removed here: every copy from this
+    /// process (requests in it run one at a time, so none is in use) or from one that has exited, and
+    /// any without a pid (from before copies had one). Copies of a helper still running are kept.
+    private static func removeStalePairingFiles(in root: URL) {
+        let manager = FileManager.default
+        guard let names = try? manager.contentsOfDirectory(atPath: root.path) else { return }
+        let me = getpid()
+        for name in names where name.hasPrefix(pairingFilePrefix) && name.hasSuffix(".plist") {
+            let rest = name.dropFirst(pairingFilePrefix.count)
+            if let dash = rest.firstIndex(of: "-"), let pid = pid_t(rest[..<dash]), pid != me,
+               kill(pid, 0) == 0 || errno == EPERM {
+                continue
+            }
+            try? manager.removeItem(at: root.appendingPathComponent(name))
         }
     }
 
