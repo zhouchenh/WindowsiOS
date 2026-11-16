@@ -81,8 +81,9 @@ In detail:
 - **The relay** is a second copy of the program (`--relay <port>`, no window). It listens on
   `10.0.2.15:<port>`, the guest's own address. The app usually listens only on loopback, so the
   relay connects each incoming connection to `127.0.0.1:<port>`, falling back to `[::1]:<port>`
-  (Go and Node often bind `localhost` to IPv6 only). It stops 4 s after a finished sign-in, or after
-  30 minutes without a connection.
+  (Go and Node often bind `localhost` to IPv6 only). It stops listening 4 s after a finished
+  sign-in, or after 30 minutes without a connection, so the next sign-in's relay can take the
+  port. Connections it already accepted get up to 2 minutes to finish before it exits.
 - **Port forward.** `PUT /.henge/expose-port` makes `host/net_slirp.c` add a libslirp host forward
   `127.0.0.1:<port> → 10.0.2.15:<port>`, plus an IPv6 bridge for `[::1]:<port>`. Safari's redirect
   to `localhost:<port>` on the iPhone therefore reaches the relay.

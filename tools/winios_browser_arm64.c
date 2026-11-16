@@ -53,6 +53,17 @@ typedef struct {
     uint8_t  sin_zero[8];
 } SockAddrIn;
 
+/* Winsock fd_set / timeval (Windows LLP64: `long` is 32-bit) */
+typedef struct {
+    uint32_t fd_count;
+    SOCKET   fd_array[64];
+} FdSet;
+
+typedef struct {
+    int32_t tv_sec;
+    int32_t tv_usec;
+} TimeVal;
+
 typedef struct {
     int16_t  sin6_family;
     uint16_t sin6_port;
@@ -134,6 +145,8 @@ __declspec(dllimport) int    send(SOCKET s, const char *buf, int len, int flags)
 __declspec(dllimport) int    recv(SOCKET s, char *buf, int len, int flags);
 __declspec(dllimport) int    shutdown(SOCKET s, int how);
 __declspec(dllimport) int    closesocket(SOCKET s);
+__declspec(dllimport) int    select(int nfds, FdSet *readfds, FdSet *writefds, FdSet *exceptfds,
+                                    const TimeVal *timeout);
 
 static void mem_zero(void *p, size_t n) {
     uint8_t *b = (uint8_t *)p;
@@ -147,6 +160,8 @@ static size_t str_len(const char *s) {
 }
 
 static volatile uint64_t g_relay_finish_at = 0;
+/* Relay client threads still running; the relay process waits for them before it exits. */
+static volatile int32_t g_relay_active_clients = 0;
 
 static char to_lower_c(char c) {
     return (c >= 'A' && c <= 'Z') ? (char)(c + 32) : c;
@@ -540,6 +555,7 @@ static DWORD relay_client_thread(void *arg) {
     if (upstream == INVALID_SOCKET) {
         log_line("relay_upstream_connect_failed", "");
         closesocket(client);
+        __atomic_fetch_sub(&g_relay_active_clients, 1, __ATOMIC_SEQ_CST);
         return 0;
     }
 
@@ -569,6 +585,7 @@ static DWORD relay_client_thread(void *arg) {
             CloseHandle(nt);
         }
     }
+    __atomic_fetch_sub(&g_relay_active_clients, 1, __ATOMIC_SEQ_CST);
     return 0;
 }
 
@@ -591,13 +608,26 @@ static void run_relay_server(uint16_t port) {
     u32_to_dec(port, pstr);
     log_line("relay_listening_10.0.2.15:", pstr);
 
-    DWORD accept_tmo = 2000;
-    setsockopt(srv, SOL_SOCKET, SO_RCVTIMEO, &accept_tmo, sizeof(accept_tmo));
-
+    /* Winsock's SO_RCVTIMEO does not apply to accept(), so wait for connections with select()
+     * and a short timeout: the idle deadline and the finish time are then really checked, and a
+     * finished relay frees the port for the next sign-in instead of taking its callback. */
     uint64_t deadline = GetTickCount64() + 30ULL * 60ULL * 1000ULL;
-    while (GetTickCount64() < deadline) {
+    for (;;) {
+        uint64_t now = GetTickCount64();
         uint64_t fin = g_relay_finish_at;
-        if (fin != 0 && GetTickCount64() >= fin) break;
+        if (now >= deadline || (fin != 0 && now >= fin)) break;
+
+        FdSet rfds;
+        rfds.fd_count = 1;
+        rfds.fd_array[0] = srv;
+        TimeVal tv = { 0, 250000 };
+        int ready = select(0, &rfds, NULL, NULL, &tv);
+        if (ready < 0) {
+            Sleep(40);
+            continue;
+        }
+        if (ready == 0) continue;
+
         SOCKET cl = accept(srv, NULL, NULL);
         if (cl == INVALID_SOCKET) {
             Sleep(40);
@@ -611,14 +641,23 @@ static void run_relay_server(uint16_t port) {
         }
         rc->client = cl;
         rc->port = port;
+        __atomic_fetch_add(&g_relay_active_clients, 1, __ATOMIC_SEQ_CST);
         HANDLE th = CreateThread(NULL, 0, relay_client_thread, rc, 0, NULL);
         if (th) CloseHandle(th);
         else {
+            __atomic_fetch_sub(&g_relay_active_clients, 1, __ATOMIC_SEQ_CST);
             HeapFree(GetProcessHeap(), 0, rc);
             closesocket(cl);
         }
     }
+    /* Stop listening first so a new relay can take the port, then let the connections already
+     * accepted finish (bounded) instead of cutting them off with ExitProcess. */
     closesocket(srv);
+    uint64_t drain_until = GetTickCount64() + 120000ULL;
+    while (__atomic_load_n(&g_relay_active_clients, __ATOMIC_SEQ_CST) > 0 && GetTickCount64() < drain_until) {
+        Sleep(50);
+    }
+    log_line("relay_exit_port=", pstr);
 }
 
 /* Parse UTF-8 command line into up to 16 arguments */
