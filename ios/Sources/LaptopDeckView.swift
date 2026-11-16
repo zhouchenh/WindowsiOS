@@ -676,13 +676,20 @@ struct LaptopDeckView: View {
         return false
     }
 
+    /// A tap with the latched modifiers. The bridge queues taps behind one another, so the modifiers go
+    /// with the tap (a combination), not down and up around a tap that may only go out later.
     private func sendModifiedTap(_ hid: UInt8) {
-        if ctrlLatched { WinIOSBridge.shared.sendKeyHid(0xe0, down: true) }
-        if altLatched  { WinIOSBridge.shared.sendKeyHid(0xe2, down: true) }
-        if winLatched  { WinIOSBridge.shared.sendKeyHid(0xe3, down: true) }
-        if shiftLatched { WinIOSBridge.shared.sendKeyHid(0xe1, down: true) }
-        WinIOSBridge.shared.tapKeyHid(hid)
-        releaseLatchedModifiers()
+        var mods: [UInt8] = []
+        if ctrlLatched { mods.append(0xe0) }
+        if altLatched { mods.append(0xe2) }
+        if winLatched { mods.append(0xe3) }
+        if shiftLatched { mods.append(0xe1) }
+        if mods.isEmpty {
+            WinIOSBridge.shared.tapKeyHid(hid)
+        } else {
+            WinIOSBridge.shared.sendKeyCombo(withModifiers: mods.map { NSNumber(value: $0) }, key: hid)
+        }
+        releaseLatchedModifiers() // and lifts any a held key put down with them
     }
 
     private func releaseLatchedModifiers() {
