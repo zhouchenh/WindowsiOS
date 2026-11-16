@@ -86,7 +86,7 @@ static int init_rest(HvMachine *m) {
     knob_env(HV_K_IJCPAGES, 1); /* on unless its variable says 0 */
     /* Henge 7131022: exits chained into another page are listed per target page (HvRam.xhead), so a code change
        unchains just those instead of scanning every cross-page chain under the translation lock. */
-    knob_env(HV_K_XCHAINPAGES, 0);
+    knob_env(HV_K_XCHAINPAGES, 1); /* on unless its variable says 0 */
     /* Henge 5d4e092 and ba9392e: a TLBI of one page (here or from another CPU) drops only that 4 KB page from the
        stashed TLB entries of switched-out processes (all of the ASID's when the page may be part of a large one), and
        a process switch puts stashed entries back with one fence. */
