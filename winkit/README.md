@@ -83,10 +83,10 @@ Windows 里拷贝的文字会自动出现在 iPhone 的剪贴板上；iPhone 上
 2. **Windows → iPhone**：Windows 里拷贝文字，App 在前台时立刻写进 iPhone 剪贴板（屏幕下方提示“已从 Windows 拷贝”）；App 不在前台时，等回到 App 再写。
    App 设置 → **剪贴板** → “Windows → iPhone 自动同步”可以关掉。密码管理器标记为不记录的内容（如 KeePass、1Password 拷贝的密码）不会发过来。
 3. **iPhone → Windows**：点工具栏里的粘贴按钮（或 App 设置 → 剪贴板 → “粘贴到 Windows”），iOS 不会弹“允许粘贴”。
-   打开“发送后在 Windows 里粘贴（Ctrl+V）”，文字到了 Windows 剪贴板后会自动按一次 Ctrl+V，粘到光标处。
+   打开“点粘贴按钮后在 Windows 里粘贴（Ctrl+V）”，点粘贴按钮发过去的文字到了 Windows 剪贴板后会自动按一次 Ctrl+V，粘到光标处。回到 App 时自动发送的文字不会自动粘贴。
 4. **回到 App 时自动发送（可选）**：App 自己读剪贴板时 iOS 默认每次都会问“允许粘贴吗”。想不被打扰地自动发送，先打开“回到 App 时 iPhone → Windows”，
    再到 iOS **设置 › Apple VM › 从其他 App 粘贴** 选 **允许**（这一项在 App 第一次读剪贴板之后才会出现），回到 App 设置里点“检查”。
-   只有检查结果是“允许”时，App 才会在回到前台、而且剪贴板里有新文字时自动发送；之后如果 iOS 又开始询问，自动发送会暂停，直到你再点“检查”。
+   只有检查结果是“允许”时，App 才会在回到前台、而且剪贴板里有新文字时自动发送；之后如果读不到（iOS 里改成了拒绝，或者询问时点了“不允许”），自动发送会暂停，直到你再点“检查”。检查时最好用这台 iPhone 上拷贝的文字：从 Mac 等别的设备拷贝过来的文字读得慢，可能被当成“每次询问”。
 
 - **状态**：App 设置 → 剪贴板 → “Windows 里的剪贴板小助手”显示“运行中”说明 Windows 这边正常。
 - **卸载**：在命令提示符里运行 `CLIPBOARD.bat remove`，或右键 `C:\WinKit\uninstall_clipboard.ps1` → 使用 PowerShell 运行，删除计划任务、程序和日志。

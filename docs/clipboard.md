@@ -20,23 +20,32 @@ starts at 0 again when the app starts) and where it came from (`host`: the iPhon
 - `GET /.henge/clipboard?since=N`: the same, but first waits up to 25 s (`&wait=S` for less) while the
   slot is still at `N`. The helper always has one of these waiting, so the iPhone's text reaches Windows
   at once without asking again and again. Any other `N` (one from before the app restarted, say) is
-  answered at once.
-- `PUT /.henge/clipboard?agent=ID&n=K`: what Windows copied. `ID` is the helper's name for itself (new
-  each time it starts), `K` its own count of what it sent; a PUT that a newer one from the same helper
-  overtook is dropped. `204` with the slot's `X-Henge-Seq` when taken, and also when nothing changed
-  (empty, overtaken, or the text the slot holds already). `413` over 1 MB (the connection ends), `400`
-  if it is not UTF-8 or has a NUL. A UTF-8 byte order mark is dropped.
+  answered at once. Asking says the helper has put `N` on Windows' clipboard, unless `&missed=1`: it
+  could not (another program kept the clipboard busy, say).
+- `PUT /.henge/clipboard?agent=ID&n=K&force=1`: what Windows copied. `ID` is the helper's name for
+  itself (new each time it starts), `K` its own count of what it sent; a PUT that a newer one from the
+  same helper overtook is dropped. The text the slot holds already is no change when it came from the
+  guest too (a repeat); the iPhone's text copied in Windows is Windows' copy now (the person copied it
+  there to have it back on the iPhone, which may hold something else by then), and `force=1`, which the
+  helper sends for every new copy in Windows, is always a change. `204` with the slot's `X-Henge-Seq`
+  when taken, and also when nothing changed (empty, overtaken, or a repeat). `413` over 1 MB (the
+  connection ends), `400` if it is not UTF-8 or has a NUL. A UTF-8 byte order mark is dropped.
 
-Loops cannot form. The slot ignores text it holds already, so text that came from Windows and goes back
-from the iPhone stops there (except when the person sends it with the paste button: then it is a change
-on purpose, `hv_share_push_clipboard`, because Windows may have copied a picture since). The helper
-remembers the clipboard sequence number (`GetClipboardSequenceNumber`) and the text it wrote itself, and
-does not send those back.
+Loops cannot form. The slot ignores the iPhone's text when it holds that text already, so text that
+came from Windows and goes back from the iPhone stops there (except when the person sends it with the
+paste button: then it is a change on purpose, `hv_share_push_clipboard`, because Windows may have copied
+a picture since). The helper remembers the clipboard sequence number (`GetClipboardSequenceNumber`) of
+what it wrote itself and does not send that back, nor the same text put back by another program within
+1.5 s; the app remembers `UIPasteboard.changeCount` after writing, so what came from Windows is not sent
+back either. Text is not compared otherwise: copying in Windows the text the iPhone sent before brings
+it back to the iPhone.
 
 Ctrl+V after sending waits until Windows really has the text: the helper asks for the next `?since=`
 only once it has put the previous text on Windows' clipboard, so the app waits (up to 2.5 s) until the
 helper's last `since` reaches what it sent (`hv_share_clipboard_agent_has`), and only then presses Ctrl+V
-through the virtual USB keyboard.
+through the virtual USB keyboard. When the helper cannot write the clipboard it tries again a few times
+(about 2 s) and then asks with `&missed=1`, which leaves `hv_share_clipboard_agent_has` where it was, so
+the app says Windows did not get the text instead of pasting what Windows had before.
 
 The helper counts as running while its long poll waits, or when it was heard from in the last 40 s
 (`hv_share_clipboard_agent_seen`).
@@ -57,11 +66,16 @@ UTF-8, malformed requests, the app's listener and the helper's status.
 - What password managers mark as private is not sent: `ExcludeClipboardContentFromMonitorProcessing`,
   or `CanIncludeInClipboardHistory` = 0.
 - From the iPhone: the text goes on the clipboard (LF as CRLF) with `SetClipboardData` on the window's
-  thread. At start the iPhone's last text is taken only into an empty clipboard (as at logon), so a
+  thread, with `CanIncludeInClipboardHistory` = 0 and `CanUploadToCloudClipboard` = 0: the iPhone cannot
+  say whether the text was private (a password, say), so none of it is kept in Win+V history or uploaded
+  to the cloud clipboard. At start the iPhone's last text is taken only into an empty clipboard (as at logon), so a
   restarted helper does not replace what was copied in Windows meanwhile.
 - It runs in the user's own session, not elevated, through the scheduled task **WinKit Clipboard**: at
   logon, and every 5 minutes after that (a running helper is left alone, a stopped one is started again).
   A mutex keeps it to one per session. If a policy refuses the task, a Startup folder shortcut is used.
+- With more than one session (fast user switching, or a session left disconnected), only the helper of
+  the session on the screen (`WTSGetActiveConsoleSessionId`) sends or takes text. The others still wait
+  for news, with `&active=0`, which does not tell the app that Windows has the text.
 - Its log: `%LOCALAPPDATA%\WinKit\clipboard.log`.
 
 Install: `START.bat` does it; `CLIPBOARD.bat` on the WINKIT drive does only this, without administrator
@@ -72,7 +86,9 @@ rights, and can be run again. `CLIPBOARD.bat remove` or `uninstall_clipboard.ps1
 **Windows → iPhone.** Writing `UIPasteboard` never asks anything. When Windows copies, the share server
 calls the app (`hv_share_set_clipboard_listener` → `WinIOSGuestClipboardDidChangeNotification`) and the
 text is put on the clipboard while the app is active; otherwise it waits (the newest only) until the app
-is active again. A short "Copied from Windows" shows at the bottom. Settings › Clipboard › "Windows →
+is active again, and is dropped if something was copied on the iPhone after it (`UIPasteboard.changeCount`
+moved on since the text arrived): the iPhone's newer copy stays, and is the one sent to Windows when that
+is on. A short "Copied from Windows" shows at the bottom. Settings › Clipboard › "Windows →
 iPhone automatically" (on by default) switches it off.
 
 **iPhone → Windows.** An app that reads the clipboard by itself gets iOS's "Allow Paste" question each
@@ -83,15 +99,20 @@ time, unless the person chose Allow for it. So:
   Clipboard; any view can mount it.
 - Sending by itself when the app becomes active is off by default. It runs only when it is switched on
   AND the app found the permission to be Allow. iOS has no call that tells the permission, so "Check" (and
-  switching the option on) reads the clipboard once, at the person's request: a read that waits more than
-  0.35 s waited for iOS's question (Ask), one that gives nothing at once is Deny, otherwise Allow. Reading
-  text this app wrote itself never asks, so that check needs text copied in another app. Before every
-  automatic read, `UIPasteboard.changeCount` and `hasStrings` (neither of which asks) skip a clipboard
-  with nothing new or no text. If iOS asks after all (the setting was changed), automatic sending stops
-  until checked again.
+  switching the option on) reads the clipboard once, at the person's request: text at once is Allow,
+  nothing at once is Deny, and a read that waits more than 0.35 s is taken as Ask (it waited for iOS's
+  question), with a note that it may also be text that is slow to come (copied on another device, or
+  large), so the check is best done with text copied on this iPhone. Reading text this app wrote itself
+  never asks, so that check needs text copied in another app. Before every automatic read,
+  `UIPasteboard.changeCount` and `hasStrings` (neither of which asks) skip a clipboard with nothing new or
+  no text. The automatic read does not go by time: text is Allow (or the person just answered Allow
+  Paste), so it is sent; no text (Deny, or Don't Allow on a question) stops automatic sending until
+  checked again.
 - To allow it: iOS Settings › Apple VM › Paste from Other Apps › Allow. The item appears once the app has
   read the clipboard at least once.
-- "Paste into Windows after sending" presses Ctrl+V once Windows has the text (see above).
+- "Paste into Windows after tapping Paste" presses Ctrl+V once Windows has the text (see above), only
+  after the paste button: never after an automatic send on returning to the app, which would type
+  whatever was copied on the iPhone into the focused window (a command line, say) without a tap.
 - "Sent to Windows" confirms; when the helper is not running the app says so (the text still waits in
   the slot and the helper takes it when it starts into an empty clipboard).
 

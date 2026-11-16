@@ -7,7 +7,8 @@ import UIKit
 /// what this side puts there.
 ///
 /// Windows → iPhone: writing UIPasteboard never asks the person anything, so what Windows copies is put on
-/// the iPhone's clipboard right away while the app is in front, or as soon as it is again.
+/// the iPhone's clipboard right away while the app is in front, or as soon as it is again, unless the
+/// person copied something on the iPhone after Windows did: the newer copy stays.
 ///
 /// iPhone → Windows: an app that reads the clipboard by itself gets iOS's "Allow Paste" question, unless
 /// the person set Settings › Apple VM › Paste from Other Apps › Allow. So it goes through the system's
@@ -41,6 +42,9 @@ final class ClipboardSync: ObservableObject {
     static let maxBytes = 1 << 20
     /// The helper asks again at most 25 s apart.
     static let helperAliveSeconds = 40
+    /// Windows' text is taken at most this often (the newest wins): a guest that copies over and over
+    /// must not keep the main thread busy or the iPhone's clipboard (and Universal Clipboard) churning.
+    static let fromWindowsInterval: CFTimeInterval = 0.4
     /// Notification name of WinIOSGuestClipboardDidChangeNotification (winios_bridge.m).
     static let guestChanged = Notification.Name("WinIOSGuestClipboardDidChange")
 
@@ -66,13 +70,16 @@ final class ClipboardSync: ObservableObject {
     private var bridge: WinIOSBridge { WinIOSBridge.shared }
     private var started = false
     private var observers: [NSObjectProtocol] = []
-    /// What Windows copied while the app was not in front.
-    private var pendingFromWindows: String?
+    /// What Windows copied while the app was not in front, and UIPasteboard.changeCount at that time.
+    private var pendingFromWindows: (text: String, changeCount: Int)?
     /// UIPasteboard.changeCount when the app last wrote the clipboard or sent it: anything else is new.
     private var knownChangeCount: Int {
         didSet { defaults.set(knownChangeCount, forKey: Key.changeCount) }
     }
     private var toastGeneration = 0
+    /// When Windows' text was last taken, and whether a later take is waiting for the interval to pass.
+    private var lastGuestTake: CFTimeInterval = -.infinity
+    private var guestTakeScheduled = false
 
     private init() {
         fromWindows = defaults.object(forKey: Key.fromWindows) as? Bool ?? true
@@ -99,13 +106,28 @@ final class ClipboardSync: ObservableObject {
 
     // MARK: - Windows → iPhone
 
+    /// The share server tells the app once and waits for the take before it tells again (however often
+    /// the guest copies meanwhile), so taking no more often than fromWindowsInterval limits all of it.
     private func guestCopied() {
+        guard !guestTakeScheduled else { return }
+        let wait = lastGuestTake + Self.fromWindowsInterval - CACurrentMediaTime()
+        guard wait > 0 else { takeGuestText(); return }
+        guestTakeScheduled = true
+        DispatchQueue.main.asyncAfter(deadline: .now() + wait) { [weak self] in
+            guard let self else { return }
+            self.guestTakeScheduled = false
+            self.takeGuestText()
+        }
+    }
+
+    private func takeGuestText() {
+        lastGuestTake = CACurrentMediaTime()
         guard let text = bridge.takeGuestClipboard() else { return }
         guard fromWindows else { return } // taken, so that it does not arrive later
         if UIApplication.shared.applicationState == .active {
             putOnPasteboard(text)
         } else {
-            pendingFromWindows = text // the newest wins
+            pendingFromWindows = (text, UIPasteboard.general.changeCount) // the newest wins
         }
     }
 
@@ -115,10 +137,19 @@ final class ClipboardSync: ObservableObject {
         show(L("已从 Windows 拷贝", "Copied from Windows"), symbol: "doc.on.clipboard")
     }
 
+    /// Windows' text from while the app was away goes on the clipboard only if nothing was copied on the
+    /// iPhone after it: a newer copy in another app is the one the person wants (and the one sent to Windows
+    /// next, if that is on), not to be replaced by older text from Windows.
     private func becameActive() {
-        if let text = pendingFromWindows ?? bridge.takeGuestClipboard() {
+        let changeCount = UIPasteboard.general.changeCount // reading it never asks
+        if let pending = pendingFromWindows {
             pendingFromWindows = nil
-            if fromWindows { putOnPasteboard(text) }
+            if fromWindows && changeCount == pending.changeCount { putOnPasteboard(pending.text) }
+        } else {
+            lastGuestTake = CACurrentMediaTime()
+            // Arrived just now, or while a take waited: when is not known, so only onto a clipboard that
+            // nothing was copied to since the app last wrote or read it.
+            if let text = bridge.takeGuestClipboard(), fromWindows, changeCount == knownChangeCount { putOnPasteboard(text) }
         }
         sendOnActivationIfAllowed()
     }
@@ -126,10 +157,11 @@ final class ClipboardSync: ObservableObject {
     // MARK: - iPhone → Windows
 
     /// From the system paste button: the person chose to paste, nothing is asked. Always sent, even when
-    /// the shared clipboard holds this text already (Windows may have copied a picture since).
+    /// the shared clipboard holds this text already (Windows may have copied a picture since), and pasted
+    /// in Windows if that is on: only here, never after an automatic send, which no one asked to type.
     func sendToWindows(_ text: String) {
         knownChangeCount = UIPasteboard.general.changeCount
-        send(text, force: true)
+        send(text, force: true, paste: pasteAfterSend)
     }
 
     private func sendOnActivationIfAllowed() {
@@ -138,17 +170,20 @@ final class ClipboardSync: ObservableObject {
         guard board.changeCount != knownChangeCount else { return } // nothing new, or what came from Windows
         knownChangeCount = board.changeCount
         guard board.hasStrings else { return } // a picture, or nothing: not read
-        let (text, asked) = readPasteboard()
-        if asked {
-            // iOS asked after all: the setting was changed. Not by itself again until checked.
-            pastePermission = .ask
-        } else if text == nil {
-            pastePermission = .denied
+        // Text means Allow, or the person just answered Allow Paste: consent either way. How long the read
+        // took decides nothing here: under Allow it can take a second too (text copied on a Mac comes over
+        // the network, a large one takes time), and that must not stop the automatic sending.
+        let (text, slow) = readPasteboard()
+        guard let text else {
+            // Deny, or Don't Allow on a question iOS asked after all: not by itself again until checked.
+            // (Slow: it waited for that answer, so the setting is Ask.)
+            pastePermission = slow ? .ask : .denied
+            return
         }
-        if let text { send(text, force: false) }
+        send(text, force: false, paste: false)
     }
 
-    private func send(_ text: String, force: Bool) {
+    private func send(_ text: String, force: Bool, paste: Bool) {
         guard !text.isEmpty else { return }
         guard text.utf8.count <= Self.maxBytes else {
             show(L("内容太大（超过 1 MB），没有发送", "Too large for Windows (over 1 MB): not sent"), symbol: "exclamationmark.triangle")
@@ -161,7 +196,7 @@ final class ClipboardSync: ObservableObject {
             return
         }
         show(L("已发送到 Windows", "Sent to Windows"), symbol: "arrow.up.doc.on.clipboard")
-        if pasteAfterSend { pasteWhenWindowsHasIt(seq, deadline: Date().addingTimeInterval(2.5)) }
+        if paste { pasteWhenWindowsHasIt(seq, deadline: Date().addingTimeInterval(2.5)) }
     }
 
     /// Ctrl+V once the helper has put seq on Windows' clipboard (it asks for the next one only then).
@@ -181,7 +216,8 @@ final class ClipboardSync: ObservableObject {
 
     // MARK: - Paste permission
 
-    /// Reads the clipboard and tells whether iOS asked first: the read waits for the person's answer.
+    /// Reads the clipboard, and whether that took long enough that iOS may have asked first (the read
+    /// waits for the person's answer). Only a hint: a slow read can also be text from another device.
     private func readPasteboard() -> (String?, Bool) {
         let start = CACurrentMediaTime()
         let text = UIPasteboard.general.string
@@ -198,9 +234,20 @@ final class ClipboardSync: ObservableObject {
             show(L("先在别的 App 里拷贝一段文字，再检查", "Copy some text in another app first, then check"), symbol: "info.circle")
             return
         }
-        let (text, asked) = readPasteboard()
+        let (text, slow) = readPasteboard()
         knownChangeCount = board.changeCount // looked at, not sent
-        pastePermission = asked ? .ask : text == nil ? .denied : .allowed
+        if text == nil {
+            pastePermission = slow ? .ask : .denied
+        } else if slow {
+            // iOS asked (Ask), or the text was slow to come: copied on another device, or large. Not
+            // taken as Allow, which would let the app read by itself without knowing.
+            pastePermission = .ask
+            show(L("读取很慢：如果 iOS 没有询问，可能是别的设备上拷贝的。请在这台 iPhone 上拷贝文字后再检查",
+                   "That took long: if iOS did not ask, the text may come from another device. Copy text on this iPhone and check again"),
+                 symbol: "info.circle")
+        } else {
+            pastePermission = .allowed
+        }
     }
 
     // MARK: - Status
@@ -218,7 +265,8 @@ final class ClipboardSync: ObservableObject {
     private func show(_ text: String, symbol: String) {
         toastGeneration += 1
         let generation = toastGeneration
-        toast = Toast(text: text, symbol: symbol)
+        // The same message again only stays longer: not shown anew (no animation, no new announcement).
+        if toast?.text != text || toast?.symbol != symbol { toast = Toast(text: text, symbol: symbol) }
         DispatchQueue.main.asyncAfter(deadline: .now() + 1.8) { [weak self] in
             guard let self, self.toastGeneration == generation else { return }
             self.toast = nil

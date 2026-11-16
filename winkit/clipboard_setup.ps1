@@ -13,13 +13,24 @@ $exe = Join-Path $dir 'WinKitClipboard.exe'
 $src = Join-Path $PSScriptRoot 'clipboard_agent.cs'
 $link = Join-Path ([Environment]::GetFolderPath('Startup')) 'WinKitClipboard.lnk'
 $user = "$env:USERDOMAIN\$env:USERNAME"
+$session = (Get-Process -Id $PID).SessionId
 
-# ---- a helper already running: stopped (started again below unless -Remove)
-try { Stop-ScheduledTask -TaskName $task -ErrorAction SilentlyContinue } catch {}
-try { Get-Process -Name 'WinKitClipboard' -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue } catch {}
-Start-Sleep -Milliseconds 300
+# This session's helper only: START.bat runs elevated, and other users' helpers are theirs.
+function Get-OwnHelper {
+    Get-Process -Name 'WinKitClipboard' -ErrorAction SilentlyContinue | Where-Object { $_.SessionId -eq $session }
+}
+
+# A helper already running: stopped, and the task kept from starting it again meanwhile (it restarts
+# a stopped helper within a minute). Registering the task again below enables it.
+function Stop-Helper {
+    try { Disable-ScheduledTask -TaskName $task -ErrorAction SilentlyContinue | Out-Null } catch {}
+    try { Stop-ScheduledTask -TaskName $task -ErrorAction SilentlyContinue } catch {}
+    try { Get-OwnHelper | Stop-Process -Force -ErrorAction SilentlyContinue } catch {}
+}
 
 if ($Remove) {
+    Stop-Helper
+    Start-Sleep -Milliseconds 300
     try { Unregister-ScheduledTask -TaskName $task -Confirm:$false -ErrorAction SilentlyContinue } catch {}
     Remove-Item -LiteralPath $exe, (Join-Path $dir 'clipboard.log'), $link -Force -ErrorAction SilentlyContinue
     Write-Host '  WinKit clipboard helper removed.'
@@ -30,18 +41,40 @@ if (-not (Test-Path -LiteralPath $src)) {
     return
 }
 
-# ---- the program. Built under a new name first: PowerShell may keep what it built open.
+# ---- the program, built first (several seconds) under a new name while a running helper carries on:
+# PowerShell may keep what it built open.
+$tmp = Join-Path $env:TEMP ('WinKitClipboard-' + [Guid]::NewGuid().ToString('N') + '.exe')
 try {
     New-Item -ItemType Directory -Force -Path $dir | Out-Null
-    $tmp = Join-Path $env:TEMP ('WinKitClipboard-' + [Guid]::NewGuid().ToString('N') + '.exe')
     Add-Type -Path $src -ReferencedAssemblies 'System.Windows.Forms' -OutputAssembly $tmp -OutputType WindowsApplication -IgnoreWarnings
-    Copy-Item -LiteralPath $tmp -Destination $exe -Force
-    Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue
-    Write-Host "  built: $exe"
 } catch {
     Write-Host "  Could not build the clipboard helper: $($_.Exception.Message)" -ForegroundColor Red
+    Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue
     return
 }
+
+# ---- then the old helper stopped and the new one put in its place (a dying process may hold the file
+# for a moment)
+Stop-Helper
+$copied = $null
+for ($i = 0; $i -lt 10; $i++) {
+    try {
+        Copy-Item -LiteralPath $tmp -Destination $exe -Force
+        $copied = $true
+        break
+    } catch {
+        $copied = $_.Exception.Message
+        Start-Sleep -Milliseconds 500
+        try { Get-OwnHelper | Stop-Process -Force -ErrorAction SilentlyContinue } catch {}
+    }
+}
+Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue
+if ($copied -ne $true) {
+    Write-Host "  Could not replace $exe ($copied): the helper there stays." -ForegroundColor Red
+    try { Enable-ScheduledTask -TaskName $task -ErrorAction SilentlyContinue | Out-Null; Start-ScheduledTask -TaskName $task -ErrorAction SilentlyContinue } catch {}
+    return
+}
+Write-Host "  built: $exe"
 
 # ---- started at every logon, in this user's session (the clipboard belongs to it), not elevated
 $started = $false
@@ -62,6 +95,7 @@ try {
 } catch {
     # Without the task (refused by a policy, say): a shortcut in the Startup folder, no restarts.
     Write-Host "  scheduled task not set up ($($_.Exception.Message)): using the Startup folder" -ForegroundColor Yellow
+    try { Enable-ScheduledTask -TaskName $task -ErrorAction SilentlyContinue | Out-Null } catch {} # one from before, if any
     try {
         $sc = (New-Object -ComObject WScript.Shell).CreateShortcut($link)
         $sc.TargetPath = $exe
@@ -72,7 +106,7 @@ if (-not $started) { Start-Process -FilePath $exe }
 
 # ---- is it running, and does the app answer?
 Start-Sleep -Seconds 2
-if (Get-Process -Name 'WinKitClipboard' -ErrorAction SilentlyContinue) {
+if (Get-OwnHelper) {
     Write-Host '  WinKit clipboard helper running: it starts by itself with every logon.' -ForegroundColor Green
 } else {
     Write-Host "  The helper did not stay running: see $(Join-Path $dir 'clipboard.log')" -ForegroundColor Yellow

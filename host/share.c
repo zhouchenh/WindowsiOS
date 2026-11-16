@@ -786,13 +786,20 @@ static int clipboard_respond(Conn *c, Request *r, int status, const char *reason
 /* GET: the slot now. GET ?since=N: first waits up to 25 s (?wait=S for less) while the slot is still at N,
    so the helper hears of a change at once without asking again and again. Any N other than the slot's
    number (one from before the app restarted, say) is answered at once. 200 with the text, or 204 when
-   there is none; X-Henge-Seq and X-Henge-Origin (host or guest) either way. */
+   there is none; X-Henge-Seq and X-Henge-Origin (host or guest) either way. Asking for news past N says
+   the helper has put N on the guest's clipboard (hv_share_clipboard_agent_has), unless &missed=1: it
+   could not, so Ctrl+V must not follow; or &active=0: the helper of a session that is not on the screen
+   (another user's, or a disconnected one), which does not take the device's text. */
 static int clipboard_get(Conn *c, Request *r) {
     if (body_discard(c, r) != 0) return -1;
     const char *since_s = query_value(r->query, "since");
     const char *wait_s = query_value(r->query, "wait");
     unsigned long since = since_s ? strtoul(since_s, NULL, 10) : 0;
     unsigned long wait = wait_s ? strtoul(wait_s, NULL, 10) : 25;
+    const char *missed_s = query_value(r->query, "missed");
+    int missed = missed_s && *missed_s == '1';
+    const char *active_s = query_value(r->query, "active");
+    int inactive = active_s && *active_s == '0';
     if (wait > 25) wait = 25;
     struct timespec until;
     struct timeval now;
@@ -802,7 +809,8 @@ static int clipboard_get(Conn *c, Request *r) {
     pthread_mutex_lock(&clip_mu);
     clip_agent_seen = agent_seen = time(NULL);
     if (since_s) {
-        if (since <= clip_seq) clip_agent_has = since; /* not a number from before the app restarted */
+        /* Not a number from before the app restarted, and really on the guest's clipboard. */
+        if (since <= clip_seq && !missed && !inactive) clip_agent_has = since;
         clip_waiters++;
         while (clip_seq == since && pthread_cond_timedwait(&clip_cond, &clip_mu, &until) != ETIMEDOUT) {}
         clip_waiters--;
@@ -818,9 +826,11 @@ static int clipboard_get(Conn *c, Request *r) {
 }
 
 /* What the guest copied. ?agent=ID&n=K (the helper's name for itself and its own count of what it sent)
-   let a PUT that a newer one from the same helper overtook be dropped. 204 with X-Henge-Seq when taken or
-   when nothing changed (empty, the same text, or overtaken); 413 past HV_SHARE_CLIP_MAX, and the
-   connection ends; 400 if it is not UTF-8 text. */
+   let a PUT that a newer one from the same helper overtook be dropped. The text the slot holds already is
+   no change only when the guest sent it too (a repeat); the device's text copied in the guest is the
+   guest's copy now, and &force=1 (a new copy in the guest, as the helper knows from the clipboard's own
+   sequence number) is always a change. 204 with X-Henge-Seq when taken or when nothing changed (empty, a
+   repeat, or overtaken); 413 past HV_SHARE_CLIP_MAX, and the connection ends; 400 if it is not UTF-8. */
 static int clipboard_put(Conn *c, Request *r) {
     if (!r->chunked && r->length > HV_SHARE_CLIP_MAX) {
         r->close = 1; /* the body is not read: the connection ends after the answer */
@@ -861,23 +871,28 @@ static int clipboard_put(Conn *c, Request *r) {
     for (size_t i = 0; a && i + 1 < sizeof agent && a[i] && a[i] != '&'; i++) agent[i] = a[i], agent[i + 1] = 0;
     const char *n = query_value(r->query, "n");
     unsigned long agent_seq = n ? strtoul(n, NULL, 10) : 0;
+    const char *f = query_value(r->query, "force");
+    int force = f && *f == '1';
 
     hv_share_clip_fn notify = NULL;
     void *opaque = NULL;
     unsigned long changed = 0;
     pthread_mutex_lock(&clip_mu);
     clip_agent_seen = agent_seen = time(NULL);
+    /* The app is told once until it takes the text (hv_share_take_clipboard): a guest that PUTs over and
+       over gets one notification in flight at a time, and the app takes the newest when it gets to it. */
+    int was_pending = guest_clip_pending;
     int counted = agent[0] && agent_seq;
     int overtaken = counted && !strcmp(agent, clip_agent_id) && agent_seq <= clip_agent_seq;
     if (copy && !overtaken) {
-        changed = clip_store_locked(copy, HV_SHARE_CLIP_FROM_GUEST, 0);
+        changed = clip_store_locked(copy, HV_SHARE_CLIP_FROM_GUEST, force || clip_origin == HV_SHARE_CLIP_FROM_DEVICE);
         copy = NULL;
     }
     if (counted && !overtaken) {
         memcpy(clip_agent_id, agent, sizeof agent);
         clip_agent_seq = agent_seq;
     }
-    if (changed) notify = clip_listener, opaque = clip_listener_opaque;
+    if (changed && !was_pending) notify = clip_listener, opaque = clip_listener_opaque;
     unsigned long seq = clip_seq;
     int origin = clip_origin;
     pthread_mutex_unlock(&clip_mu);
