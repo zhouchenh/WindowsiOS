@@ -211,11 +211,25 @@ bool winios_jit_is_traced(void) {
     return (info.kp_proc.p_flag & P_TRACED) != 0;
 }
 
+/* How long after the JIT helper was told to let go a debugger still (or newly) attached is taken for
+   another helper session: a second StikDebug request attaches as soon as the first lets go. */
+#define WINIOS_LINGERING_WINDOW_S 30
+
 bool winios_jit_release_lingering_debugger(void) {
     /* Only after this launch's own debugger was told to let go, and not straight away: give that
        detach a moment to land before calling what is left a second debugger. */
     if (!atomic_load(&g_jit_live) || !g_detach_requested || g_lingering_tries >= 3) return false;
-    if (time(NULL) - g_detach_at < 3 || !winios_jit_is_traced()) return false;
+    time_t since = time(NULL) - g_detach_at;
+    if (since < 3) return false;
+    /* brk #0xf00d is answered only by the JIT script; any other debugger (Xcode's Attach to Process,
+       plain lldb) stops on it again at every continue, and the app with it. So it goes only to a
+       debugger that has been attached since the helper's session ended, within the window a queued
+       helper session shows up in. Once the process is seen without one, or the window is over, a
+       debugger that attaches later is someone else's: never send it. */
+    if (since > WINIOS_LINGERING_WINDOW_S || !winios_jit_is_traced()) {
+        g_detach_requested = false;
+        return false;
+    }
     g_lingering_tries++;
     WINIOS_LOG("a debugger is still attached after the JIT region was held (a second StikDebug session?); "
                "asking it to detach (%d of 3)", g_lingering_tries);
