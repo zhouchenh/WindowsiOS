@@ -20,7 +20,8 @@ starts at 0 again when the app starts) and where it came from (`host`: the iPhon
 - `GET /.henge/clipboard?since=N`: the same, but first waits up to 25 s (`&wait=S` for less) while the
   slot is still at `N`. The helper always has one of these waiting, so the iPhone's text reaches Windows
   at once without asking again and again. Any other `N` (one from before the app restarted, say) is
-  answered at once.
+  answered at once. Asking says the helper has put `N` on Windows' clipboard, unless `&missed=1`: it
+  could not (another program kept the clipboard busy, say).
 - `PUT /.henge/clipboard?agent=ID&n=K&force=1`: what Windows copied. `ID` is the helper's name for
   itself (new each time it starts), `K` its own count of what it sent; a PUT that a newer one from the
   same helper overtook is dropped. The text the slot holds already is no change when it came from the
@@ -42,7 +43,9 @@ it back to the iPhone.
 Ctrl+V after sending waits until Windows really has the text: the helper asks for the next `?since=`
 only once it has put the previous text on Windows' clipboard, so the app waits (up to 2.5 s) until the
 helper's last `since` reaches what it sent (`hv_share_clipboard_agent_has`), and only then presses Ctrl+V
-through the virtual USB keyboard.
+through the virtual USB keyboard. When the helper cannot write the clipboard it tries again a few times
+(about 2 s) and then asks with `&missed=1`, which leaves `hv_share_clipboard_agent_has` where it was, so
+the app says Windows did not get the text instead of pasting what Windows had before.
 
 The helper counts as running while its long poll waits, or when it was heard from in the last 40 s
 (`hv_share_clipboard_agent_seen`).

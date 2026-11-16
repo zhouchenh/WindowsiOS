@@ -32,7 +32,8 @@ void hv_share_set_clipboard_listener(hv_share_clip_fn fn, void *opaque);
 /* Seconds since the guest's clipboard helper was last heard from: 0 while it waits for news, -1 never. */
 long hv_share_clipboard_agent_seen(void);
 /* The sequence number the helper last asked ?since= for. It asks again only once it has put what it got
-   on the guest's clipboard, so a value >= what hv_share_push_clipboard returned means Ctrl+V can go. */
+   on the guest's clipboard (or with &missed=1 when it could not, which leaves this as it was), so a value
+   >= what hv_share_push_clipboard returned means Ctrl+V can go. */
 unsigned long hv_share_clipboard_agent_has(void);
 /* 1 if len bytes at text are UTF-8 without NUL and at most HV_SHARE_CLIP_MAX long. */
 int hv_share_clip_valid(const char *text, size_t len);

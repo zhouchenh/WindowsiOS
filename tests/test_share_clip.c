@@ -241,12 +241,19 @@ int main(void) {
     free_reply(&p.reply);
     CHECK(hv_share_clipboard_agent_has() == 1, "the helper had 1: %lu", hv_share_clipboard_agent_has());
 
+    /* A helper that could not put 2 on the guest's clipboard says so: Ctrl+V must not follow. */
+    r = request("GET", "/.henge/clipboard?since=2&wait=1&missed=1", NULL, 0);
+    CHECK(r.status == 200 && r.seq == 2, "missed: %d %lu", r.status, r.seq);
+    free_reply(&r);
+    CHECK(hv_share_clipboard_agent_has() == 1, "missed is not had: %lu", hv_share_clipboard_agent_has());
+
     /* With nothing new it waits as long as asked, then says what there is. */
     double t0 = now_s();
     r = request("GET", "/.henge/clipboard?since=2&wait=1", NULL, 0);
     double took = now_s() - t0;
     CHECK(r.status == 200 && r.seq == 2 && took >= 0.9 && took < 3, "timeout: %d seq %lu after %.2f s", r.status, r.seq, took);
     free_reply(&r);
+    CHECK(hv_share_clipboard_agent_has() == 2, "had 2: %lu", hv_share_clipboard_agent_has());
 
     /* A number from before the app restarted is answered at once. */
     t0 = now_s();

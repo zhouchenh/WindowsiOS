@@ -7,7 +7,8 @@
 //   (force: a new copy here is news even when it is the text the iPhone sent last).
 // iPhone -> Windows: GET /.henge/clipboard?since=N waits in the app (up to 25 s) until the iPhone's
 //   clipboard changes; the text goes on Windows' clipboard, and only then is the next ?since= asked for,
-//   which tells the app that Ctrl+V may follow.
+//   which tells the app that Ctrl+V may follow. If the text could not be put there (another program kept
+//   the clipboard busy, say), the next one says &missed=1, so that no Ctrl+V pastes the old text.
 // Loops: what this helper wrote itself is known by the clipboard's sequence number, and is not sent
 //   back; nor is the same text put there again by another program right after (a clipboard manager).
 //   Text that password managers mark as private (ExcludeClipboardContentFromMonitorProcessing,
@@ -36,13 +37,13 @@ namespace WinKit
         [DllImport("user32.dll")] static extern uint GetClipboardSequenceNumber();
         [DllImport("user32.dll", SetLastError = true)] static extern bool OpenClipboard(IntPtr hwnd);
         [DllImport("user32.dll")] static extern bool CloseClipboard();
-        [DllImport("user32.dll")] static extern bool EmptyClipboard();
+        [DllImport("user32.dll", SetLastError = true)] static extern bool EmptyClipboard();
         [DllImport("user32.dll")] static extern IntPtr GetClipboardData(uint format);
-        [DllImport("user32.dll")] static extern IntPtr SetClipboardData(uint format, IntPtr mem);
+        [DllImport("user32.dll", SetLastError = true)] static extern IntPtr SetClipboardData(uint format, IntPtr mem);
         [DllImport("user32.dll")] static extern bool IsClipboardFormatAvailable(uint format);
         [DllImport("user32.dll")] static extern int CountClipboardFormats();
         [DllImport("user32.dll", CharSet = CharSet.Unicode)] static extern uint RegisterClipboardFormat(string name);
-        [DllImport("user32.dll")] static extern bool PostMessage(IntPtr hwnd, int msg, IntPtr wParam, IntPtr lParam);
+        [DllImport("user32.dll", SetLastError = true)] static extern bool PostMessage(IntPtr hwnd, int msg, IntPtr wParam, IntPtr lParam);
         [DllImport("kernel32.dll")] static extern IntPtr GlobalAlloc(uint flags, UIntPtr bytes);
         [DllImport("kernel32.dll")] static extern IntPtr GlobalLock(IntPtr mem);
         [DllImport("kernel32.dll")] static extern bool GlobalUnlock(IntPtr mem);
@@ -64,6 +65,7 @@ namespace WinKit
         // From the receiving thread to the window's.
         static readonly object fromHostLock = new object();
         static string fromHost;
+        static bool fromHostWritten; // whether ApplyFromHost put it on the clipboard
         static readonly AutoResetEvent fromHostApplied = new AutoResetEvent(false);
 
         // From the window's thread to the sending thread: the newest text wins.
@@ -248,6 +250,7 @@ namespace WinKit
         {
             ulong since = 0;
             bool first = true;
+            bool missed = false; // the text numbered since is not on the clipboard
             for (;;)
             {
                 string origin, text;
@@ -255,7 +258,7 @@ namespace WinKit
                 int status;
                 try
                 {
-                    status = Get(first ? Url : Url + "?since=" + since, out seq, out origin, out text);
+                    status = Get(first ? Url : Url + "?since=" + since + (missed ? "&missed=1" : ""), out seq, out origin, out text);
                 }
                 catch (Exception e)
                 {
@@ -269,7 +272,12 @@ namespace WinKit
                 bool news = status == 200 && origin == "host" && text != null &&
                             (first ? CountClipboardFormats() == 0 : seq != since);
                 first = false;
-                if (news) Deliver(text);
+                missed = false;
+                if (news && !DeliverRetrying(text))
+                {
+                    Log("could not put the iPhone's text " + seq + " on the clipboard");
+                    missed = true;
+                }
                 since = seq;
             }
         }
@@ -293,48 +301,82 @@ namespace WinKit
             }
         }
 
-        // Puts text on the clipboard on the window's thread, and waits until it is there.
-        static void Deliver(string text)
+        // A few tries, about 2 s in all at most: the app waits 2.5 s before it gives up on Ctrl+V.
+        static bool DeliverRetrying(string text)
         {
-            lock (fromHostLock) fromHost = text;
+            for (int attempt = 0; ; attempt++)
+            {
+                if (Deliver(text)) return true;
+                if (attempt == 2) return false;
+                Thread.Sleep(200 * (attempt + 1));
+            }
+        }
+
+        // Puts text on the clipboard on the window's thread, and waits until it is there: false if it is not.
+        static bool Deliver(string text)
+        {
+            lock (fromHostLock) { fromHost = text; fromHostWritten = false; }
             fromHostApplied.Reset();
-            if (PostMessage(window.Handle, WM_APP_FROM_HOST, IntPtr.Zero, IntPtr.Zero)) fromHostApplied.WaitOne(5000);
+            if (!PostMessage(window.Handle, WM_APP_FROM_HOST, IntPtr.Zero, IntPtr.Zero))
+            {
+                Log("deliver: PostMessage failed: " + Marshal.GetLastWin32Error());
+                lock (fromHostLock) fromHost = null;
+                return false;
+            }
+            if (!fromHostApplied.WaitOne(5000))
+            {
+                Log("deliver: the window did not get to it");
+                lock (fromHostLock) fromHost = null; // not written late, unless it is being written right now
+                return false;
+            }
+            lock (fromHostLock) return fromHostWritten;
         }
 
         static void ApplyFromHost()
         {
             string text;
             lock (fromHostLock) { text = fromHost; fromHost = null; }
-            try
+            if (text == null) { fromHostApplied.Set(); return; } // taken back, or already applied
+            bool written = false;
+            try { written = WriteClipboardText(text); }
+            finally
             {
-                if (text != null) WriteClipboardText(text);
+                lock (fromHostLock) fromHostWritten = written;
+                fromHostApplied.Set();
             }
-            finally { fromHostApplied.Set(); }
         }
 
-        static void WriteClipboardText(string text)
+        // True once the text is on the clipboard. Nothing changes when the memory cannot be had or the
+        // clipboard stays busy: it is emptied only once it is open and the text is ready to go in.
+        static bool WriteClipboardText(string text)
         {
             string windows = text.Replace("\r\n", "\n").Replace("\n", "\r\n");
-            if (!Open()) return;
+            IntPtr mem = GlobalAlloc(GMEM_MOVEABLE, new UIntPtr((uint)((windows.Length + 1) * 2)));
+            if (mem == IntPtr.Zero) { Log("write: no memory"); return false; }
+            IntPtr ptr = GlobalLock(mem);
+            if (ptr == IntPtr.Zero) { GlobalFree(mem); Log("write: no memory"); return false; }
+            Marshal.Copy(windows.ToCharArray(), 0, ptr, windows.Length);
+            Marshal.WriteInt16(ptr, windows.Length * 2, (short)0);
+            GlobalUnlock(mem);
+            if (!Open()) { GlobalFree(mem); return false; }
+            bool written = false;
             try
             {
-                EmptyClipboard();
-                int bytes = (windows.Length + 1) * 2;
-                IntPtr mem = GlobalAlloc(GMEM_MOVEABLE, new UIntPtr((uint)bytes));
-                if (mem == IntPtr.Zero) return;
-                IntPtr ptr = GlobalLock(mem);
-                if (ptr == IntPtr.Zero) { GlobalFree(mem); return; }
-                Marshal.Copy(windows.ToCharArray(), 0, ptr, windows.Length);
-                Marshal.WriteInt16(ptr, windows.Length * 2, (short)0);
-                GlobalUnlock(mem);
-                if (SetClipboardData(CF_UNICODETEXT, mem) == IntPtr.Zero) GlobalFree(mem); // else the system owns it
+                if (!EmptyClipboard()) { Log("write: EmptyClipboard failed: " + Marshal.GetLastWin32Error()); return false; }
+                written = SetClipboardData(CF_UNICODETEXT, mem) != IntPtr.Zero; // then the system owns it
+                if (!written) Log("write: SetClipboardData failed: " + Marshal.GetLastWin32Error());
+                return written;
             }
             finally
             {
+                if (!written) GlobalFree(mem);
                 CloseClipboard();
-                ownSequence = GetClipboardSequenceNumber();
-                ownText = text.Replace("\r\n", "\n");
-                ownTick = Environment.TickCount;
+                if (written)
+                {
+                    ownSequence = GetClipboardSequenceNumber();
+                    ownText = text.Replace("\r\n", "\n");
+                    ownTick = Environment.TickCount;
+                }
             }
         }
 

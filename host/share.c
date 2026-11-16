@@ -786,13 +786,17 @@ static int clipboard_respond(Conn *c, Request *r, int status, const char *reason
 /* GET: the slot now. GET ?since=N: first waits up to 25 s (?wait=S for less) while the slot is still at N,
    so the helper hears of a change at once without asking again and again. Any N other than the slot's
    number (one from before the app restarted, say) is answered at once. 200 with the text, or 204 when
-   there is none; X-Henge-Seq and X-Henge-Origin (host or guest) either way. */
+   there is none; X-Henge-Seq and X-Henge-Origin (host or guest) either way. Asking for news past N says
+   the helper has put N on the guest's clipboard (hv_share_clipboard_agent_has), unless &missed=1: it
+   could not, so Ctrl+V must not follow. */
 static int clipboard_get(Conn *c, Request *r) {
     if (body_discard(c, r) != 0) return -1;
     const char *since_s = query_value(r->query, "since");
     const char *wait_s = query_value(r->query, "wait");
     unsigned long since = since_s ? strtoul(since_s, NULL, 10) : 0;
     unsigned long wait = wait_s ? strtoul(wait_s, NULL, 10) : 25;
+    const char *missed_s = query_value(r->query, "missed");
+    int missed = missed_s && *missed_s == '1';
     if (wait > 25) wait = 25;
     struct timespec until;
     struct timeval now;
@@ -802,7 +806,8 @@ static int clipboard_get(Conn *c, Request *r) {
     pthread_mutex_lock(&clip_mu);
     clip_agent_seen = agent_seen = time(NULL);
     if (since_s) {
-        if (since <= clip_seq) clip_agent_has = since; /* not a number from before the app restarted */
+        /* Not a number from before the app restarted, and really on the guest's clipboard. */
+        if (since <= clip_seq && !missed) clip_agent_has = since;
         clip_waiters++;
         while (clip_seq == since && pthread_cond_timedwait(&clip_cond, &clip_mu, &until) != ETIMEDOUT) {}
         clip_waiters--;
