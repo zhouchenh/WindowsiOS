@@ -21,9 +21,11 @@
 #include <stdio.h>
 #include <string.h>
 #include <sys/mman.h>
+#include <sys/proc.h>
 #include <sys/syscall.h>
 #include <sys/sysctl.h>
 #include <sys/ucontext.h>
+#include <time.h>
 #include <unistd.h>
 
 /* Provide pipe2 if referenced by static glib/slirp on older iOS runtimes. */
@@ -88,6 +90,11 @@ static atomic_bool g_jit_live;
 static char g_status[256] = "Not initialized";
 
 static uint32_t g_cfg_jit_mb, g_cfg_ram_mb;
+
+/* Set once the debugger that gave the JIT region was told to detach (when it was asked to). */
+static bool g_detach_requested;
+static time_t g_detach_at;
+static int g_lingering_tries;
 
 void winios_jit_configure(uint32_t jit_mb, uint32_t ram_mb) {
     g_cfg_jit_mb = jit_mb;
@@ -194,6 +201,30 @@ bool winios_jit_is_debugger_attached(void) {
            (flags & 0x10000000u) != 0; /* CS_DEBUGGED */
 }
 #pragma clang diagnostic pop
+
+bool winios_jit_is_traced(void) {
+    struct kinfo_proc info;
+    size_t size = sizeof info;
+    int mib[4] = {CTL_KERN, KERN_PROC, KERN_PROC_PID, getpid()};
+    memset(&info, 0, sizeof info);
+    if (sysctl(mib, 4, &info, &size, NULL, 0) != 0 || size == 0) return false;
+    return (info.kp_proc.p_flag & P_TRACED) != 0;
+}
+
+bool winios_jit_release_lingering_debugger(void) {
+    /* Only after this launch's own debugger was told to let go, and not straight away: give that
+       detach a moment to land before calling what is left a second debugger. */
+    if (!atomic_load(&g_jit_live) || !g_detach_requested || g_lingering_tries >= 3) return false;
+    if (time(NULL) - g_detach_at < 3 || !winios_jit_is_traced()) return false;
+    g_lingering_tries++;
+    WINIOS_LOG("a debugger is still attached after the JIT region was held (a second StikDebug session?); "
+               "asking it to detach (%d of 3)", g_lingering_tries);
+    g_expecting_jit_trap = true;
+    winios_brk_jit_detach();
+    g_expecting_jit_trap = false;
+    WINIOS_LOG("after the detach request, traced: %s", winios_jit_is_traced() ? "yes" : "no");
+    return true;
+}
 
 size_t winios_available_memory_bytes(void) {
 #if TARGET_OS_IPHONE
@@ -361,6 +392,9 @@ bool winios_jit_acquire(size_t bytes, bool detach_after) {
         g_expecting_jit_trap = true;
         winios_brk_jit_detach();
         g_expecting_jit_trap = false;
+        g_detach_requested = true;
+        g_detach_at = time(NULL);
+        WINIOS_LOG("after the detach request, traced: %s", winios_jit_is_traced() ? "yes" : "no");
     }
 
     set_status("Live (%zu MiB TXM JIT, %llu MiB RAM)", bytes >> 20,

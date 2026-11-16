@@ -23,6 +23,21 @@ void hv_fb_metal_set_fps(int fps) {
 
 int hv_fb_metal_fps(void) { return atomic_load(&g_target_fps); }
 
+/* The guest draws sRGB values (Windows' and Linux's desktops are sRGB). Tagging the layer sRGB has Core
+   Animation colour-match them to the screen. An untagged layer goes to a wide-gamut (Display P3) panel
+   unmanaged, its colours stretched to the panel's gamut: oversaturated. HV_NO_COLOR_MATCH=1 (an
+   environment variable, or a Documents/env.txt line on iOS) leaves the layer untagged, as before.
+   After Henge (Leviidev/Henge, GPL-2.0-or-later) commit 7f3398c (SonNX), which tags its display layer. */
+static CGColorSpaceRef fb_layer_colorspace(void) {
+    static CGColorSpaceRef cs;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        const char *off = getenv("HV_NO_COLOR_MATCH");
+        if (!(off && *off && *off != '0')) cs = CGColorSpaceCreateWithName(kCGColorSpaceSRGB);
+    });
+    return cs;
+}
+
 static NSString *const kFbShaderSource =
     @"#include <metal_stdlib>\n"
      "using namespace metal;\n"
@@ -129,6 +144,7 @@ static NSString *const kFbShaderSource =
             newLayer.device = self->device;
             newLayer.pixelFormat = MTLPixelFormatBGRA8Unorm;
             newLayer.framebufferOnly = YES;
+            newLayer.colorspace = fb_layer_colorspace();
         };
         if ([NSThread isMainThread]) cfg();
         else dispatch_async(dispatch_get_main_queue(), cfg);

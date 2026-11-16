@@ -59,6 +59,7 @@ struct SessionView: View {
         .statusBarHidden(true)
         .persistentSystemOverlays(.hidden)
         .defersSystemGestures(on: .all)
+        .onOpenURL { JITSetup.shared.handleOpenURL($0) } // app-jit hook
         .onAppear {
             WinIOSBridge.shared.updateScreenSize(UIScreen.main.bounds.size, scale: UIScreen.main.scale)
         }
@@ -508,8 +509,9 @@ private struct LaunchPage: View {
                             : L("请通过 StikDebug 开启 JIT", "Please enable JIT with StikDebug")
                     ) {
                         if !vm.isJITLive {
-                            Button(L("用 StikDebug 开启", "Enable with StikDebug")) { vm.requestStikDebugJIT() }
+                            Button(L("用 StikDebug 开启", "Enable with StikDebug")) { JITSetup.shared.enable() } // app-jit hook
                                 .buttonStyle(.bordered)
+                            JITPanel() // app-jit hook
                         }
                     }
                     Divider().padding(.leading, 52)
@@ -769,6 +771,7 @@ private struct SettingsSheet: View {
                 Section(L("状态", "Status")) {
                     LabeledContent(L("虚拟机", "Machine"), value: vm.vmStatusText)
                     LabeledContent("JIT", value: vm.isJITLive ? L("已开启", "On") : L("未开启", "Off"))
+                    ThermalStateRow() // app-jit hook
                     LabeledContent(L("画面", "Screen"),
                                    value: vm.fbWidth > 0 ? "\(vm.fbWidth) × \(vm.fbHeight)" : "-")
                     LabeledContent(L("显卡", "Graphics"), value: vm.gpuStatusSummary)

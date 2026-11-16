@@ -38,6 +38,22 @@ targets:
         CADisableMinimumFrameDurationOnPhone: true
         UIViewControllerBasedStatusBarAppearance: false
         NSMicrophoneUsageDescription: "Windows uses the microphone for voice input and audio recording."
+        # applevm:// brings the app back from LocalDevVPN (localdevvpn://enable?scheme=applevm);
+        # applevm://enable-jit asks StikDebug for JIT (JITSetup.swift)
+        CFBundleURLTypes:
+          - CFBundleURLName: $(PRODUCT_BUNDLE_IDENTIFIER)
+            CFBundleURLSchemes:
+              - applevm
+        # canOpenURL answers for these: is StikDebug / LocalDevVPN installed
+        LSApplicationQueriesSchemes:
+          - stikjit
+          - stikdebug
+          - localdevvpn
+        # Game Mode (iOS 18+): background work deprioritised and lower Bluetooth latency for keyboards,
+        # mice and controllers while the app is full screen. The games category is what turns it on.
+        LSApplicationCategoryType: public.app-category.games
+        LSSupportsGameMode: true
+        GCSupportsGameMode: true
         UIBackgroundModes:
           - audio
         UISupportedInterfaceOrientations:

@@ -32,6 +32,15 @@ void winios_jit_configure(uint32_t jit_mb, uint32_t ram_mb);
 size_t winios_jit_configured_bytes(void);
 void winios_jit_install_trap_handler(void);
 bool winios_jit_is_debugger_attached(void);
+/* Whether a debugger traces this process right now (P_TRACED, one sysctl). Unlike CS_DEBUGGED, which
+   stays set for the life of the process once any debugger attached, this clears when it detaches. */
+bool winios_jit_is_traced(void);
+/* A debugger still attached a few seconds after the JIT region was held and the debugger that gave it
+   was told to let go: a second StikDebug session, say. While one is attached every trap stops the app
+   until it answers. Asks it to detach (the JIT script answers that brk), at most three times per launch.
+   Cheap when there is nothing to do; returns true when a detach request was sent. Main thread only.
+   Adapted from Henge's JITBootstrap.releaseLingeringDebugger (Leviidev/Henge ca44144). */
+bool winios_jit_release_lingering_debugger(void);
 bool winios_jit_acquire(size_t bytes, bool detach_after);
 bool winios_jit_is_live(void);
 WinIosDualMapping winios_jit_mapping(void);
