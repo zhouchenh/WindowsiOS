@@ -1,3 +1,40 @@
+## Duo edition
+
+This branch (`duo`) is **Apple VM for the foldable iPhone Duo** (`iPhone19,4`, A20 Pro, iOS 27
+with TXM). It combines three GPL-2.0-or-later projects:
+
+- **[WindowsiOS](https://github.com/ammaarreshi/WindowsiOS)** at `0071d69`: the base, Windows 11
+  ARM64 on iOS with a TXM JIT; its emulator core was forked from Henge at `f9c12c9`. Its README
+  follows below this section.
+- **[AppleVM](https://github.com/zktfjcksxk-spec/AppleVM)**: virtio-gpu 2D/3D (virglrenderer and
+  DXMT from UTM), the single-view UI and settings, the Arch Linux installer, the WinKit guest kit
+  (`winkit/`) and the Windows 11 tutorial (`docs/`). The app is shown as **Apple VM**.
+- **[Henge](https://github.com/Leviidev/Henge)**: fixes from Henge commits newer than the fork
+  point, ported one by one; each port names the Henge commit in its commit message.
+
+What is different here: it targets the iPhone Duo; it builds for anyone, with no team,
+certificate or profile in the project (signing comes from your own gitignored
+`ios/Signing.local.xcconfig`, a free Apple account works); its bundle id is `com.applevm.duo`, so
+it installs next to other builds; `scripts/package_ipa.sh` makes an unsigned IPA; CI builds and
+tests every push on GitHub's `xcode-27` runner; `repo.json` is an AltStore/SideStore source
+template. See `git log` for the full list of changes.
+
+**Build it:** [docs/building.md](docs/building.md) (macOS 27, Xcode 27.2). The upstream build
+notes further down name the original author's bundle id and signing; follow docs/building.md
+instead.
+
+**Licences and credits:** the source is GPL-2.0-or-later ([`LICENSE`](LICENSE)), from the projects
+above. Built apps may also contain unmodified frameworks from [UTM](https://github.com/utmapp/UTM)'s
+iOS build (virglrenderer, DXMT, ANGLE, libepoxy, the Vulkan loader, MoltenVK, KosmicKrisp, zstd),
+under their own licences (MIT, LGPL, BSD, Apache-2.0); they are not in git and are added at
+packaging time. `winkit/` carries Red Hat's [virtio-win](https://github.com/virtio-win/kvm-guest-drivers-windows)
+NetKVM driver (BSD-3-Clause, `winkit/virtio-win_license.txt`) and osy's
+[viogpu3d](https://github.com/osy/kvm-guest-drivers-windows) with the Neptune UMD (BSD-3-Clause / MIT),
+both unmodified. Details: [`THIRD_PARTY.md`](THIRD_PARTY.md) and
+[`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md). You need your own licence for Windows 11.
+
+---
+
 <div align="center">
 
 # WindowsiOS
