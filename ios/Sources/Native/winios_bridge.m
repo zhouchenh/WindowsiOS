@@ -72,6 +72,7 @@ NSNotificationName const WinIOSDisplayWillReshapeNotification = @"WinIOSDisplayW
     double _tabletX, _tabletY;
     uint8_t _tabletButtons;
     uint8_t _keysDown[32];
+    CFAbsoluteTime _keyTapFreeAt; /* main thread: when the last queued key tap is up again (reserveKeyTap) */
 }
 - (void)handleVMExitWithReason:(NSString *)reason;
 - (void)postDisplayStateChanged;
@@ -1636,18 +1637,49 @@ static void winios_type_run(NSString *text) {
     hv_winvm_key_hid(usage, down ? 1 : 0);
 }
 
+/* Key taps (tapKeyHid, sendKeyComboWithModifiers) go out one after another: each starts once the one before
+   is up again, plus 10 ms. Taps that overlap share one USB boot report, which has 6 slots and cannot press a
+   key that is already down, so a burst of them (a word a composing keyboard commits, dictation, the key bar
+   tapped fast) lost doubled letters, dropped keys past the sixth and let shifted ones overtake the rest.
+   Reserves ms for a tap; returns how long from now it has to wait (0: now). Main thread. */
+- (double)reserveKeyTap:(double)ms {
+    CFAbsoluteTime now = CFAbsoluteTimeGetCurrent();
+    CFAbsoluteTime start = MAX(now, _keyTapFreeAt);
+    _keyTapFreeAt = start + (ms + 10.0) / 1000.0;
+    return start - now;
+}
+
+static void winios_after(double seconds, dispatch_block_t block) {
+    if (seconds <= 0) block();
+    else dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(seconds * NSEC_PER_SEC)), dispatch_get_main_queue(), block);
+}
+
 - (void)tapKeyHid:(uint8_t)usage {
     if (!_vmRunning) return;
+    if (![NSThread isMainThread]) {
+        dispatch_async(dispatch_get_main_queue(), ^{ [self tapKeyHid:usage]; });
+        return;
+    }
     hv_fb_metal_note_input(); /* display hook: idle throttling */
-    hv_winvm_key_hid(usage, 1);
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(35 * NSEC_PER_MSEC)), dispatch_get_main_queue(), ^{
-        hv_winvm_key_hid(usage, 0);
+    winios_after([self reserveKeyTap:35], ^{
+        hv_winvm_key_hid(usage, 1);
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(35 * NSEC_PER_MSEC)), dispatch_get_main_queue(), ^{
+            hv_winvm_key_hid(usage, 0);
+        });
     });
 }
 
 - (void)sendKeyComboWithModifiers:(NSArray<NSNumber *> *)modifiers key:(uint8_t)usage {
     if (!_vmRunning) return;
+    if (![NSThread isMainThread]) {
+        dispatch_async(dispatch_get_main_queue(), ^{ [self sendKeyComboWithModifiers:modifiers key:usage]; });
+        return;
+    }
     hv_fb_metal_note_input(); /* display hook: idle throttling */
+    winios_after([self reserveKeyTap:18 + 38 + 15], ^{ [self pressKeyComboWithModifiers:modifiers key:usage]; });
+}
+
+- (void)pressKeyComboWithModifiers:(NSArray<NSNumber *> *)modifiers key:(uint8_t)usage {
     for (NSNumber *m in modifiers) {
         hv_winvm_key_hid((uint8_t)m.unsignedCharValue, 1);
     }

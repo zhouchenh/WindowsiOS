@@ -231,6 +231,8 @@ extension MetalCanvasUIView {
         let ascii = !mapped.contains { $0 == nil }
         // a latched Ctrl/Alt/Win makes it a shortcut: always keys
         if ascii && (keys.hasActiveModifiers || !KeyboardOptions.unicodeText || !bridge.unicodeTextBusy) {
+            // several at once (a composing keyboard's commit, dictation) are fine: the bridge sends key
+            // taps one after another, never two in the same USB report
             for m in mapped { if let m { sendKey(m.0, withShift: m.1) } }
             return
         }
