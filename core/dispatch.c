@@ -741,6 +741,15 @@ static void print_stats(HvCpu *cpu, int force) {
    same 16 KB page, so when that page's code is invalidated the stale blocks are
    only reachable from each other, and the exit_req check before every chained
    jump gets a block that just wrote its own page back to the dispatcher. */
+/* A stub's B just became a B to the chained block. HV_FAST_ICACHE (Henge a47f5e1): drop the line without waiting for
+   every CPU, as Arm lets a CPU run a B while it changes into another B; one that still runs the old one goes to the
+   stub, which follows the slot (stored first). The conditional branch below, and unchaining (hv_invalidate_code),
+   whose old target must not run any more, keep the full wait. */
+static void finish_chain_site(HvMachine *m, uint32_t *site) {
+    if (hv_knob[HV_K_FASTICACHE]) hv_jit_finish_branch(&m->jit, site);
+    else hv_jit_finish(&m->jit, site, 1);
+}
+
 static void chain(HvMachine *m, uint64_t *slot, HvBlock *b) {
     uint32_t idx = (uint32_t)(slot - m->slots);
     if (m->gen_checks && (b->jit_gen != m->jit_gen || (m->slot_site[idx] && (uint64_t)(m->slot_site[idx] - m->jit.base) >= m->jit.used)))
@@ -765,7 +774,7 @@ static void chain(HvMachine *m, uint64_t *slot, HvBlock *b) {
         if (site && off >= -(1 << 25) && off < (1 << 25)) {
             uint32_t insn = 0x14000000u | (uint32_t)(off & 0x3ffffff);
             hv_jit_write(&m->jit, site, &insn, 4);
-            hv_jit_finish(&m->jit, site, 1);
+            finish_chain_site(m, site);
         }
         m->stats.chained++;
         if (m->stats_interval) m->stats.xchained++;
@@ -779,7 +788,7 @@ static void chain(HvMachine *m, uint64_t *slot, HvBlock *b) {
     if (site && off >= -(1 << 25) && off < (1 << 25)) {
         uint32_t insn = 0x14000000u | (uint32_t)(off & 0x3ffffff);
         hv_jit_write(&m->jit, site, &insn, 4);
-        hv_jit_finish(&m->jit, site, 1);
+        finish_chain_site(m, site);
     }
     uint32_t *cond = m->slot_cond[idx];
     if (cond) { /* the conditional branch to that stub, too */

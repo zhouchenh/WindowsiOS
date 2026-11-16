@@ -19,12 +19,20 @@ extern void hv_xjump_thunk(void);
 static int init_rest(HvMachine *m);
 
 int hv_knob[HV_K_COUNT];
-static const char *const hv_knob_names[HV_K_COUNT] = {"HV_NO_RAS", "HV_SUPERBLOCKS", "HV_GROUPS", "HV_WFI_SPIN", "HV_FLUSH", "HV_K1", "HV_K2", "HV_K3", "HV_TLBT", "HV_JIT_CAP", "HV_RECHECK"};
+static const char *const hv_knob_names[] = {"HV_NO_RAS", "HV_SUPERBLOCKS", "HV_GROUPS", "HV_WFI_SPIN", "HV_FLUSH", "HV_K1", "HV_K2", "HV_K3", "HV_TLBT", "HV_JIT_CAP", "HV_RECHECK",
+                                            "HV_FAST_ICACHE"};
+_Static_assert(sizeof hv_knob_names / sizeof hv_knob_names[0] == HV_K_COUNT, "a name for every knob");
 
 static void knobs_init(void) {
     for (int i = 0; i < HV_K_COUNT; i++)
         hv_knob[i] = getenv(hv_knob_names[i]) ? atoi(getenv(hv_knob_names[i])) : 0;
     if (getenv("HV_NO_RAS") && !*getenv("HV_NO_RAS")) hv_knob[HV_K_NO_RAS] = 1;
+}
+
+/* A knob from its environment variable, or def when that is unset. */
+static void knob_env(int k, int def) {
+    const char *v = getenv(hv_knob_names[k]);
+    hv_knob[k] = v ? atoi(v) : def;
 }
 
 int hv_knob_set(HvMachine *m, const char *name, int value) {
@@ -58,6 +66,9 @@ static int init_rest(HvMachine *m) {
     /* 4 KB pages expose stack accesses in the last 15 bytes of every page (500K+/s on Windows):
        exact OOL recheck avoids trapping to C on every stack push/pop at page top. */
     hv_knob[HV_K_RECHECK] = getenv("HV_RECHECK") ? atoi(getenv("HV_RECHECK")) : 1;
+    /* Henge a47f5e1: chaining rewrites one B as another B and drops just that instruction-cache line, without waiting
+       for every CPU; a placed block's hot and cold parts share one wait (host/jit_region.c). */
+    knob_env(HV_K_FASTICACHE, 0);
     /* As many blocks as the region holds (a block is at least ~160 bytes of
        code), so the region filling, not this table, is what flushes; two
        chainable exits each at most. Untouched entries cost nothing. */

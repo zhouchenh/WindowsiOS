@@ -309,8 +309,11 @@ void hv_ret_clear(HvCpu *cpu);
 int hv_ic_ivau_drops(void);
 /* Settings that say how to translate or wait, to compare ways of doing it in one running guest
    ("knob NAME VALUE" in HV_INPUT_FILE; a new way starts from an empty code cache). Each starts
-   from the environment variable named in hv_knob_names. */
-enum { HV_K_NO_RAS, HV_K_SUPERBLOCKS, HV_K_GROUPS, HV_K_WFI_SPIN, HV_K_FLUSH, HV_K_TEST1, HV_K_TEST2, HV_K_TEST3, HV_K_TLBT, HV_K_JITCAP, HV_K_RECHECK, HV_K_COUNT };
+   from the environment variable named in hv_knob_names. The ports of Henge's core work (HV_FAST_ICACHE and the
+   ones after it) are read in init_rest with their defaults, so the Mac tool and the tests can set them too
+   (Documents/env.txt on iOS): 0 turns one off. */
+enum { HV_K_NO_RAS, HV_K_SUPERBLOCKS, HV_K_GROUPS, HV_K_WFI_SPIN, HV_K_FLUSH, HV_K_TEST1, HV_K_TEST2, HV_K_TEST3, HV_K_TLBT, HV_K_JITCAP, HV_K_RECHECK,
+       HV_K_FASTICACHE, HV_K_COUNT };
 extern int hv_knob[HV_K_COUNT];
 int hv_knob_set(HvMachine *m, const char *name, int value);
 /* Debugging (HV_WATCH): which pages keep losing their translations. */
