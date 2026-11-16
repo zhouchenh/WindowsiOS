@@ -26,7 +26,6 @@
 
 #define VIRGL_RENDERER_UNSTABLE_APIS 1
 #include "virglrenderer.h"
-#include "gpu_fence_order.h"
 #include "virtio_gpu.h"
 
 /* ---- protocol ---- */
@@ -164,10 +163,9 @@ static struct {
 
 /* ---- device state ---- */
 typedef struct Parked {
-    HvFenceNode node; /* first: the in-order queue links Parked through it */
+    struct Parked *next;
     Hdr h;
     uint32_t epoch;
-    uint32_t resp; /* what to answer once it is its turn (RESP_OK_NODATA, or the error it met) */
     HvVirtqElem e;
 } Parked;
 
@@ -200,12 +198,10 @@ struct HvVgpu3d {
     FenceEv *events;
 
     /* worker only */
-    HvFenceQueue fenceq; /* fenced commands, answered in the order they came (gpu_fence_order.h) */
-    uint64_t fence_hold_ns;
-    uint32_t ctx_capset[64]; /* capset each context was created with, by ctx_id (logging) */
+    Parked *fenceq;
+    uint32_t nparked_global;
+    uint32_t ctx_capset[64];              /* capset each context was created with, by ctx_id (logging) */
     uint64_t fenced_ring, fenced_global; /* fenced commands by timeline */
-    int flush_wait;          /* a scanout flush came while older fenced work was still running ... */
-    uint64_t flush_wait_seq; /* ... parked up to here: show the frame again once that has retired */
     Res3d res[MAX_RES3D];
     uint32_t capsets[8], ncapsets;
     uint32_t scanout_res;
@@ -223,7 +219,7 @@ struct HvVgpu3d {
     uint64_t win_pa;
 
     /* stats */
-    uint64_t cmds, submits, submit_bytes, fences, maps, blobs, ctxs, errors, submit_errors, reflushes;
+    uint64_t cmds, submits, submit_bytes, fences, maps, blobs, ctxs, errors, submit_errors;
     int init_ok;
     char why[160];
 
@@ -793,9 +789,22 @@ static uint32_t process(HvVgpu3d *s, const HvVirtqElem *e, const Hdr *h, uint32_
         return rc ? RESP_ERR_UNSPEC : 0;
     }
     case CMD_CTX_DESTROY: {
-        /* its timelines go with it: fences still parked on them would hold every later one */
-        int n = hv_fence_q_retire_ctx(&s->fenceq, h->ctx_id);
-        LOG("ctx %u destroy (%d fences still parked on it)\n", h->ctx_id, n);
+        /* Its rings go with it: a ring fence still parked on it would never be written, and its
+           request (the guest's buffer) would never come back. */
+        int n = 0;
+        for (Parked **pp = &s->fenceq; *pp;) {
+            Parked *p = *pp;
+            if ((p->h.flags & FLAG_RING_IDX) && p->h.ctx_id == h->ctx_id) {
+                *pp = p->next;
+                respond(s, &p->e, &p->h, p->epoch, RESP_OK_NODATA, NULL, 0);
+                s->fences++;
+                free(p);
+                n++;
+            } else {
+                pp = &p->next;
+            }
+        }
+        LOG("ctx %u destroy (%d ring fences still parked on it answered)\n", h->ctx_id, n);
         V.virgl_renderer_context_destroy(h->ctx_id);
         return 0;
     }
@@ -1088,12 +1097,6 @@ static uint32_t process(HvVgpu3d *s, const HvVirtqElem *e, const Hdr *h, uint32_
             s->g->flushes++;
             if (!s->scanout_handle && !s->g->fb->ovr_tex) readback_scanout(s);
             hv_fb_display_override_flushed(s->g->fb);
-            /* The presenter samples the texture now, on its own queue; the frame may still be being drawn
-               by work parked before this flush. Show it again once all of that has retired (answer_ready). */
-            if (!hv_fence_q_done_through(&s->fenceq, s->fenceq.last_seq)) {
-                s->flush_wait = 1;
-                s->flush_wait_seq = s->fenceq.last_seq;
-            }
         }
         return 0;
     }
@@ -1104,34 +1107,25 @@ static uint32_t process(HvVgpu3d *s, const HvVirtqElem *e, const Hdr *h, uint32_
     (void)got;
 }
 
-static uint64_t now_ns(void) {
-    return clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
-}
-
-/* A timeline moved on: its parked fences have retired (answer_ready answers them in order). */
 static void complete_fences(HvVgpu3d *s, const FenceEv *f) {
-    hv_fence_q_retire(&s->fenceq, f->ctx_id, f->ring_idx == UINT32_MAX ? HV_FENCE_GLOBAL : f->ring_idx, f->fence_id);
-}
-
-/* Answer the fenced commands whose turn has come: oldest first, each once it and all before it have retired. */
-static void answer_ready(HvVgpu3d *s) {
-    uint64_t forced = s->fenceq.forced;
-    HvFenceNode *n;
-    while ((n = hv_fence_q_pop(&s->fenceq, now_ns(), s->fence_hold_ns))) {
-        Parked *p = (Parked *)n;
-        respond(s, &p->e, &p->h, p->epoch, p->resp, NULL, 0);
-        s->fences++;
-        free(p);
-    }
-    if (s->fenceq.forced != forced && s->fenceq.forced <= 20)
-        WARN("fence %llu (ctx %u ring %d) unretired for %llu ms: answering later ones ahead of it\n",
-             s->fenceq.head ? (unsigned long long)s->fenceq.head->fence_id : 0ull,
-             s->fenceq.head ? s->fenceq.head->ctx_id : 0, s->fenceq.head ? (int)s->fenceq.head->ring_idx : -1,
-             (unsigned long long)(s->fence_hold_ns / 1000000));
-    if (s->flush_wait && hv_fence_q_done_through(&s->fenceq, s->flush_wait_seq)) {
-        s->flush_wait = 0;
-        s->reflushes++;
-        hv_fb_display_override_flushed(s->g->fb); /* the frame is finished now: sample it again */
+    Parked **pp = &s->fenceq;
+    while (*pp) {
+        Parked *p = *pp;
+        int match;
+        if (f->ring_idx == UINT32_MAX)
+            match = !(p->h.flags & FLAG_RING_IDX) && p->h.fence_id <= f->fence_id;
+        else
+            match = (p->h.flags & FLAG_RING_IDX) && p->h.ctx_id == f->ctx_id && p->h.ring_idx == f->ring_idx &&
+                    p->h.fence_id <= f->fence_id;
+        if (match) {
+            *pp = p->next;
+            if (!(p->h.flags & FLAG_RING_IDX)) s->nparked_global--;
+            respond(s, &p->e, &p->h, p->epoch, RESP_OK_NODATA, NULL, 0);
+            s->fences++;
+            free(p);
+        } else {
+            pp = &p->next;
+        }
     }
 }
 
@@ -1144,12 +1138,12 @@ static void renderer_reset(HvVgpu3d *s) {
         free(s->res[i].iov);
         memset(&s->res[i], 0, sizeof s->res[i]);
     }
-    for (HvFenceNode *n = hv_fence_q_take_all(&s->fenceq); n;) {
-        HvFenceNode *next = n->next;
-        free(n);
-        n = next;
+    while (s->fenceq) {
+        Parked *p = s->fenceq;
+        s->fenceq = p->next;
+        free(p);
     }
-    s->flush_wait = 0;
+    s->nparked_global = 0;
     if (s->page_host) {
         memset(s->page_host, 0, (s->win_size >> 12) * sizeof *s->page_host);
         sync_tlbs(s);
@@ -1208,19 +1202,10 @@ static void *worker(void *arg) {
     for (;;) {
         pthread_mutex_lock(&s->mu);
         while (!s->kicked && !s->events && s->done_epoch == s->epoch) {
-            /* global fences retire only when virgl is polled (every 1 ms); a fence that outstays the hold
-               lets the retired ones behind it go when it runs out */
-            uint64_t wait = s->fenceq.unretired_global ? 1000000 : 0;
-            uint64_t dl = hv_fence_q_deadline(&s->fenceq, s->fence_hold_ns);
-            if (dl) {
-                uint64_t now = now_ns(), left = dl > now ? dl - now : 1;
-                if (!wait || left < wait) wait = left;
-            }
-            if (wait) {
+            if (s->nparked_global) {
                 struct timespec ts;
                 clock_gettime(CLOCK_REALTIME, &ts);
-                ts.tv_sec += (time_t)(wait / 1000000000);
-                ts.tv_nsec += (long)(wait % 1000000000);
+                ts.tv_nsec += 1000000;
                 if (ts.tv_nsec >= 1000000000) ts.tv_sec++, ts.tv_nsec -= 1000000000;
                 if (pthread_cond_timedwait(&s->cv, &s->mu, &ts) == ETIMEDOUT) break;
             } else {
@@ -1249,8 +1234,7 @@ static void *worker(void *arg) {
             free(ev);
             ev = n;
         }
-        answer_ready(s);
-        if (s->fenceq.unretired_global) V.virgl_renderer_poll(); /* global fences retire from here */
+        if (s->nparked_global) V.virgl_renderer_poll(); /* global fences retire from here */
         if (cursor_pending) fetch_cursor(s, cursor_res);
 
         /* take what the driver queued */
@@ -1285,38 +1269,41 @@ static void *worker(void *arg) {
             if (err) {
                 s->errors++;
                 if (s->errors <= 50) WARN("cmd %#x ctx %u failed: %#x\n", p->h.type, p->h.ctx_id, err);
-            }
-            p->resp = err ? err : RESP_OK_NODATA;
-            if (!(p->h.flags & FLAG_FENCE)) {
-                respond(s, &p->e, &p->h, epoch, p->resp, NULL, 0);
+                respond(s, &p->e, &p->h, epoch, err, NULL, 0);
                 free(p);
                 continue;
             }
-            /* Fenced: answered once the renderer retires it AND every fenced command before it has been
-               answered (gpu_fence_order.h): the guest takes the highest answered fence for "all done". */
-            uint64_t t = now_ns();
-            if (err) {
-                hv_fence_q_push(&s->fenceq, &p->node, p->h.ctx_id, HV_FENCE_GLOBAL, p->h.fence_id, 1, t);
-            } else if (p->h.flags & FLAG_RING_IDX) {
+            if (!(p->h.flags & FLAG_FENCE)) {
+                respond(s, &p->e, &p->h, epoch, RESP_OK_NODATA, NULL, 0);
+                free(p);
+                continue;
+            }
+            /* fenced: answered when the renderer retires it */
+            if (p->h.flags & FLAG_RING_IDX) {
                 s->fenced_ring++;
                 int rc = V.virgl_renderer_context_create_fence(p->h.ctx_id, VIRGL_RENDERER_FENCE_FLAG_MERGEABLE,
                                                                p->h.ring_idx, p->h.fence_id);
-                if (rc) { /* dead context: never retires; nothing left to wait for */
+                if (rc != 0) {
                     s->errors++;
                     if (s->errors <= 50) WARN("ctx %u ring %u fence %llu: create_fence failed %d\n", p->h.ctx_id,
                                               p->h.ring_idx, (unsigned long long)p->h.fence_id, rc);
+                    respond(s, &p->e, &p->h, epoch, RESP_OK_NODATA, NULL, 0); /* dead context: never retires */
+                    free(p);
+                    continue;
                 }
-                hv_fence_q_push(&s->fenceq, &p->node, p->h.ctx_id, p->h.ring_idx, p->h.fence_id, rc != 0, t);
             } else {
+                /* A global fence waits only for vrend's (ctx 0) GL work, not for the commands' own context:
+                   log which contexts (capsets) send them, to tell whether a Neptune context ever does. */
                 s->fenced_global++;
                 if (s->fenced_global <= 20)
                     LOG("global fence %llu: cmd %#x ctx %u (capset %u)\n", (unsigned long long)p->h.fence_id,
                         p->h.type, p->h.ctx_id, p->h.ctx_id < 64 ? s->ctx_capset[p->h.ctx_id] : 0);
                 V.virgl_renderer_create_fence((int)p->h.fence_id, p->h.type);
-                hv_fence_q_push(&s->fenceq, &p->node, p->h.ctx_id, HV_FENCE_GLOBAL, p->h.fence_id, 0, t);
+                s->nparked_global++;
             }
+            p->next = s->fenceq;
+            s->fenceq = p;
         }
-        answer_ready(s);
         flush_done(s);
     }
     return NULL;
@@ -1329,10 +1316,6 @@ HvVgpu3d *hv_vgpu3d_create(HvVirtioGpu *g) {
     if (!s) return NULL;
     s->g = g;
     s->ram_idx = -1;
-    /* How long the oldest fenced command may hold back the answers of later ones (gpu_fence_order.h).
-       HV_GPU3D_FENCE_HOLD_MS=0 answers each fence as soon as it retires, as before. */
-    const char *hold = getenv("HV_GPU3D_FENCE_HOLD_MS");
-    s->fence_hold_ns = (hold && *hold ? strtoull(hold, NULL, 0) : 500) * 1000000ull;
     pthread_mutex_init(&s->mu, NULL);
     pthread_cond_init(&s->cv, NULL);
     const char *hm = getenv("HV_GPU3D_HOSTMEM_MB");
@@ -1434,15 +1417,13 @@ int hv_vgpu3d_describe(HvVgpu3d *s, char *buf, unsigned len) {
     if (s->init_ok < 0) return snprintf(buf, len, "unavailable (%s)", s->why);
     return snprintf(buf, len,
                     "on capsets=%u ctxs=%llu cmds=%llu submits=%llu (%lluKB) blobs=%llu maps=%llu fences=%llu "
-                    "(ring %llu global %llu held %llu forced %llu) errors=%llu submit_errors=%llu reflush=%llu "
-                    "scanout=%u %ux%u%s hostmem@%#llx",
+                    "(ring %llu global %llu) errors=%llu submit_errors=%llu scanout=%u %ux%u%s hostmem@%#llx",
                     s->ncapsets, (unsigned long long)s->ctxs, (unsigned long long)s->cmds,
                     (unsigned long long)s->submits, (unsigned long long)(s->submit_bytes >> 10),
                     (unsigned long long)s->blobs, (unsigned long long)s->maps, (unsigned long long)s->fences,
                     (unsigned long long)s->fenced_ring, (unsigned long long)s->fenced_global,
-                    (unsigned long long)s->fenceq.held, (unsigned long long)s->fenceq.forced,
-                    (unsigned long long)s->errors, (unsigned long long)s->submit_errors,
-                    (unsigned long long)s->reflushes, s->scanout_res, s->sc_w, s->sc_h,
+                    (unsigned long long)s->errors, (unsigned long long)s->submit_errors, s->scanout_res, s->sc_w,
+                    s->sc_h,
                     s->scanout_handle || (s->g && s->g->fb && s->g->fb->ovr_tex) ? " metal" : "",
                     (unsigned long long)s->win_pa);
 }
