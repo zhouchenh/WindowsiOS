@@ -126,6 +126,8 @@ extern NSNotificationName const WinIOSDisplayWillReshapeNotification;
 
 - (void)sendTabletNormalizedX:(double)x y:(double)y buttons:(uint8_t)buttons wheel:(int8_t)wheel;
 - (void)sendKeyHid:(uint8_t)usage down:(BOOL)down;
+/* Key-ups sent only after every key tap already queued is up again (see winios_bridge.m). */
+- (void)releaseKeysAfterQueuedTaps:(NSArray<NSNumber *> *)usages;
 - (void)tapKeyHid:(uint8_t)usage;
 - (void)sendKeyComboWithModifiers:(NSArray<NSNumber *> *)modifiers key:(uint8_t)usage;
 - (void)sendWindowsKey;

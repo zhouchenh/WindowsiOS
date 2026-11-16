@@ -1679,6 +1679,19 @@ static void winios_after(double seconds, dispatch_block_t block) {
     winios_after([self reserveKeyTap:18 + 38 + 15], ^{ [self pressKeyComboWithModifiers:modifiers key:usage]; });
 }
 
+/* Key-ups that must not overtake the taps already queued (the deck's latched modifiers after a
+   modified tap): they go out once every queued tap is up again. Main thread or not. */
+- (void)releaseKeysAfterQueuedTaps:(NSArray<NSNumber *> *)usages {
+    if (!usages.count) return;
+    if (![NSThread isMainThread]) {
+        dispatch_async(dispatch_get_main_queue(), ^{ [self releaseKeysAfterQueuedTaps:usages]; });
+        return;
+    }
+    winios_after([self reserveKeyTap:0], ^{
+        for (NSNumber *u in usages) hv_winvm_key_hid((uint8_t)u.unsignedCharValue, 0);
+    });
+}
+
 - (void)pressKeyComboWithModifiers:(NSArray<NSNumber *> *)modifiers key:(uint8_t)usage {
     for (NSNumber *m in modifiers) {
         hv_winvm_key_hid((uint8_t)m.unsignedCharValue, 1);

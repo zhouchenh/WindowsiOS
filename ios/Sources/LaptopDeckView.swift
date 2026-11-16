@@ -686,10 +686,15 @@ struct LaptopDeckView: View {
         if shiftLatched { mods.append(0xe1) }
         if mods.isEmpty {
             WinIOSBridge.shared.tapKeyHid(hid)
+            releaseLatchedModifiers()
         } else {
             WinIOSBridge.shared.sendKeyCombo(withModifiers: mods.map { NSNumber(value: $0) }, key: hid)
+            // The combination presses and lifts these itself. Lifting them now would overtake the queued
+            // combination (an idle queue sends its modifiers at once and the key 18 ms later), so Windows
+            // would see a bare key. Any a held key put down with them are lifted after the queue instead.
+            shiftLatched = false; ctrlLatched = false; altLatched = false; winLatched = false
+            WinIOSBridge.shared.releaseKeys(afterQueuedTaps: mods.map { NSNumber(value: $0) })
         }
-        releaseLatchedModifiers() // and lifts any a held key put down with them
     }
 
     private func releaseLatchedModifiers() {
