@@ -8,7 +8,8 @@
 //   attached, and then every trap stops Windows until it answers);
 // - a debugger still attached after the JIT region is held is told to let go (winios_jit.c);
 // - LocalDevVPN, which StikDebug reaches this device through: checked, and connected first when it
-//   is installed, coming back through the applevm:// URL scheme;
+//   is installed, coming back through the applevm:// URL scheme (not for the built-in helper set to
+//   reach this device through the user's own VPN, JITConnectionMode);
 // - "Turn on JIT when the app opens";
 // - failures say what to check.
 //
@@ -53,10 +54,33 @@ final class JITSetup: ObservableObject {
     @Published private(set) var txmPresent: Bool?
     /// The built-in method needs a step done first: the setup sheet (BuiltInJITView.swift) opens.
     @Published var showBuiltInSetup = false
-    /// A request to the helper other than enable (Prepare, Reset DDI) is under way.
+    /// A request to the helper other than enable (Prepare, Reset DDI, Test connection) is under way.
     @Published private(set) var helperBusy = false
     /// What the last Prepare or Reset DDI said.
     @Published private(set) var helperNote: String?
+
+    /// How the built-in helper reaches this device: LocalDevVPN, or the user's own VPN at
+    /// vpnDeviceAddress. StikDebug is a separate app and always uses its own setting (LocalDevVPN).
+    @Published var connectionMode = JITConnectionMode.stored {
+        didSet {
+            UserDefaults.standard.set(connectionMode.rawValue, forKey: JITConnectionMode.defaultsKey)
+            if connectionMode != oldValue { connectionChanged() }
+        }
+    }
+    /// The device address for the user's own VPN, as typed in the setup.
+    @Published var vpnAddressText = UserDefaults.standard.string(forKey: JITConnectionMode.addressKey) ?? "" {
+        didSet {
+            UserDefaults.standard.set(vpnAddressText, forKey: JITConnectionMode.addressKey)
+            if JITDeviceAddress.normalized(vpnAddressText) != JITDeviceAddress.normalized(oldValue) { connectionChanged() }
+        }
+    }
+    /// A tunnel interface of a VPN is up (OwnVPN), as last checked.
+    @Published private(set) var ownVPNConnected = OwnVPN.isConnected
+    /// Test connection is under way (it holds helperBusy too).
+    @Published private(set) var testingConnection = false
+    /// What the last Test connection said, and whether it passed.
+    @Published private(set) var connectionTestNote: String?
+    @Published private(set) var connectionTestPassed: Bool?
 
     static let enableAtLaunchKey = "winios.jit.enableAtLaunch"
     /// "Turn on JIT when the app opens": once per launch, when no debugger shows up by itself, go to
@@ -100,6 +124,29 @@ final class JITSetup: ObservableObject {
 
     private var networkSituation: JITNetworkSituation { JITNetworkSituation(pathMonitor.currentPath) }
 
+    /// The device address the user's own VPN routes back to this device, normalised; nil when the text
+    /// is not an IPv4 or IPv6 address.
+    var vpnDeviceAddress: String? { JITDeviceAddress.normalized(vpnAddressText) }
+
+    /// The built-in helper is to reach this device through the user's own VPN, not LocalDevVPN.
+    var builtInUsesOwnVPN: Bool { resolvedMethod == .builtIn && connectionMode == .ownVPN }
+
+    /// The address for the helper's requests: nil for LocalDevVPN (StikJIT's 10.7.0.1).
+    private var helperDeviceAddress: String? { connectionMode == .ownVPN ? vpnDeviceAddress : nil }
+
+    /// A Prepare or Test result was for the other connection.
+    private func connectionChanged() {
+        prepared = false
+        connectionTestNote = nil
+        connectionTestPassed = nil
+        RemotePairingPortDiscovery.invalidate()
+    }
+
+    func refreshVPNStatus() {
+        vpnConnected = LocalDevVPN.isConnected
+        ownVPNConnected = OwnVPN.isConnected
+    }
+
     private var jitLive: Bool { WinIOSBridge.shared.isJITLive }
 
     // MARK: Activation
@@ -108,7 +155,7 @@ final class JITSetup: ObservableObject {
     /// syncs and, if asked to, starts the machine).
     func appBecameActive(onLive: @escaping () -> Void) {
         self.onLive = onLive
-        vpnConnected = LocalDevVPN.isConnected
+        refreshVPNStatus()
         activationTask?.cancel()
         activationTask = Task { [weak self] in await self?.watchActivation() }
     }
@@ -288,6 +335,23 @@ final class JITSetup: ObservableObject {
                 return
             }
         }
+        if builtInUsesOwnVPN {
+            // The user's own VPN: LocalDevVPN is neither needed nor opened (iOS would drop that VPN for it).
+            guard vpnDeviceAddress != nil else {
+                if atLaunch { jitLog("JIT at launch: no device address for your VPN; skipped"); return }
+                jitLog("built-in JIT over your VPN has no valid device address; opening its setup")
+                error = L("请在内置 JIT 设置里填写你的 VPN 转回本机的地址（IPv4 或 IPv6）。",
+                          "Enter the address your VPN routes back to this device (IPv4 or IPv6) in Built-in JIT setup.")
+                showBuiltInSetup = true
+                return
+            }
+            ownVPNConnected = OwnVPN.isConnected
+            // Not a hard stop: a VPN whose interface is named otherwise still gets its try, and the helper
+            // says what failed.
+            if !ownVPNConnected { jitLog("no VPN tunnel interface is up; trying the device address anyway") }
+            requestDebugger()
+            return
+        }
         vpnConnected = LocalDevVPN.isConnected
         if !vpnConnected && LocalDevVPN.isInstalled {
             jitLog("LocalDevVPN is not connected; opening it to connect (it comes back through applevm://)")
@@ -441,32 +505,46 @@ final class JITSetup: ObservableObject {
                    "Apple VM's JIT script (henge-jit.js) is missing from this installation. Reinstall Apple VM."))
             return
         }
+        // Never LocalDevVPN's address in its stead: My VPN without a valid address stops here.
+        if connectionMode == .ownVPN && vpnDeviceAddress == nil {
+            fail(L("请在内置 JIT 设置里填写你的 VPN 转回本机的地址（IPv4 或 IPv6）。",
+                   "Enter the address your VPN routes back to this device (IPv4 or IPv6) in Built-in JIT setup."))
+            return
+        }
         busy = true
         error = nil
         if attempt == 1 { status = L("正在启动内置 JIT 助手…", "Starting the built-in JIT helper…") }
         builtInRequest += 1
         let request = builtInRequest
-        jitLog("enabling JIT with the built-in helper" + (attempt > 1 ? " (attempt \(attempt))" : ""))
+        // Fixed for this request, whatever the setting is changed to meanwhile.
+        let deviceAddress = helperDeviceAddress
+        let connection: JITConnectionMode = deviceAddress == nil ? .localDevVPN : .ownVPN
+        jitLog("enabling JIT with the built-in helper" + (attempt > 1 ? " (attempt \(attempt))" : "")
+               + (deviceAddress.map { " through your VPN (\(JITDeviceAddress.family($0)))" } ?? ""))
         RemotePairingPortDiscovery.resolve { [weak self] port in
             guard let self, request == self.builtInRequest, self.busy else { return }
             WinBuiltInJIT.send(
-                .enable(targetPID: getpid(), pairingData: pairing, scriptBase64: script, rsdPort: port),
+                .enable(targetPID: getpid(), pairingData: pairing, scriptBase64: script, rsdPort: port,
+                        deviceAddress: deviceAddress),
                 started: { [weak self] in
                     guard let self, request == self.builtInRequest, self.busy else { return }
                     if attempt == 1 { self.status = L("正在等待内置助手连接…", "Waiting for the helper to attach…") }
                     // The first Enable can download and mount the Developer Disk Image before it attaches.
-                    self.awaitDebugger(timeout: 150, timeoutMessage: L(
-                        "内置助手 150 秒内没有连接。请确认 LocalDevVPN 已连接，先点“准备”，然后重试。",
-                        "The helper did not attach within 150 seconds. Check that LocalDevVPN is connected, run Prepare, then try again."))
+                    self.awaitDebugger(timeout: 150, timeoutMessage: connection == .ownVPN
+                        ? L("内置助手 150 秒内没有连接。请确认你的 VPN 已连接，在设置里点“测试连接”和“准备”，然后重试。",
+                            "The helper did not attach within 150 seconds. Check that your VPN is connected, run Test connection and Prepare in the setup, then try again.")
+                        : L("内置助手 150 秒内没有连接。请确认 LocalDevVPN 已连接，先点“准备”，然后重试。",
+                            "The helper did not attach within 150 seconds. Check that LocalDevVPN is connected, run Prepare, then try again."))
                 },
                 completion: { [weak self] result in
-                    self?.builtInEnableFinished(result, attempt: attempt, request: request)
+                    self?.builtInEnableFinished(result, attempt: attempt, request: request, connection: connection)
                 })
         }
     }
 
     /// The helper's enable request ended: after the script detached (success), or when attaching failed.
-    private func builtInEnableFinished(_ result: Result<WinJITRequest.Response, Error>, attempt: Int, request: Int) {
+    private func builtInEnableFinished(_ result: Result<WinJITRequest.Response, Error>, attempt: Int, request: Int,
+                                       connection: JITConnectionMode) {
         let current = request == builtInRequest
         // This request failed, but an earlier one the app gave up on may still attach.
         defer { if !jitLive && !busy { watchForLateHelper() } }
@@ -486,9 +564,16 @@ final class JITSetup: ObservableObject {
                 return
             }
             guard current, !jitLive, busy else { return }
+            if connection == .ownVPN, let check = response.connection, check != .ok {
+                // The helper checked the address first and says which stage failed.
+                RemotePairingPortDiscovery.invalidate()
+                fail(JITOwnVPNAdvice.text(for: check) + "\n(" + response.message + ")")
+                return
+            }
             if let problem = JITConnectionProblem(helperMessage: response.message) {
                 RemotePairingPortDiscovery.invalidate()
-                if let wait = JITRetryPolicy.retryDelay(situation: networkSituation, problem: problem, attempt: attempt) {
+                if let wait = JITRetryPolicy.retryDelay(situation: networkSituation, problem: problem, attempt: attempt,
+                                                        connection: connection) {
                     awaitTask?.cancel()
                     awaitTask = nil
                     status = JITRetryPolicy.statusText(nextAttempt: attempt + 1)
@@ -500,7 +585,7 @@ final class JITSetup: ObservableObject {
                     }
                     return
                 }
-                fail(problem.advice(networkSituation))
+                fail(problem.advice(networkSituation, connection: connection))
                 return
             }
             fail(L("内置 JIT 没能开启：", "Built-in JIT could not turn on: ") + response.message)
@@ -510,7 +595,8 @@ final class JITSetup: ObservableObject {
         }
     }
 
-    /// Prepare: checks LocalDevVPN and mounts the Developer Disk Image (downloading it the first time).
+    /// Prepare: checks LocalDevVPN (or the user's own VPN) and mounts the Developer Disk Image
+    /// (downloading it the first time).
     func prepareBuiltIn(attempt: Int = 1) {
         guard !helperBusy, !busy else { return }
         if let reason = WinBuiltInJIT.unavailableReason { helperNote = reason; return }
@@ -518,21 +604,38 @@ final class JITSetup: ObservableObject {
             helperNote = L("请先配对本机，或导入它的配对文件。", "Pair this device or import its pairing file first.")
             return
         }
+        let deviceAddress = helperDeviceAddress
+        let connection: JITConnectionMode = deviceAddress == nil ? .localDevVPN : .ownVPN
+        if connectionMode == .ownVPN && deviceAddress == nil {
+            helperNote = L("请先填写你的 VPN 转回本机的地址。", "Enter the address your VPN routes back to this device first.")
+            return
+        }
         helperBusy = true
         if attempt == 1 {
-            helperNote = L("正在检查 LocalDevVPN 和开发者磁盘映像（第一次会下载）…",
-                           "Checking LocalDevVPN and the Developer Disk Image (downloaded the first time)…")
+            helperNote = connection == .ownVPN
+                ? L("正在检查通过你的 VPN 的连接和开发者磁盘映像（第一次会下载）…",
+                    "Checking the connection through your VPN and the Developer Disk Image (downloaded the first time)…")
+                : L("正在检查 LocalDevVPN 和开发者磁盘映像（第一次会下载）…",
+                    "Checking LocalDevVPN and the Developer Disk Image (downloaded the first time)…")
         }
         RemotePairingPortDiscovery.resolve { [weak self] port in
-            WinBuiltInJIT.send(.prepare(pairingData: pairing, rsdPort: port)) { [weak self] result in
+            WinBuiltInJIT.send(.prepare(pairingData: pairing, rsdPort: port, deviceAddress: deviceAddress)) { [weak self] result in
                 guard let self else { return }
                 switch result {
                 case .success(let response):
                     jitLog("prepare \(response.success ? "passed" : "failed"): \(response.message)")
                     txmPresent = response.txmPresent ?? txmPresent
+                    if !response.success, connection == .ownVPN, let check = response.connection, check != .ok {
+                        RemotePairingPortDiscovery.invalidate()
+                        helperBusy = false
+                        prepared = false
+                        helperNote = JITOwnVPNAdvice.text(for: check) + "\n(" + response.message + ")"
+                        return
+                    }
                     if !response.success, let problem = JITConnectionProblem(helperMessage: response.message) {
                         RemotePairingPortDiscovery.invalidate()
-                        if let wait = JITRetryPolicy.retryDelay(situation: networkSituation, problem: problem, attempt: attempt) {
+                        if let wait = JITRetryPolicy.retryDelay(situation: networkSituation, problem: problem, attempt: attempt,
+                                                                connection: connection) {
                             helperNote = JITRetryPolicy.statusText(nextAttempt: attempt + 1)
                             Task { [weak self] in
                                 try? await Task.sleep(nanoseconds: UInt64(wait * 1_000_000_000))
@@ -543,14 +646,15 @@ final class JITSetup: ObservableObject {
                         }
                         helperBusy = false
                         prepared = false
-                        helperNote = problem.advice(networkSituation)
+                        helperNote = problem.advice(networkSituation, connection: connection)
                         return
                     }
                     helperBusy = false
                     prepared = response.success
-                    helperNote = response.success
-                        ? L("LocalDevVPN 可用，开发者磁盘映像已就绪。", "LocalDevVPN is reachable and the Developer Disk Image is ready.")
-                        : response.message
+                    helperNote = !response.success ? response.message
+                        : connection == .ownVPN
+                        ? L("本机通过你的 VPN 有回应，开发者磁盘映像已就绪。", "This device answers through your VPN and the Developer Disk Image is ready.")
+                        : L("LocalDevVPN 可用，开发者磁盘映像已就绪。", "LocalDevVPN is reachable and the Developer Disk Image is ready.")
                 case .failure(let failure):
                     helperBusy = false
                     prepared = false
@@ -576,6 +680,47 @@ final class JITSetup: ObservableObject {
                     : response.message
             case .failure(let failure):
                 helperNote = failure.localizedDescription
+            }
+        }
+    }
+
+    /// Test connection (the user's own VPN): the helper connects to RemotePairing's port at the device
+    /// address and, once paired, checks that RemotePairing answers there. Says which stage failed.
+    func testConnection() {
+        guard !helperBusy, !busy else { return }
+        if let reason = WinBuiltInJIT.unavailableReason {
+            connectionTestPassed = false
+            connectionTestNote = reason
+            return
+        }
+        guard let address = vpnDeviceAddress else {
+            connectionTestPassed = false
+            connectionTestNote = L("这不是有效的 IPv4 或 IPv6 地址。", "That is not a valid IPv4 or IPv6 address.")
+            return
+        }
+        let pairing = try? JITPairingFileStore.data()
+        helperBusy = true
+        testingConnection = true
+        connectionTestPassed = nil
+        connectionTestNote = L("正在测试通过你的 VPN 的连接…", "Testing the connection through your VPN…")
+        jitLog("testing the connection through your VPN (\(JITDeviceAddress.family(address)), \(pairing == nil ? "not paired" : "paired"))")
+        RemotePairingPortDiscovery.resolve { [weak self] port in
+            WinBuiltInJIT.send(.testConnection(pairingData: pairing, rsdPort: port, deviceAddress: address)) { [weak self] result in
+                guard let self else { return }
+                helperBusy = false
+                testingConnection = false
+                switch result {
+                case .success(let response):
+                    jitLog("connection test \(response.success ? "passed" : "failed"): \(response.message)")
+                    txmPresent = response.txmPresent ?? txmPresent
+                    if !response.success { RemotePairingPortDiscovery.invalidate() }
+                    connectionTestPassed = response.success
+                    let summary = response.connection.map(JITOwnVPNAdvice.text(for:))
+                    connectionTestNote = summary.map { $0 + "\n(" + response.message + ")" } ?? response.message
+                case .failure(let failure):
+                    connectionTestPassed = false
+                    connectionTestNote = failure.localizedDescription
+                }
             }
         }
     }
@@ -617,7 +762,8 @@ final class JITSetup: ObservableObject {
     }
 }
 
-/// LocalDevVPN, the VPN StikDebug and the built-in helper reach this device through.
+/// LocalDevVPN, the VPN StikDebug and the built-in helper reach this device through (the helper unless
+/// it is set to the user's own VPN, JITConnectionMode).
 enum LocalDevVPN {
     static let appStoreURL = URL(string: "https://apps.apple.com/us/app/localdevvpn/id6755608044")!
     /// `enable` connects; `scheme` has LocalDevVPN come back to this app afterwards.
@@ -650,8 +796,8 @@ enum LocalDevVPN {
 }
 
 /// Under the JIT row of the launch page while JIT is off: what a request is doing or why it failed,
-/// the JIT method (and the built-in method's setup), LocalDevVPN's state, and "Turn on JIT when the
-/// app opens".
+/// the JIT method (and the built-in method's setup), LocalDevVPN's state (or, for the built-in helper
+/// set to the user's own VPN, whether a VPN is up), and "Turn on JIT when the app opens".
 struct JITPanel: View {
     @ObservedObject private var jit = JITSetup.shared
 
@@ -668,16 +814,27 @@ struct JITPanel: View {
                     .fixedSize(horizontal: false, vertical: true)
             }
             JITMethodRow()
-            HStack(spacing: 6) {
-                Image(systemName: jit.vpnConnected ? "checkmark.shield.fill" : "shield.slash")
-                    .foregroundStyle(jit.vpnConnected ? .green : .secondary)
-                Text(jit.vpnConnected ? L("LocalDevVPN 已连接", "LocalDevVPN connected")
-                                      : L("LocalDevVPN 未连接", "LocalDevVPN not connected"))
-                    .font(.footnote).foregroundStyle(.secondary)
-                if !jit.vpnConnected {
-                    Button(LocalDevVPN.isInstalled ? L("连接", "Connect") : L("获取", "Get")) { LocalDevVPN.open() }
-                        .font(.footnote)
-                        .disabled(jit.busy)
+            if jit.builtInUsesOwnVPN {
+                // No LocalDevVPN here: the helper goes through the user's own VPN.
+                HStack(spacing: 6) {
+                    Image(systemName: jit.ownVPNConnected ? "checkmark.shield.fill" : "shield.slash")
+                        .foregroundStyle(jit.ownVPNConnected ? .green : .secondary)
+                    Text(jit.ownVPNConnected ? L("VPN 已连接（内置 JIT 通过它连到本机）", "VPN connected (built-in JIT reaches this device through it)")
+                                             : L("没有连接 VPN：内置 JIT 要通过你的 VPN 连到本机", "No VPN connected: built-in JIT reaches this device through your VPN"))
+                        .font(.footnote).foregroundStyle(.secondary)
+                }
+            } else {
+                HStack(spacing: 6) {
+                    Image(systemName: jit.vpnConnected ? "checkmark.shield.fill" : "shield.slash")
+                        .foregroundStyle(jit.vpnConnected ? .green : .secondary)
+                    Text(jit.vpnConnected ? L("LocalDevVPN 已连接", "LocalDevVPN connected")
+                                          : L("LocalDevVPN 未连接", "LocalDevVPN not connected"))
+                        .font(.footnote).foregroundStyle(.secondary)
+                    if !jit.vpnConnected {
+                        Button(LocalDevVPN.isInstalled ? L("连接", "Connect") : L("获取", "Get")) { LocalDevVPN.open() }
+                            .font(.footnote)
+                            .disabled(jit.busy)
+                    }
                 }
             }
             Toggle(L("打开 App 时自动开启 JIT", "Turn on JIT when the app opens"), isOn: $jit.enableAtLaunch)

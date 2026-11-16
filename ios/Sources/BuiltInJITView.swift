@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 //
 // The JIT method picker, the Enable button and Built-in JIT's setup (docs/builtin-jit.md): Developer
-// Mode, pairing (on this iPhone with iOS 27, or a pairing file), LocalDevVPN, Prepare, Enable. After
+// Mode, pairing (on this iPhone with iOS 27, or a pairing file), the connection (LocalDevVPN or the
+// user's own VPN), Prepare, Enable. After
 // Henge's JITSetupView.swift (Leviidev/Henge, GPL-2.0-or-later, 7b55730), written for this app.
 import Combine
 import SwiftUI
@@ -55,10 +56,12 @@ struct JITMethodRow: View {
                      "Switches to the StikDebug app for JIT (it needs this device's pairing file).")
         case .builtIn:
             if let reason = WinBuiltInJIT.unavailableReason { return reason }
-            return jit.hasPairing
-                ? L("App 自带的调试器通过 LocalDevVPN 连到本机开启 JIT，不需要 StikDebug 和电脑。",
+            guard jit.hasPairing else { return L("还没有配对：打开设置完成一次性配对。", "Not paired yet: open the setup to pair once.") }
+            return jit.connectionMode == .ownVPN
+                ? L("App 自带的调试器通过你的 VPN 连到本机开启 JIT，不需要 StikDebug、LocalDevVPN 和电脑。",
+                    "The debugger inside the app attaches through your own VPN: no StikDebug, no LocalDevVPN, no computer.")
+                : L("App 自带的调试器通过 LocalDevVPN 连到本机开启 JIT，不需要 StikDebug 和电脑。",
                     "The debugger inside the app attaches through LocalDevVPN: no StikDebug, no computer.")
-                : L("还没有配对：打开设置完成一次性配对。", "Not paired yet: open the setup to pair once.")
         }
     }
 }
@@ -71,6 +74,8 @@ struct BuiltInJITSetupView: View {
     @State private var importing = false
     @State private var confirmRemove = false
     @State private var vpnConnected = LocalDevVPN.isConnected
+    @State private var ownVPNConnected = OwnVPN.isConnected
+    @FocusState private var addressFocused: Bool
     private let vpnTimer = Timer.publish(every: 1.5, on: .main, in: .common).autoconnect()
 
     var body: some View {
@@ -97,10 +102,14 @@ struct BuiltInJITSetupView: View {
             .confirmationDialog(L("删除配对文件？", "Remove the pairing file?"), isPresented: $confirmRemove, titleVisibility: .visible) {
                 Button(L("删除", "Remove"), role: .destructive) { jit.removePairing() }
             }
-            .onReceive(vpnTimer) { _ in vpnConnected = LocalDevVPN.isConnected }
+            .onReceive(vpnTimer) { _ in
+                vpnConnected = LocalDevVPN.isConnected
+                ownVPNConnected = OwnVPN.isConnected
+            }
             .onAppear {
                 jit.refreshPairingStatus()
                 vpnConnected = LocalDevVPN.isConnected
+                ownVPNConnected = OwnVPN.isConnected
             }
         }
     }
@@ -128,8 +137,8 @@ struct BuiltInJITSetupView: View {
         } header: {
             Text(L("状态", "Status"))
         } footer: {
-            Text(L("内置 JIT 把调试器（StikJIT）作为 App 扩展装在 Apple VM 里，通过 LocalDevVPN 连到本机，给 Apple VM 开启 JIT。不需要 StikDebug，也不需要电脑。",
-                   "Built-in JIT ships a debugger (StikJIT) inside Apple VM as an app extension. It reaches this device through LocalDevVPN and turns on JIT for Apple VM: no StikDebug app and no computer."))
+            Text(L("内置 JIT 把调试器（StikJIT）作为 App 扩展装在 Apple VM 里，通过 LocalDevVPN（或你自己的 VPN）连到本机，给 Apple VM 开启 JIT。不需要 StikDebug，也不需要电脑。",
+                   "Built-in JIT ships a debugger (StikJIT) inside Apple VM as an app extension. It reaches this device through LocalDevVPN (or your own VPN) and turns on JIT for Apple VM: no StikDebug app and no computer."))
         }
     }
 
@@ -226,24 +235,91 @@ struct BuiltInJITSetupView: View {
 
     private var vpnSection: some View {
         Section {
-            HStack(spacing: 6) {
-                Image(systemName: vpnConnected ? "checkmark.shield.fill" : "shield.slash")
-                    .foregroundStyle(vpnConnected ? .green : .secondary)
-                Text(vpnConnected ? L("LocalDevVPN 已连接", "LocalDevVPN connected")
-                                  : L("LocalDevVPN 未连接", "LocalDevVPN not connected"))
-                    .font(.footnote)
-                Spacer()
-                if !vpnConnected {
-                    Button(LocalDevVPN.isInstalled ? L("连接", "Connect") : L("获取", "Get")) { LocalDevVPN.open() }
-                        .buttonStyle(.borderless)
+            Picker(L("JIT 连接", "JIT connection"), selection: $jit.connectionMode) {
+                ForEach(JITConnectionMode.allCases) { Text($0.title).tag($0) }
+            }
+            .pickerStyle(.segmented)
+            .disabled(jit.busy || jit.helperBusy)
+            if jit.connectionMode == .localDevVPN {
+                HStack(spacing: 6) {
+                    Image(systemName: vpnConnected ? "checkmark.shield.fill" : "shield.slash")
+                        .foregroundStyle(vpnConnected ? .green : .secondary)
+                    Text(vpnConnected ? L("LocalDevVPN 已连接", "LocalDevVPN connected")
+                                      : L("LocalDevVPN 未连接", "LocalDevVPN not connected"))
+                        .font(.footnote)
+                    Spacer()
+                    if !vpnConnected {
+                        Button(LocalDevVPN.isInstalled ? L("连接", "Connect") : L("获取", "Get")) { LocalDevVPN.open() }
+                            .buttonStyle(.borderless)
+                    }
                 }
+            } else {
+                ownVPNRows
             }
         } header: {
-            Text("3. LocalDevVPN")
+            Text(L("3. 连接", "3. Connection"))
         } footer: {
-            Text(L("免费的 App Store App。调试器通过它连到本机（10.7.0.1）。只有蜂窝网络时，如果连不上，请关掉再打开蜂窝数据，或连一次 Wi-Fi。",
-                   "A free App Store app. The debugger reaches this device (10.7.0.1) through it. On cellular only, if it cannot connect, turn Cellular Data off and on again, or join a Wi-Fi once."))
+            if jit.connectionMode == .localDevVPN {
+                Text(L("免费的 App Store App。调试器通过它连到本机（10.7.0.1）。只有蜂窝网络时，如果连不上，请关掉再打开蜂窝数据，或连一次 Wi-Fi。",
+                       "A free App Store app. The debugger reaches this device (10.7.0.1) through it. On cellular only, if it cannot connect, turn Cellular Data off and on again, or join a Wi-Fi once."))
+            } else {
+                Text(L("iOS 同时只能连一个 VPN。如果你的 VPN 服务器把某个地址转回本机（“反射”，例如把第二个 IPv6 地址 NAT64 到本机的 IPv4 隧道地址），调试器就能通过它连到本机，不需要 LocalDevVPN。填 IPv4 或 IPv6 地址，方括号可有可无。服务器的设置见 docs/builtin-jit.md。",
+                       "iOS runs one VPN at a time. If your VPN's server routes an address back to this device (a reflector, for example NAT64 from a second IPv6 address to this device's IPv4 tunnel address), the debugger reaches this device through it instead of LocalDevVPN. Enter an IPv4 or IPv6 address, with or without brackets. docs/builtin-jit.md shows server setups."))
+            }
         }
+    }
+
+    /// The user's own VPN: the device address, whether a VPN is up, and Test connection.
+    @ViewBuilder private var ownVPNRows: some View {
+        TextField(L("VPN 转回本机的地址", "Address your VPN routes back here"), text: $jit.vpnAddressText)
+            .font(.body.monospaced())
+            .keyboardType(.asciiCapable)
+            .textInputAutocapitalization(.never)
+            .autocorrectionDisabled()
+            .submitLabel(.done)
+            .focused($addressFocused)
+            .disabled(jit.busy || jit.helperBusy)
+            .onSubmit(normalizeAddress)
+            .onChange(of: addressFocused) { _, focused in if !focused { normalizeAddress() } }
+        if !jit.vpnAddressText.trimmingCharacters(in: .whitespaces).isEmpty && jit.vpnDeviceAddress == nil {
+            Text(L("不是有效的 IPv4 或 IPv6 地址（只填地址，不要端口或主机名）。",
+                   "Not a valid IPv4 or IPv6 address (the address only: no port, no host name)."))
+                .font(.footnote).foregroundStyle(.red)
+        }
+        HStack(spacing: 6) {
+            Image(systemName: ownVPNConnected ? "checkmark.shield.fill" : "shield.slash")
+                .foregroundStyle(ownVPNConnected ? .green : .secondary)
+            Text(ownVPNConnected ? L("有 VPN 已连接", "A VPN is connected")
+                                 : L("没有连接 VPN", "No VPN connected"))
+                .font(.footnote)
+        }
+        if vpnConnected {
+            Text(L("LocalDevVPN 正连着：iOS 同时只能连一个 VPN，请改连你自己的 VPN。",
+                   "LocalDevVPN is connected: iOS runs one VPN at a time, so connect your own VPN instead."))
+                .font(.footnote).foregroundStyle(.orange)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+        Button(L("测试连接", "Test connection"), systemImage: "network") {
+            normalizeAddress()
+            jit.testConnection()
+        }
+        .disabled(jit.vpnDeviceAddress == nil || jit.helperBusy || jit.busy || !WinBuiltInJIT.isAvailable)
+        if jit.testingConnection {
+            HStack(spacing: 8) {
+                ProgressView()
+                Text(jit.connectionTestNote ?? "").font(.footnote).foregroundStyle(.secondary)
+            }
+        } else if let note = jit.connectionTestNote {
+            Label(note, systemImage: jit.connectionTestPassed == true ? "checkmark.circle.fill" : "exclamationmark.triangle")
+                .font(.footnote)
+                .foregroundStyle(jit.connectionTestPassed == true ? .green : .secondary)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+    }
+
+    /// The address as the helper gets it: no brackets, canonical form. Left as typed while invalid.
+    private func normalizeAddress() {
+        if let address = jit.vpnDeviceAddress, address != jit.vpnAddressText { jit.vpnAddressText = address }
     }
 
     private var prepareSection: some View {
@@ -252,7 +328,7 @@ struct BuiltInJITSetupView: View {
                 jit.prepareBuiltIn()
             }
             .disabled(!jit.hasPairing || jit.helperBusy || jit.busy || !WinBuiltInJIT.isAvailable)
-            if jit.helperBusy {
+            if jit.helperBusy && !jit.testingConnection {
                 HStack(spacing: 8) { ProgressView(); Text(jit.helperNote ?? "").font(.footnote).foregroundStyle(.secondary) }
             } else if let note = jit.helperNote {
                 Label(note, systemImage: jit.prepared ? "checkmark.circle.fill" : "info.circle")
