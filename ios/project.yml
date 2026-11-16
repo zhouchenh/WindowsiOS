@@ -143,6 +143,9 @@ targets:
           mkdir -p "$(dirname "$DST")"
           ditto "$SRC" "$DST"
           rm -rf "$DST/Headers" "$DST/Modules" "$DST/_CodeSignature"
+          # StikJIT's bundled JIT scripts are not under its MPL-2.0 (its README: they keep their own licences)
+          # and are never used: the helper always runs henge-jit.js (.customBase64, forceScript).
+          rm -f "$DST/universal.js" "$DST/legacy.js"
           PLIST="$DST/Info.plist"
           if [ ! -f "$PLIST" ]; then
             plutil -create xml1 "$PLIST"

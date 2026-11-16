@@ -184,6 +184,8 @@ XA="$X/PlugIns/WinJITHelper.appex"
 XF="$X/Frameworks/StikJIT.framework"
 [ -d "$XA" ] || fail "PlugIns/WinJITHelper.appex (Built-in JIT helper) missing"
 [ -f "$XF/StikJIT" ] && [ -f "$XF/Info.plist" ] || fail "Frameworks/StikJIT.framework (binary and Info.plist) missing"
+[ ! -e "$XF/universal.js" ] && [ ! -e "$XF/legacy.js" ] ||
+    fail "Frameworks/StikJIT.framework still has StikJIT's universal.js / legacy.js (not under StikJIT's MPL-2.0, unused)"
 HBID="$(/usr/libexec/PlistBuddy -c "Print :CFBundleIdentifier" "$XA/Info.plist" 2>/dev/null)" ||
     fail "WinJITHelper.appex has no CFBundleIdentifier"
 [ "$HBID" = "$BUNDLE_ID.JITHelper" ] || fail "JIT helper bundle id is $HBID, expected $BUNDLE_ID.JITHelper"

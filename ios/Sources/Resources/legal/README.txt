@@ -23,7 +23,9 @@ Built-in JIT ships two third-party components inside this app:
    repository as ios/patches/stikjit-high-address.patch; taken from Henge,
    https://github.com/Leviidev/Henge, ci/stikjit-high-address.patch). The source code of
    StikJIT is available at the address above; scripts/build_jit_deps.sh in the Apple VM
-   repository rebuilds the framework from it with the patch.
+   repository rebuilds the framework from it with the patch. The JIT scripts StikJIT bundles
+   (universal.js, legacy.js: StikDebug's, under their own licences, not StikJIT's MPL-2.0) are
+   removed from the framework in this app; they are never used.
    StikJIT contains idevice by Jackson Coxson (https://github.com/jkcoxson/idevice), MIT
    licence, see LICENSE-idevice-MIT.txt, as the prebuilt idevice/libidevice_ffi.a in StikJIT's
    repository, with the Rust crates idevice is built on (tokio, rustls, AWS-LC through
@@ -40,3 +42,8 @@ Built-in JIT ships two third-party components inside this app:
 
 The Swift code of Built-in JIT (the helper extension, the pairing and the setup) is ported
 from Henge (commit 7b55730) and Husk, both GPL-2.0-or-later.
+
+The JIT script henge-jit.js (in the app, run by the built-in helper or by StikDebug) is
+StikDebug's universal.js (https://github.com/StephenDev0/StikDebug, StikDebug/Scripts/
+universal.js) as adapted by Henge. That file has no licence header of its own; the StikDebug
+repository is under the GNU Affero General Public License, version 3.
