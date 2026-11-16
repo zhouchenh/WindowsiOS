@@ -63,6 +63,13 @@ struct ClipboardSettingsSection: View {
             TimelineView(.periodic(from: .now, by: 2)) { _ in
                 LabeledContent(L("Windows 里的剪贴板小助手", "Clipboard helper in Windows"), value: helperText)
             }
+            // The session's toast is under this sheet: what Check or the paste button here found shows here.
+            if let notice = sync.notice {
+                Label(notice.text, systemImage: notice.symbol)
+                    .font(.footnote)
+                    .foregroundStyle(.secondary)
+                    .id(notice.id)
+            }
         } header: {
             Text(L("剪贴板", "Clipboard"))
         } footer: {
@@ -90,11 +97,13 @@ struct ClipboardSettingsSection: View {
 }
 
 extension View {
-    /// Starts the clipboard sync and shows its short confirmations at the bottom of this view.
-    func clipboardSync() -> some View { modifier(ClipboardSyncModifier()) }
+    /// Starts the clipboard sync and shows its short confirmations at the bottom of this view. windows:
+    /// whether the machine is Windows; for any other, the iPhone's clipboard is left alone.
+    func clipboardSync(windows: Bool) -> some View { modifier(ClipboardSyncModifier(windows: windows)) }
 }
 
 private struct ClipboardSyncModifier: ViewModifier {
+    let windows: Bool
     @ObservedObject private var sync = ClipboardSync.shared
 
     func body(content: Content) -> some View {
@@ -117,6 +126,10 @@ private struct ClipboardSyncModifier: ViewModifier {
                 }
             }
             .animation(.snappy(duration: 0.25), value: sync.toast)
-            .onAppear { sync.start() }
+            .onAppear {
+                sync.forWindows = windows
+                sync.start()
+            }
+            .onChange(of: windows) { _, now in sync.forWindows = now }
     }
 }

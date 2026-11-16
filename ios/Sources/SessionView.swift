@@ -64,7 +64,7 @@ struct SessionView: View {
         .persistentSystemOverlays(chrome.hidesSystemUI ? .hidden : .automatic)
         .defersSystemGestures(on: chrome.hidesSystemUI ? .all : (vm.isVMRunning ? .bottom : []))
         .onOpenURL { JITSetup.shared.handleOpenURL($0) } // app-jit hook
-        .clipboardSync() // clipboard hook
+        .clipboardSync(windows: !vm.isLinux) // clipboard hook
         .onAppear {
             WinIOSBridge.shared.updateScreenSize(UIScreen.main.bounds.size, scale: UIScreen.main.scale)
             chrome.updateSessionActive(sessionActive)
