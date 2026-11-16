@@ -16,7 +16,7 @@ DEV = $(B)/acpi.o $(B)/fb_display.o $(B)/fb_metal.o $(B)/fdt.o $(B)/fw_cfg.o $(B
       $(B)/virtio.o $(B)/virtio_blk.o $(B)/virtio_input.o $(B)/virtio_net.o $(B)/virtio_snd.o $(B)/virtio_gpu.o $(B)/virtio_gpu3d.o \
       $(B)/winvirt.o $(B)/xhci.o
 
-VM_HOST = $(B)/winvm.o $(B)/net_slirp.o $(B)/share.o $(B)/audio_mac.o $(B)/hvsparse.o
+VM_HOST = $(B)/winvm.o $(B)/net_slirp.o $(B)/dns_proxy.o $(B)/share.o $(B)/audio_mac.o $(B)/hvsparse.o
 
 MAC_FRAMEWORKS = -framework Cocoa -framework Foundation -framework QuartzCore -framework Metal \
                  -framework CoreGraphics -framework ImageIO -framework UniformTypeIdentifiers \
@@ -57,6 +57,12 @@ $(B)/test_operands: tests/test_operands.c tests/operand_cases.s $(B)/operands.o
 $(B)/test_mmu: tests/test_mmu.c $(ENGINE)
 	$(CC) $(CFLAGS) tests/test_mmu.c $(ENGINE) -o $@
 
+# Guest DNS proxy against a stand-in resolver (no network needed).
+$(B)/test_dns_lifecycle: tests/test_dns_lifecycle.c $(B)/dns_proxy.o
+	$(CC) $(CFLAGS) $^ -o $@
+test-dns: $(B)/test_dns_lifecycle
+	$(B)/test_dns_lifecycle
+
 $(B)/hvsparse: tools/hvsparse_main.c host/hvsparse.c host/hvsparse.h | $(B)
 	$(CC) $(CFLAGS) tools/hvsparse_main.c host/hvsparse.c -o $@
 
@@ -78,7 +84,7 @@ IOS_OBJCFLAGS = -fobjc-arc -Wall -Wextra -O2 -g -Icore -Ihost -Idevices
 IB = build/ios
 
 IOS_C_SRC = $(wildcard core/*.c) \
-            host/jit_region.c host/disk.c host/winvm.c host/net_slirp.c host/share.c \
+            host/jit_region.c host/disk.c host/winvm.c host/net_slirp.c host/dns_proxy.c host/share.c \
             host/audio_mac.c host/hvsparse.c host/prof_ios.c \
             $(wildcard devices/*.c)
 IOS_OBJ = $(patsubst %.c,$(IB)/%.o,$(IOS_C_SRC)) $(IB)/host/enter.o $(IB)/devices/fb_metal.o
@@ -104,4 +110,4 @@ ios-lib: $(IB)/libwinvm.a
 clean:
 	rm -rf $(B)
 
-.PHONY: all test-core ios-lib clean
+.PHONY: all test-core test-dns ios-lib clean
