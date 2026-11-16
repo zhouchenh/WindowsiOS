@@ -56,6 +56,10 @@ when something is missing).
      [StikDebug pairing-file guide](https://github.com/StikDebug/StikDebug-Guide/blob/main/pairing_file.md).
      Tap **Import pairing file…**, or copy it with Finder or the Files app to
      `Apple VM/StikJIT/pairingFile.plist`.
+   - **Already paired StikDebug?** Its pairing works for Apple VM too: tap **Import pairing
+     file…**, then **Browse › On My iPhone › StikDebug › pairingFile.plist**. StikDebug keeps
+     working; both use the same pairing. (In the file picker, Browse is quicker than Recents,
+     which can take a long time to load on cellular.)
 
    The pairing file stays in Apple VM's Documents and is only ever passed to its own helper. Each
    new pairing with Apple VM replaces the previous one on the device (pairings of StikDebug, Henge

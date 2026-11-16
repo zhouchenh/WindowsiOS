@@ -734,6 +734,9 @@ final class JITSetup: ObservableObject {
         do {
             try JITPairingFileStore.importFile(from: url)
             OnDevicePairing.shared.cancel()
+            // A failure left by an earlier on-device attempt no longer applies (cancel() keeps it when
+            // no attempt is running).
+            OnDevicePairing.shared.reset()
             pairingDidChange()
             helperNote = L("配对文件已导入。", "Pairing file imported.")
             jitLog("pairing file imported")

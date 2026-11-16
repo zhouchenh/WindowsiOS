@@ -172,10 +172,10 @@ struct BuiltInJITSetupView: View {
             Text(L("2. 配对（一次）", "2. Pair (once)"))
         } footer: {
             Text(OnDevicePairing.isSupported
-                 ? L("iOS 27 可以直接在本机配对：点“在本机配对”，然后去 设置 › 隐私与安全性 › 开发者模式，点“与 Apple VM 配对”，输入这里显示的配对码。需要 Wi-Fi 和“本地网络”权限。也可以导入在电脑上生成的配对文件（RPPairing plist），或通过“文件”App放到 Apple VM/StikJIT/pairingFile.plist。",
-                     "iOS 27 pairs on the device itself: tap Pair on this iPhone, then in Settings › Privacy & Security › Developer Mode tap Pair with Apple VM and type the code shown here. Needs Wi-Fi and Local Network access. You can also import a pairing file (RPPairing plist) made on a computer, or put it in Apple VM/StikJIT/pairingFile.plist with the Files app.")
-                 : L("这个 iOS 版本不能在本机配对（需要 iOS 27）。请在电脑上生成配对文件（RPPairing plist）后导入，或通过“文件”App放到 Apple VM/StikJIT/pairingFile.plist。",
-                     "This iOS cannot pair on the device (that needs iOS 27). Make a pairing file (RPPairing plist) on a computer and import it, or put it in Apple VM/StikJIT/pairingFile.plist with the Files app."))
+                 ? L("已经在用 StikDebug？直接导入它的配对文件：浏览 › 我的 iPhone › StikDebug › pairingFile.plist。iOS 27 也可以直接在本机配对：点“在本机配对”，然后去 设置 › 隐私与安全性 › 开发者模式，点“与 Apple VM 配对”，输入这里显示的配对码。需要 Wi-Fi 和“本地网络”权限。也可以导入在电脑上生成的配对文件（RPPairing plist），或通过“文件”App放到 Apple VM/StikJIT/pairingFile.plist。",
+                     "Already use StikDebug? Import its pairing file: Browse › On My iPhone › StikDebug › pairingFile.plist. iOS 27 can also pair on the device itself: tap Pair on this iPhone, then in Settings › Privacy & Security › Developer Mode tap Pair with Apple VM and type the code shown here. Needs Wi-Fi and Local Network access. You can also import a pairing file (RPPairing plist) made on a computer, or put it in Apple VM/StikJIT/pairingFile.plist with the Files app.")
+                 : L("已经在用 StikDebug？直接导入它的配对文件：浏览 › 我的 iPhone › StikDebug › pairingFile.plist。这个 iOS 版本不能在本机配对（需要 iOS 27）。请在电脑上生成配对文件（RPPairing plist）后导入，或通过“文件”App放到 Apple VM/StikJIT/pairingFile.plist。",
+                     "Already use StikDebug? Import its pairing file: Browse › On My iPhone › StikDebug › pairingFile.plist. This iOS cannot pair on the device (that needs iOS 27). Make a pairing file (RPPairing plist) on a computer and import it, or put it in Apple VM/StikJIT/pairingFile.plist with the Files app."))
         }
     }
 
