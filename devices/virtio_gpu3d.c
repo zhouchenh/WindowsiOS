@@ -200,6 +200,8 @@ struct HvVgpu3d {
     /* worker only */
     Parked *fenceq;
     uint32_t nparked_global;
+    uint32_t ctx_capset[64];              /* capset each context was created with, by ctx_id (logging) */
+    uint64_t fenced_ring, fenced_global; /* fenced commands by timeline */
     Res3d res[MAX_RES3D];
     uint32_t capsets[8], ncapsets;
     uint32_t scanout_res;
@@ -217,7 +219,7 @@ struct HvVgpu3d {
     uint64_t win_pa;
 
     /* stats */
-    uint64_t cmds, submits, submit_bytes, fences, maps, blobs, ctxs, errors;
+    uint64_t cmds, submits, submit_bytes, fences, maps, blobs, ctxs, errors, submit_errors;
     int init_ok;
     char why[160];
 
@@ -781,14 +783,31 @@ static uint32_t process(HvVgpu3d *s, const HvVirtqElem *e, const Hdr *h, uint32_
         int rc = init ? V.virgl_renderer_context_create_with_flags(h->ctx_id, init, nlen, name)
                       : V.virgl_renderer_context_create(h->ctx_id, nlen, name);
         s->ctxs++;
+        if (h->ctx_id < 64) s->ctx_capset[h->ctx_id] = init & 0xff;
         LOG("ctx %u create capset %u '%s' -> %d\n", h->ctx_id, init & 0xff, name, rc);
         if (rc) WARN("context %u (capset %u '%s') could not be created: %d (errno %d %s)\n", h->ctx_id, init & 0xff, name, rc, errno, strerror(errno));
         return rc ? RESP_ERR_UNSPEC : 0;
     }
-    case CMD_CTX_DESTROY:
-        LOG("ctx %u destroy\n", h->ctx_id);
+    case CMD_CTX_DESTROY: {
+        /* Its rings go with it: a ring fence still parked on it would never be written, and its
+           request (the guest's buffer) would never come back. */
+        int n = 0;
+        for (Parked **pp = &s->fenceq; *pp;) {
+            Parked *p = *pp;
+            if ((p->h.flags & FLAG_RING_IDX) && p->h.ctx_id == h->ctx_id) {
+                *pp = p->next;
+                respond(s, &p->e, &p->h, p->epoch, RESP_OK_NODATA, NULL, 0);
+                s->fences++;
+                free(p);
+                n++;
+            } else {
+                pp = &p->next;
+            }
+        }
+        LOG("ctx %u destroy (%d ring fences still parked on it answered)\n", h->ctx_id, n);
         V.virgl_renderer_context_destroy(h->ctx_id);
         return 0;
+    }
     case CMD_CTX_ATTACH_RESOURCE:
     case CMD_CTX_DETACH_RESOURCE: {
         uint32_t id;
@@ -911,8 +930,12 @@ static uint32_t process(HvVgpu3d *s, const HvVirtqElem *e, const Hdr *h, uint32_
             for (uint32_t i = 0; i < size / 4 && i < 14; i++) n += snprintf(line + n, sizeof line - (size_t)n, " %x", w[i]);
             LOG("submit ctx %u %u bytes:%s\n", h->ctx_id, size, line);
         }
-        V.virgl_renderer_submit_cmd(buf, (int)h->ctx_id, (int)(size / 4));
+        int rc = V.virgl_renderer_submit_cmd(buf, (int)h->ctx_id, (int)(size / 4));
         free(buf);
+        if (rc) { /* answered as before (QEMU does not fail it either), but no longer silently */
+            s->submit_errors++;
+            if (s->submit_errors <= 20) WARN("submit ctx %u (%u bytes) failed: %d\n", h->ctx_id, size, rc);
+        }
         return 0;
     }
     case CMD_GET_CAPSET_INFO: {
@@ -1257,13 +1280,24 @@ static void *worker(void *arg) {
             }
             /* fenced: answered when the renderer retires it */
             if (p->h.flags & FLAG_RING_IDX) {
-                if (V.virgl_renderer_context_create_fence(p->h.ctx_id, VIRGL_RENDERER_FENCE_FLAG_MERGEABLE,
-                                                          p->h.ring_idx, p->h.fence_id) != 0) {
+                s->fenced_ring++;
+                int rc = V.virgl_renderer_context_create_fence(p->h.ctx_id, VIRGL_RENDERER_FENCE_FLAG_MERGEABLE,
+                                                               p->h.ring_idx, p->h.fence_id);
+                if (rc != 0) {
+                    s->errors++;
+                    if (s->errors <= 50) WARN("ctx %u ring %u fence %llu: create_fence failed %d\n", p->h.ctx_id,
+                                              p->h.ring_idx, (unsigned long long)p->h.fence_id, rc);
                     respond(s, &p->e, &p->h, epoch, RESP_OK_NODATA, NULL, 0); /* dead context: never retires */
                     free(p);
                     continue;
                 }
             } else {
+                /* A global fence waits only for vrend's (ctx 0) GL work, not for the commands' own context:
+                   log which contexts (capsets) send them, to tell whether a Neptune context ever does. */
+                s->fenced_global++;
+                if (s->fenced_global <= 20)
+                    LOG("global fence %llu: cmd %#x ctx %u (capset %u)\n", (unsigned long long)p->h.fence_id,
+                        p->h.type, p->h.ctx_id, p->h.ctx_id < 64 ? s->ctx_capset[p->h.ctx_id] : 0);
                 V.virgl_renderer_create_fence((int)p->h.fence_id, p->h.type);
                 s->nparked_global++;
             }
@@ -1382,12 +1416,14 @@ int hv_vgpu3d_describe(HvVgpu3d *s, char *buf, unsigned len) {
     if (!s) return snprintf(buf, len, "off");
     if (s->init_ok < 0) return snprintf(buf, len, "unavailable (%s)", s->why);
     return snprintf(buf, len,
-                    "on capsets=%u ctxs=%llu cmds=%llu submits=%llu (%lluKB) blobs=%llu maps=%llu fences=%llu errors=%llu "
-                    "scanout=%u %ux%u%s hostmem@%#llx",
+                    "on capsets=%u ctxs=%llu cmds=%llu submits=%llu (%lluKB) blobs=%llu maps=%llu fences=%llu "
+                    "(ring %llu global %llu) errors=%llu submit_errors=%llu scanout=%u %ux%u%s hostmem@%#llx",
                     s->ncapsets, (unsigned long long)s->ctxs, (unsigned long long)s->cmds,
                     (unsigned long long)s->submits, (unsigned long long)(s->submit_bytes >> 10),
                     (unsigned long long)s->blobs, (unsigned long long)s->maps, (unsigned long long)s->fences,
-                    (unsigned long long)s->errors, s->scanout_res, s->sc_w, s->sc_h,
+                    (unsigned long long)s->fenced_ring, (unsigned long long)s->fenced_global,
+                    (unsigned long long)s->errors, (unsigned long long)s->submit_errors, s->scanout_res, s->sc_w,
+                    s->sc_h,
                     s->scanout_handle || (s->g && s->g->fb && s->g->fb->ovr_tex) ? " metal" : "",
                     (unsigned long long)s->win_pa);
 }
