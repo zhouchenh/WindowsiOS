@@ -267,6 +267,8 @@ typedef struct Applied { /* what is open for a rule: network thread only */
 
 typedef struct Rule {
     int used, removed, session;
+    int load_off;    /* saved as on, off for now: its port was taken when the store was loaded (still saved as on) */
+    char blocked[160];
     int dirty;       /* changed since the network thread last looked */
     int reopen;      /* close and open again (hv_net_fwd_reopen) */
     uint64_t serial; /* which use of the slot */
@@ -287,6 +289,10 @@ static char store_path[1024];
 static uint64_t store_seq;
 static pthread_mutex_t save_mu = PTHREAD_MUTEX_INITIALIZER;
 static uint64_t saved_seq;
+/* Saved forwards of the store that found no free slot when it was loaded: not in the table, but written back
+   with the rest, so a full table never shortens the file. fwd_mu. */
+static HvFwdRule kept_out[MAX_RULES];
+static int nkept_out;
 
 static void wake_net(void) {
     if (wake_pipe[1] > 0) {
@@ -956,7 +962,24 @@ static void free_rule(Rule *r) {
     memset(r, 0, sizeof *r);
 }
 
-/* fwd_mu held. The saved rules as the file's JSON. */
+static void store_rule_json(Buf *b, const HvFwdRule *c, int enabled, int first) {
+    bstr(b, first ? "\n    {\"id\": " : ",\n    {\"id\": ");
+    bjson(b, c->id);
+    bstr(b, ", \"name\": ");
+    bjson(b, c->name);
+    bstr(b, ", \"protocol\": ");
+    bjson(b, proto_name(c->proto));
+    bstr(b, ", \"hostPort\": ");
+    bint(b, c->host_port);
+    bstr(b, ", \"guestPort\": ");
+    bint(b, c->guest_port);
+    bstr(b, ", \"scope\": ");
+    bjson(b, scope_name(c->scope));
+    bstr(b, enabled ? ", \"enabled\": true}" : ", \"enabled\": false}");
+}
+
+/* fwd_mu held. The saved rules as the file's JSON: as the user saved them. One turned off only for now
+   (load_off) is written as on, and those left out for want of a slot are written too. */
 static char *store_json_locked(void) {
     Buf b = {0};
     bstr(&b, "{\n  \"version\": 1,\n  \"rules\": [");
@@ -964,19 +987,12 @@ static char *store_json_locked(void) {
     for (int i = 0; i < MAX_RULES; i++) {
         Rule *r = &rules[i];
         if (!r->used || r->removed || r->session) continue;
-        bstr(&b, first ? "\n    {\"id\": " : ",\n    {\"id\": ");
-        bjson(&b, r->cfg.id);
-        bstr(&b, ", \"name\": ");
-        bjson(&b, r->cfg.name);
-        bstr(&b, ", \"protocol\": ");
-        bjson(&b, proto_name(r->cfg.proto));
-        bstr(&b, ", \"hostPort\": ");
-        bint(&b, r->cfg.host_port);
-        bstr(&b, ", \"guestPort\": ");
-        bint(&b, r->cfg.guest_port);
-        bstr(&b, ", \"scope\": ");
-        bjson(&b, scope_name(r->cfg.scope));
-        bstr(&b, r->cfg.enabled ? ", \"enabled\": true}" : ", \"enabled\": false}");
+        store_rule_json(&b, &r->cfg, r->cfg.enabled || r->load_off, first);
+        first = 0;
+    }
+    for (int i = 0; i < nkept_out; i++) {
+        if (find_rule(kept_out[i].id)) continue; /* added again since */
+        store_rule_json(&b, &kept_out[i], kept_out[i].enabled, first);
         first = 0;
     }
     bstr(&b, first ? "]\n}\n" : "\n  ]\n}\n");
@@ -1063,6 +1079,8 @@ static int put_locked(HvFwdRule *in, int session, int from_guest, char *err, siz
     }
     same->cfg = c;
     same->session = session;
+    same->load_off = 0; /* set as asked now */
+    same->blocked[0] = 0;
     same->dirty = 1;
     *in = c;
     fwd_changed_locked();
@@ -1208,21 +1226,54 @@ int hv_net_fwd_set_store(const char *path) {
         nloaded = 0;
     }
 
+    /* The machine's saved forwards come first. The former store's go, and a session forward (one the guest
+       asked for, or one left from a machine that ran before in this process) on the port of an enabled saved
+       one gives way. While the network thread runs, removed slots are only free once it has closed their
+       listeners: it is given the chance before the saved forwards are added. */
     pthread_mutex_lock(&fwd_mu);
     snprintf(store_path, sizeof store_path, "%s", path);
+    nkept_out = 0;
     for (int i = 0; i < MAX_RULES; i++)
         if (rules[i].used && !rules[i].removed && !rules[i].session) remove_locked(&rules[i]);
+    for (int i = 0; i < nloaded; i++) {
+        if (!loaded[i].enabled) continue;
+        for (int k = 0; k < MAX_RULES; k++) {
+            Rule *o = &rules[k];
+            if (!o->used || o->removed || !o->session || !o->cfg.enabled) continue;
+            if (o->cfg.host_port != loaded[i].host_port || !(o->cfg.proto & loaded[i].proto)) continue;
+            fprintf(stderr, "winvm: net: session forward \"%s\" gives way to the saved \"%s\" (port %d)\n", o->cfg.name,
+                    loaded[i].name, o->cfg.host_port);
+            remove_locked(o);
+        }
+    }
+    int running = net_running;
+    fwd_changed_locked();
+    pthread_mutex_unlock(&fwd_mu);
+    if (running) {
+        wake_net();
+        hv_net_fwd_sync(1000);
+    }
+
+    pthread_mutex_lock(&fwd_mu);
     int skipped = 0;
     for (int i = 0; i < nloaded; i++) {
         char err[160];
         if (!loaded[i].id[0]) snprintf(loaded[i].id, sizeof loaded[i].id, "fwd-loaded-%d", i);
         if (put_locked(&loaded[i], 0, 0, err, sizeof err) == 0) continue;
-        if (loaded[i].enabled) { /* its port is taken by one before it: kept, but off */
+        if (loaded[i].enabled) { /* its port is taken by a saved one before it: off for now, still saved as on */
             loaded[i].enabled = 0;
-            fprintf(stderr, "winvm: net: saved forward \"%s\" turned off: %s\n", loaded[i].name, err);
-            if (put_locked(&loaded[i], 0, 0, err, sizeof err) == 0) continue;
+            char why[160];
+            snprintf(why, sizeof why, "%s", err);
+            if (put_locked(&loaded[i], 0, 0, err, sizeof err) == 0) {
+                Rule *r = find_rule(loaded[i].id);
+                if (r) r->load_off = 1, snprintf(r->blocked, sizeof r->blocked, "%s", why);
+                fprintf(stderr, "winvm: net: saved forward \"%s\" off for now: %s\n", loaded[i].name, why);
+                continue;
+            }
+            loaded[i].enabled = 1;
         }
-        fprintf(stderr, "winvm: net: saved forward \"%s\" left out: %s\n", loaded[i].name, err);
+        fprintf(stderr, "winvm: net: saved forward \"%s\" not loaded (kept in the file): %s\n", loaded[i].name, err);
+        if (nkept_out < MAX_RULES) kept_out[nkept_out++] = loaded[i];
         skipped++;
     }
     fwd_changed_locked();
@@ -1299,9 +1350,9 @@ char *hv_net_fwd_list_json(void) {
         bjson(&b, state);
         int live = r->cfg.enabled && net_running;
         bstr(&b, ",\"code\":");
-        bjson(&b, live ? r->code : "");
+        bjson(&b, live ? r->code : r->load_off ? "blocked" : "");
         bstr(&b, ",\"message\":");
-        bjson(&b, live ? r->msg : "");
+        bjson(&b, live ? r->msg : r->load_off ? r->blocked : "");
         bstr(&b, ",\"warning\":");
         bjson(&b, live ? r->warn : "");
         bstr(&b, ",\"listen\":[");

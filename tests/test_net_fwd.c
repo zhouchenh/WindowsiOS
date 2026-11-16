@@ -668,6 +668,64 @@ static int scenario_utf8(void) {
     return failures != 0;
 }
 
+/* A store with n enabled TCP forwards f0.. on ports from base (and, if dup, a second one on base's port). */
+static void write_store(const char *path, int n, int base, int dup) {
+    FILE *f = fopen(path, "w");
+    fprintf(f, "{\"version\": 1, \"rules\": [");
+    for (int i = 0; i < n; i++)
+        fprintf(f, "%s{\"id\": \"f%d\", \"name\": \"F%d\", \"protocol\": \"tcp\", \"hostPort\": %d, \"guestPort\": 7, "
+                   "\"scope\": \"loopback\", \"enabled\": true}", i ? ", " : "", i, i, base + i);
+    if (dup)
+        fprintf(f, ", {\"id\": \"twin\", \"name\": \"Twin\", \"protocol\": \"tcp\", \"hostPort\": %d, \"guestPort\": 8, "
+                   "\"scope\": \"loopback\", \"enabled\": true}", base);
+    fprintf(f, "]}\n");
+    fclose(f);
+}
+static int count(const char *text, const char *what) {
+    int n = 0;
+    for (const char *p = text; p && (p = strstr(p, what)); p += strlen(what)) n++;
+    return n;
+}
+
+/* Loading a machine's store while session forwards (the guest's, or another machine's) hold ports and slots:
+   the saved forwards win, and nothing the user saved is turned off or dropped in the file. */
+static int scenario_store_priority(void) {
+    char path[512], err[160];
+    unsetenv("HV_NET_FWD");
+    /* the guest holds port base on this device; the machine's saved forward wants it */
+    int base = 41000 + (int)(getpid() % 500) * 40;
+    HvFwdRule g = rule("", HV_FWD_TCP, base, 7, HV_FWD_LOOPBACK);
+    check("priority: guest forward", hv_net_fwd_put(&g, HV_FWD_GUEST, err, sizeof err) == 0);
+    store_file(path, sizeof path, "prio.json");
+    write_store(path, 3, base, 1);
+    check("priority: store loads", hv_net_fwd_set_store(path) == 0);
+    check("priority: the saved forward wins its port", has("f0", "\"enabled\":true"));
+    check("priority: the guest's forward gave way", !has(g.id, "\"id\""));
+    check("priority: a saved twin on the same port is off for now", has("twin", "\"enabled\":false") &&
+                                                                     has("twin", "\"code\":\"blocked\""));
+    put(rule("new", HV_FWD_TCP, base + 30, 7, HV_FWD_LOOPBACK)); /* writes the file */
+    const char *text = read_file(path);
+    check("priority: the file keeps the twin on", text && strstr(text, "\"id\": \"twin\"") &&
+                                                      count(text, "\"enabled\": false") == 0);
+    /* full: 32 session forwards and a store of 40 */
+    for (int i = 0; i < 32; i++) {
+        HvFwdRule s = rule("", HV_FWD_TCP, base - 100 - i, 7, HV_FWD_LOOPBACK);
+        hv_net_fwd_put(&s, HV_FWD_GUEST, err, sizeof err);
+    }
+    char full[512];
+    store_file(full, sizeof full, "full.json");
+    write_store(full, 40, base + 200, 0);
+    check("priority: full store loads", hv_net_fwd_set_store(full) == 0);
+    check("priority: some saved forwards had no slot", !has("f39", "\"id\""));
+    check("priority: remove one", hv_net_fwd_remove("f0", 0) == 0); /* writes the file */
+    text = read_file(full);
+    check("priority: the file keeps every other saved forward", text && count(text, "\"id\": \"f") == 39 &&
+                                                                    strstr(text, "\"id\": \"f39\"") && !strstr(text, "\"id\": \"f0\""));
+    printf("fwd (store priority): %d failures\n", failures);
+    fflush(stdout);
+    return failures != 0;
+}
+
 static int scenario_bad_store(void) {
     char path[512], moved[600];
     store_file(path, sizeof path, "bad.json");
@@ -726,8 +784,8 @@ int main(void) {
     const char *tmp = getenv("TMPDIR");
     snprintf(dir, sizeof dir, "%s/test_net_fwd.XXXXXX", tmp && *tmp ? tmp : "/tmp");
     if (!mkdtemp(dir)) return 2;
-    int (*scenarios[])(void) = {scenario_rules, scenario_bad_store, scenario_rules_off, scenario_utf8};
-    const char *names[] = {"rules", "damaged store", "HV_NET_FWD_RULES=0", "UTF-8 names"};
+    int (*scenarios[])(void) = {scenario_rules, scenario_bad_store, scenario_rules_off, scenario_utf8, scenario_store_priority};
+    const char *names[] = {"rules", "damaged store", "HV_NET_FWD_RULES=0", "UTF-8 names", "store priority"};
     int bad = 0;
     for (int i = 0; i < (int)(sizeof scenarios / sizeof *scenarios); i++) {
         fflush(stdout);

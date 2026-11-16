@@ -419,8 +419,13 @@ private struct PortForwardRow: View {
             let at = rule.listen.joined(separator: ", ")
             return L("正在监听", "Listening") + (at.isEmpty ? "" : " · " + at)
         case "waiting": return L("Windows 启动后打开", "Opens when Windows starts")
-        case "off": return rule.code == "env_off" ? L("已关闭（env.txt 里 HV_NET_FWD_RULES=0）", "Off (HV_NET_FWD_RULES=0 in env.txt)")
-                                                  : L("已关闭", "Off")
+        case "off":
+            switch rule.code {
+            case "env_off": return L("已关闭（env.txt 里 HV_NET_FWD_RULES=0）", "Off (HV_NET_FWD_RULES=0 in env.txt)")
+            case "blocked": return L("暂时关闭：端口 \(rule.hostPort) 已被另一个转发占用。仍保存为打开。",
+                                     "Off for now: port \(rule.hostPort) is taken by another forward. Still saved as on.")
+            default: return L("已关闭", "Off")
+            }
         case "error":
             switch rule.code {
             case "in_use":
