@@ -498,23 +498,13 @@ static BOOL winios_plans_equal(WinIOSDisplayPlan a, WinIOSDisplayPlan b) {
     if (!plan.modeWidth) return;
     if (_displayImmersive && _immersiveKeeps && _committedPlan.modeWidth && !plan.legacy) {
         /* immersive, keeping the resolution: no re-mode; the presenter fits the picture to the panel */
-        if (_hasPending) {
-            _gpuPrefToken++;
-            _hasPending = NO;
-            _reshapeAnnounced = NO;
-            if (_reshapeState == WinIOSReshapeStateIdle) hv_fb_metal_hold_for_size(0, 0, 0);
-            [self postDisplayStateChanged];
-        }
+        if (_hasPending) [self dropPendingPlan];
         return;
     }
     if (winios_plans_equal(plan, _committedPlan)) {
         if (_hasPending) {
-            _gpuPrefToken++;
-            _hasPending = NO;
-            _reshapeAnnounced = NO;
-            if (_reshapeState == WinIOSReshapeStateIdle) hv_fb_metal_hold_for_size(0, 0, 0);
             fprintf(stderr, "display: %.0fx%.0f pt is back within the settle time: no re-mode\n", pts.width, pts.height);
-            [self postDisplayStateChanged];
+            [self dropPendingPlan];
         }
         return;
     }
@@ -549,6 +539,22 @@ static BOOL winios_plans_equal(WinIOSDisplayPlan a, WinIOSDisplayPlan b) {
         if (token != self->_gpuPrefToken || !self->_hasPending) return;
         [self commitPendingPlan:why];
     });
+}
+
+/* A waiting size is not sent after all. The presenter's hold follows what Windows is still on its way to:
+   while a reshape to the committed size is in flight (the watch is not idle), the hold is for that size, for
+   what is left of its 3 s, not for the size just dropped (replanDisplay set that one), whose frames never come;
+   otherwise there is nothing to hold for. */
+- (void)dropPendingPlan {
+    _gpuPrefToken++;
+    _hasPending = NO;
+    _reshapeAnnounced = NO;
+    double left = _reshapeState == WinIOSReshapeStateIdle ? 0 : 3000.0 - (CFAbsoluteTimeGetCurrent() - _reshapeStart) * 1000.0;
+    if (left >= 1.0 && _guestFollowsModes && !_committedPlan.legacy)
+        hv_fb_metal_hold_for_size(_committedPlan.modeWidth, _committedPlan.modeHeight, (uint32_t)left);
+    else
+        hv_fb_metal_hold_for_size(0, 0, 0);
+    [self postDisplayStateChanged];
 }
 
 /* The size of the picture Windows draws now (see framebufferWidth). */
