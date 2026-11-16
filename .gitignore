@@ -44,3 +44,7 @@ __pycache__/
 
 # from AppleVM
 ._*
+
+# WinKit disk and other release payloads (make winkit-img), the ios/deps symlink of a worktree
+/dist/
+/ios/deps
