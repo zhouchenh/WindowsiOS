@@ -77,6 +77,9 @@ void hv_fb_metal_set_layer(HvFbDisplay *fb, void *ca_metal_layer);
 /* Refresh rate of the presented frames (default 60): set any time, global. */
 void hv_fb_metal_set_fps(int fps);
 int hv_fb_metal_fps(void);
+/* Pan/zoom of the shown picture (keyboard pan, viewport zoom): zoom >= 1 about the drawable's centre, then
+   moved by (tx, ty) as fractions of the drawable (y down). 1, 0, 0 = as fitted. Any thread. */
+void hv_fb_metal_set_view_transform(float zoom, float tx, float ty);
 uint64_t hv_fb_metal_frames(HvFbDisplay *fb);
 int hv_fb_save_png(HvFbDisplay *fb, const char *path);
 

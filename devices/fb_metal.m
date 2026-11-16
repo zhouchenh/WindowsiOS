@@ -23,6 +23,40 @@ void hv_fb_metal_set_fps(int fps) {
 
 int hv_fb_metal_fps(void) { return atomic_load(&g_target_fps); }
 
+/* ---- Viewport pan/zoom (keyboard pan and viewport zoom, set by the app through the bridge) ----
+   The picture, as fitted to the drawable, is scaled by zoom about the drawable's centre and then moved by
+   (tx, ty), fractions of the drawable's width and height (y down). 1, 0, 0 shows it as fitted. Kept to
+   this block, fb_view_transform() and the off uniform (buffer 2) so the fitting code stays independent. */
+static os_unfair_lock g_view_lock = OS_UNFAIR_LOCK_INIT;
+static float g_view_zoom = 1.0f, g_view_tx = 0.0f, g_view_ty = 0.0f;
+static _Atomic uint64_t g_view_serial; /* folded into the frame hashes: a new transform redraws */
+
+void hv_fb_metal_set_view_transform(float zoom, float tx, float ty) {
+    if (!(zoom >= 1.0f)) zoom = 1.0f; /* also NaN */
+    if (zoom > 8.0f) zoom = 8.0f;
+    if (!(tx > -4.0f && tx < 4.0f)) tx = 0.0f;
+    if (!(ty > -4.0f && ty < 4.0f)) ty = 0.0f;
+    os_unfair_lock_lock(&g_view_lock);
+    int same = g_view_zoom == zoom && g_view_tx == tx && g_view_ty == ty;
+    g_view_zoom = zoom;
+    g_view_tx = tx;
+    g_view_ty = ty;
+    os_unfair_lock_unlock(&g_view_lock);
+    if (!same) atomic_fetch_add(&g_view_serial, 1);
+}
+
+static uint64_t fb_view_hash(void) { return atomic_load(&g_view_serial) * 0xc2b2ae3d27d4eb4full; }
+
+/* The fitted picture's NDC half sizes (scale) -> zoomed, and the NDC offset to draw it at (off). */
+static void fb_view_transform(float scale[2], float off[2]) {
+    os_unfair_lock_lock(&g_view_lock);
+    scale[0] *= g_view_zoom;
+    scale[1] *= g_view_zoom;
+    off[0] = 2.0f * g_view_tx;
+    off[1] = -2.0f * g_view_ty;
+    os_unfair_lock_unlock(&g_view_lock);
+}
+
 /* The guest draws sRGB values (Windows' and Linux's desktops are sRGB). Tagging the layer sRGB has Core
    Animation colour-match them to the screen. An untagged layer goes to a wide-gamut (Display P3) panel
    unmanaged, its colours stretched to the panel's gamut: oversaturated. HV_NO_COLOR_MATCH=1 (an
@@ -45,11 +79,12 @@ static NSString *const kFbShaderSource =
      "    float4 pos [[position]];\n"
      "    float2 uv;\n"
      "};\n"
-     "vertex VOut fb_vs(uint vid [[vertex_id]], constant float2 &scale [[buffer(0)]], constant float4 &uvr [[buffer(1)]]) {\n"
+     "vertex VOut fb_vs(uint vid [[vertex_id]], constant float2 &scale [[buffer(0)]], constant float4 &uvr [[buffer(1)]],\n"
+     "                  constant float2 &off [[buffer(2)]]) {\n"
      "    const float2 quad[4] = { float2(-1,-1), float2(1,-1), float2(-1,1), float2(1,1) };\n"
      "    const float2 uvs[4]  = { float2(0,1),   float2(1,1),  float2(0,0),  float2(1,0) };\n"
      "    VOut o;\n"
-     "    o.pos = float4(quad[vid] * scale, 0.0, 1.0);\n"
+     "    o.pos = float4(quad[vid] * scale + off, 0.0, 1.0);\n"
      "    o.uv  = uvr.xy + uvs[vid] * uvr.zw;\n"
      "    return o;\n"
      "}\n"
@@ -224,8 +259,8 @@ static uint64_t cursor_hash(HvFbDisplay *fb) {
 }
 
 /* The hardware cursor over a frame of fw x fh pixels drawn at scale (NDC half sizes). Under lock. */
-static void draw_cursor(HvFbMetalPresenter *p, id<MTLRenderCommandEncoder> enc, const float scale[2], uint32_t fw,
-                        uint32_t fh) {
+static void draw_cursor(HvFbMetalPresenter *p, id<MTLRenderCommandEncoder> enc, const float scale[2], const float off[2],
+                        uint32_t fw, uint32_t fh) {
     uint32_t cw = 0, ch = 0;
     int32_t cx = 0, cy = 0;
     uint64_t img = p->curImgSerial;
@@ -246,8 +281,9 @@ static void draw_cursor(HvFbMetalPresenter *p, id<MTLRenderCommandEncoder> enc, 
         for (uint32_t r = 0; r < ch; r++) memcpy(full + r * 64, p->curPx + r * cw, cw * 4);
         [p->curTex replaceRegion:MTLRegionMake2D(0, 0, 64, 64) mipmapLevel:0 withBytes:full bytesPerRow:64 * 4];
     }
-    float rect[4] = {-scale[0] + 2 * scale[0] * (float)cx / fw, scale[1] - 2 * scale[1] * (float)cy / fh,
-                     -scale[0] + 2 * scale[0] * (float)(cx + 64) / fw, scale[1] - 2 * scale[1] * (float)(cy + 64) / fh};
+    float rect[4] = {off[0] - scale[0] + 2 * scale[0] * (float)cx / fw, off[1] + scale[1] - 2 * scale[1] * (float)cy / fh,
+                     off[0] - scale[0] + 2 * scale[0] * (float)(cx + 64) / fw,
+                     off[1] + scale[1] - 2 * scale[1] * (float)(cy + 64) / fh};
     [enc setRenderPipelineState:p->curPipeline];
     [enc setVertexBytes:rect length:sizeof(rect) atIndex:0];
     [enc setFragmentTexture:p->curTex atIndex:0];
@@ -281,7 +317,7 @@ static uint64_t quick_frame_hash(const uint8_t *px, uint32_t w, uint32_t h, uint
     }
     CGSize dsize = curLayer.drawableSize;
     uint64_t serial = __atomic_load_n(&fb->ovr_serial, __ATOMIC_RELAXED);
-    uint64_t hval = (serial * 0xff51afd7ed558ccdull) ^ (uint64_t)(uintptr_t)tref ^ 0x5bd1e995 ^ cursor_hash(fb);
+    uint64_t hval = (serial * 0xff51afd7ed558ccdull) ^ (uint64_t)(uintptr_t)tref ^ 0x5bd1e995 ^ cursor_hash(fb) ^ fb_view_hash();
     if (dsize.width < 4 || dsize.height < 4 ||
         (hval == lastHash && CGSizeEqualToSize(dsize, lastDrawableSize))) {
         os_unfair_lock_unlock(&lock);
@@ -298,6 +334,8 @@ static uint64_t quick_frame_hash(const uint8_t *px, uint32_t w, uint32_t h, uint
     if (dstAspect > srcAspect) scale[0] = srcAspect / dstAspect;
     else scale[1] = dstAspect / srcAspect;
     float uvr[4] = {(float)rx / tw, (float)ry / th, (float)rw / tw, (float)rh / th};
+    float off[2] = {0, 0};
+    fb_view_transform(scale, off); /* pan/zoom */
     MTLRenderPassDescriptor *rp = [MTLRenderPassDescriptor renderPassDescriptor];
     rp.colorAttachments[0].texture = drawable.texture;
     rp.colorAttachments[0].loadAction = MTLLoadActionClear;
@@ -308,9 +346,10 @@ static uint64_t quick_frame_hash(const uint8_t *px, uint32_t w, uint32_t h, uint
     [enc setRenderPipelineState:pipeline];
     [enc setVertexBytes:scale length:sizeof(scale) atIndex:0];
     [enc setVertexBytes:uvr length:sizeof(uvr) atIndex:1];
+    [enc setVertexBytes:off length:sizeof(off) atIndex:2];
     [enc setFragmentTexture:src atIndex:0];
     [enc drawPrimitives:MTLPrimitiveTypeTriangleStrip vertexStart:0 vertexCount:4];
-    draw_cursor(self, enc, scale, rw, rh);
+    draw_cursor(self, enc, scale, off, rw, rh);
     [enc endEncoding];
     [cb presentDrawable:drawable];
     [cb commit];
@@ -342,7 +381,8 @@ static uint64_t quick_frame_hash(const uint8_t *px, uint32_t w, uint32_t h, uint
         }
 
         uint64_t hval = quick_frame_hash(px, w, h, stride) ^
-                        (__atomic_load_n(&fb->ovr_serial, __ATOMIC_RELAXED) * 0xff51afd7ed558ccdull) ^ cursor_hash(fb);
+                        (__atomic_load_n(&fb->ovr_serial, __ATOMIC_RELAXED) * 0xff51afd7ed558ccdull) ^ cursor_hash(fb) ^
+                        fb_view_hash();
         BOOL sizeChanged = !CGSizeEqualToSize(dsize, lastDrawableSize);
         if (hval == lastHash && !sizeChanged && texW == w && texH == h) {
             os_unfair_lock_unlock(&lock);
@@ -379,6 +419,8 @@ static uint64_t quick_frame_hash(const uint8_t *px, uint32_t w, uint32_t h, uint
         } else {
             scale[1] = dstAspect / srcAspect;
         }
+        float off[2] = {0, 0};
+        fb_view_transform(scale, off); /* pan/zoom */
 
         MTLRenderPassDescriptor *rp = [MTLRenderPassDescriptor renderPassDescriptor];
         rp.colorAttachments[0].texture = drawable.texture;
@@ -392,9 +434,10 @@ static uint64_t quick_frame_hash(const uint8_t *px, uint32_t w, uint32_t h, uint
         [enc setVertexBytes:scale length:sizeof(scale) atIndex:0];
         static const float uvr_full[4] = {0, 0, 1, 1};
         [enc setVertexBytes:uvr_full length:sizeof(uvr_full) atIndex:1];
+        [enc setVertexBytes:off length:sizeof(off) atIndex:2];
         [enc setFragmentTexture:texture atIndex:0];
         [enc drawPrimitives:MTLPrimitiveTypeTriangleStrip vertexStart:0 vertexCount:4];
-        draw_cursor(self, enc, scale, w, h);
+        draw_cursor(self, enc, scale, off, w, h);
         [enc endEncoding];
         [cb presentDrawable:drawable];
         [cb commit];
