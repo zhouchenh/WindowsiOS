@@ -383,12 +383,19 @@ enum ClipboardTyper {
             if let k = hid(for: ch) { keys.append(k) } else { skipped += 1 }
         }
         skipped += max(0, text.count - maxCharacters)
-        for (i, (code, shifted)) in keys.enumerated() {
-            DispatchQueue.main.asyncAfter(deadline: .now() + Double(i) * 0.03) {
-                if shifted { WinIOSBridge.shared.sendKeyHid(WinKeys.shift, down: true) }
-                WinIOSBridge.shared.tapKeyHid(code)
-                if shifted { WinIOSBridge.shared.sendKeyHid(WinKeys.shift, down: false) }
+        // One key at a time: each tap is up again (35 ms; a Shift combination 71 ms) before the next goes
+        // down. Overlapping taps share one USB report, which cannot press a key that is already down, so a
+        // doubled letter ("hello", "https://") would be typed once.
+        var at = 0.0
+        for (code, shifted) in keys {
+            DispatchQueue.main.asyncAfter(deadline: .now() + at) {
+                if shifted {
+                    WinIOSBridge.shared.sendKeyCombo(withModifiers: [NSNumber(value: WinKeys.shift)], key: code)
+                } else {
+                    WinIOSBridge.shared.tapKeyHid(code)
+                }
             }
+            at += shifted ? 0.09 : 0.05
         }
         return (keys.count, skipped)
     }
