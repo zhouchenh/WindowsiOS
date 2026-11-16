@@ -44,6 +44,8 @@ if ($PSScriptRoot -and (Test-Path $dispSrc)) { Copy-Item -Force $dispSrc (Join-P
 # second or two and starts each new job in its own console window. It also tells the app it is alive.
 # Display: whenever http://10.0.2.4/res.txt changes ("WxH@scale"), it sets that mode and then Windows'
 # scale, live, in this (the signed-in user's) session, and reports what Windows took (res_applied.txt).
+# Only while this session is the one on the VM's screen: not over Remote Desktop, not while another user
+# or the sign-in screen is in front. Back on the screen, the size the app asks for then is applied.
 $u = 'http://10.0.2.4'; $wc = New-Object Net.WebClient; $last = ''; $n = 0
 try { $last = ($wc.DownloadString("$u/agent_job.txt") -split "`r?`n")[0].Trim() } catch {}   # a job from before this logon: not again
 $disp = $false; $lastRes = ''; $attempted = ''; $retryAt = $null; $tries = 0
@@ -52,7 +54,10 @@ try { if (Test-Path $cs) { Add-Type -Path $cs -ErrorAction Stop; $disp = $true }
 while ($true) {
     if (($n % 15) -eq 0) { try { [void]$wc.UploadString("$u/agent_alive.txt", 'PUT', (Get-Date -Format s)) } catch {} }
     Start-Sleep -Milliseconds 400
-    if ($disp) {
+    $onScreen = $true
+    if ($disp) { try { $onScreen = [WinKitDisplay]::OnConsole() } catch {} }
+    if ($disp -and -not $onScreen) { $lastRes = '' }   # not this session's display now: applied once back
+    if ($disp -and $onScreen) {
         try {
             $r = $wc.DownloadString("$u/res.txt").Trim()
             if ($retryAt -and (Get-Date) -ge $retryAt) { $lastRes = ''; $retryAt = $null }

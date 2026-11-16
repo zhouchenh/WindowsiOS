@@ -74,21 +74,42 @@ public static class WinKitDisplay {
     [DllImport("user32.dll")] static extern int DisplayConfigGetDeviceInfo(ref DPI_SCALE_GET req);
     [DllImport("user32.dll")] static extern int DisplayConfigGetDeviceInfo(ref SOURCE_DEVICE_NAME req);
     [DllImport("user32.dll")] static extern int DisplayConfigSetDeviceInfo(ref DPI_SCALE_SET req);
+    [DllImport("user32.dll")] static extern int GetSystemMetrics(int index);
+    [DllImport("kernel32.dll")] static extern uint WTSGetActiveConsoleSessionId();
+    [DllImport("kernel32.dll")] static extern uint GetCurrentProcessId();
+    [DllImport("kernel32.dll")] static extern bool ProcessIdToSessionId(uint pid, out uint session);
+    const int SM_REMOTESESSION = 0x1000;
+
+    /// Whether this session is the one on the VM's screen: not a Remote Desktop session, and not another
+    /// user's or a disconnected one (fast user switching). Elsewhere the VirtIO display is not this
+    /// session's, and what the app asks for is not for it.
+    public static bool OnConsole() {
+        if (GetSystemMetrics(SM_REMOTESESSION) != 0) return false;
+        uint own;
+        if (!ProcessIdToSessionId(GetCurrentProcessId(), out own)) return true; // cannot tell: as before
+        return own == WTSGetActiveConsoleSessionId();
+    }
 
     // The scale steps Windows offers per monitor, in order: the relative steps index into this.
     static readonly int[] Steps = { 100, 125, 150, 175, 200, 225, 250, 300, 350, 400, 450, 500 };
     const uint QDC_ONLY_ACTIVE_PATHS = 2;
     const int MODE_SIZE = 64; // sizeof(DISPLAYCONFIG_MODE_INFO)
 
-    /// The VirtIO GPU display (\\.\DISPLAYn), else the primary one.
+    /// The VirtIO GPU display (\\.\DISPLAYn), else the primary one. None in a Remote Desktop session:
+    /// its displays are the remote computer's (Microsoft Remote Display Adapter), never the VM's.
     public static string FindDisplay(StringBuilder log) {
+        if (GetSystemMetrics(SM_REMOTESESSION) != 0) {
+            if (log != null) log.AppendLine("a Remote Desktop session: the VM's display is not here");
+            return null;
+        }
         string primary = null, virtio = null;
         for (uint i = 0; i < 16; i++) {
             DISPLAY_DEVICE dd = new DISPLAY_DEVICE(); dd.cb = Marshal.SizeOf(dd);
             if (!EnumDisplayDevices(null, i, ref dd, 0)) break;
             if (log != null) log.AppendLine(dd.DeviceName + " '" + dd.DeviceString + "' flags=0x" + dd.StateFlags.ToString("x"));
             if ((dd.StateFlags & 1) == 0) continue; // not attached to the desktop
-            if ((dd.StateFlags & 4) != 0 && primary == null) primary = dd.DeviceName;
+            bool remote = dd.DeviceString.IndexOf("Remote Display", StringComparison.OrdinalIgnoreCase) >= 0;
+            if ((dd.StateFlags & 4) != 0 && primary == null && !remote) primary = dd.DeviceName;
             if (virtio == null && dd.DeviceString.IndexOf("VirtIO", StringComparison.OrdinalIgnoreCase) >= 0) virtio = dd.DeviceName;
         }
         return virtio ?? primary;
