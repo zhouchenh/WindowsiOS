@@ -83,7 +83,7 @@ static int init_rest(HvMachine *m) {
     knob_env(HV_K_LOGFLUSH, 1); /* on unless its variable says 0 */
     /* Henge b537dbb: a code change drops the cached branch targets into its page (under every live user id and
        kernel salt) instead of every CPU's whole branch cache. */
-    knob_env(HV_K_IJCPAGES, 0);
+    knob_env(HV_K_IJCPAGES, 1); /* on unless its variable says 0 */
     /* Henge 7131022: exits chained into another page are listed per target page (HvRam.xhead), so a code change
        unchains just those instead of scanning every cross-page chain under the translation lock. */
     knob_env(HV_K_XCHAINPAGES, 0);
