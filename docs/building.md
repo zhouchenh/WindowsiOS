@@ -65,6 +65,9 @@ an arm64 executable, the JIT script, the signature) and prints its size and SHA-
 `get-task-allow`, which JIT needs. Use `--entitlements ios/WindowsiOS-IncreasedMemory.entitlements`
 if you will re-sign with an account that has the Increased Memory Limit capability.
 
+The IPA's bundle id is `com.applevm.duo`, the one in `repo.json`, even if your
+`ios/Signing.local.xcconfig` (section 4b) sets another; pass `--bundle-id ID` for a different one.
+
 ### 3D graphics (optional)
 
 Without extra files the IPA has 2D graphics only. The 3D path (virtio-gpu with virglrenderer,

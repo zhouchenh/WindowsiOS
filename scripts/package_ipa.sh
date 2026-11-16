@@ -3,7 +3,7 @@
 #
 # Builds the iOS app (Release, unsigned) and packs it as dist/AppleVM-Duo-unsigned.ipa.
 #
-#   scripts/package_ipa.sh [--utm DIR] [--no-3d] [--entitlements FILE] [--tipa] [--out DIR]
+#   scripts/package_ipa.sh [--utm DIR] [--no-3d] [--entitlements FILE] [--bundle-id ID] [--tipa] [--out DIR]
 #
 #   --utm DIR           Frameworks directory of UTM's iOS app (UTM.app/Frameworks, see docs/building.md).
 #                       Default: $UTM_FRAMEWORKS, else work/utm/Payload/UTM.app/Frameworks, else
@@ -12,6 +12,9 @@
 #   --no-3d             Do not embed the 3D frameworks even if they are found.
 #   --entitlements F    Entitlements carried in the IPA's ad-hoc signature
 #                       (default ios/WindowsiOS.entitlements: get-task-allow).
+#   --bundle-id ID      Bundle identifier of the IPA (default com.applevm.duo, the one in repo.json).
+#                       ios/Signing.local.xcconfig does not change it: a release IPA always has the
+#                       repository's bundle id unless this option is given.
 #   --tipa              Also write dist/AppleVM-Duo-unsigned.tipa (same archive, other extension).
 #   --out DIR           Output directory (default dist/).
 #
@@ -26,6 +29,7 @@ cd "$ROOT"
 UTM_DIR="${UTM_FRAMEWORKS:-}"
 EMBED_3D=1
 ENTITLEMENTS="$ROOT/ios/WindowsiOS.entitlements"
+BUNDLE_ID="com.applevm.duo"
 TIPA=0
 OUT_DIR="$ROOT/dist"
 NAME="AppleVM-Duo-unsigned"
@@ -36,6 +40,7 @@ while [ $# -gt 0 ]; do
         --utm) UTM_DIR="${2:?--utm needs a directory}"; shift 2 ;;
         --no-3d) EMBED_3D=0; shift ;;
         --entitlements) ENTITLEMENTS="${2:?--entitlements needs a file}"; shift 2 ;;
+        --bundle-id) BUNDLE_ID="${2:?--bundle-id needs an identifier}"; shift 2 ;;
         --tipa) TIPA=1; shift ;;
         --out) OUT_DIR="${2:?--out needs a directory}"; shift 2 ;;
         -h|--help) usage 0 ;;
@@ -71,6 +76,7 @@ echo "== Release build, unsigned ($(xcodebuild -version | sed -n 1p))"
 if ! xcodebuild -project ios/WindowsiOS.xcodeproj -scheme WindowsiOS -configuration Release \
         -sdk iphoneos -destination 'generic/platform=iOS' -derivedDataPath "$DD" \
         CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY= DEVELOPMENT_TEAM= \
+        PRODUCT_BUNDLE_IDENTIFIER="$BUNDLE_ID" \
         build > "$WORK/xcodebuild.log" 2>&1; then
     grep -E "error:|BUILD FAILED" "$WORK/xcodebuild.log" | sort -u | tail -40
     die "xcodebuild failed (full log: $WORK/xcodebuild.log)"
@@ -136,6 +142,7 @@ EXE="$(plist CFBundleExecutable)" || fail "Info.plist has no CFBundleExecutable"
 [ -f "$X/$EXE" ] && [ -x "$X/$EXE" ] || fail "executable $EXE missing or not executable"
 lipo -archs "$X/$EXE" | grep -qw arm64 || fail "$EXE is not arm64"
 BID="$(plist CFBundleIdentifier)" || fail "Info.plist has no CFBundleIdentifier"
+[ "$BID" = "$BUNDLE_ID" ] || fail "bundle id is $BID, expected $BUNDLE_ID"
 MINOS="$(plist MinimumOSVersion)" || fail "Info.plist has no MinimumOSVersion"
 VER="$(plist CFBundleShortVersionString || echo '?') ($(plist CFBundleVersion || echo '?'))"
 [ -f "$X/henge-jit.js" ] || fail "henge-jit.js (JIT script) missing"
