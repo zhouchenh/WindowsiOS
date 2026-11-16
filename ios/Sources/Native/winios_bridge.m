@@ -610,7 +610,11 @@ static BOOL winios_plans_equal(WinIOSDisplayPlan a, WinIOSDisplayPlan b) {
             uint32_t gw = 0, gh = 0;
             [self guestPictureWidth:&gw height:&gh];
             BOOL already = gw == plan.modeWidth && gh == plan.modeHeight;
-            if ([self guestDisplayDriverUp] && !already) {
+            /* The watch (and its "Windows didn't change size... run START.bat" notice) is for Windows with
+               WinKit's driver and helper. A Linux guest, or the legacy sizing, takes a preferred mode only if
+               its compositor wants to (a text console never does): nothing to wait for, nothing to advise. */
+            BOOL watch = !plan.legacy && !winios_machine_is_linux();
+            if (watch && [self guestDisplayDriverUp] && !already) {
                 /* the old picture stays (scaled by the layer) until Windows draws at the new size, 3 s at most;
                    not when Windows did not follow the last time (no helper or driver): no freeze for nothing */
                 if (_guestFollowsModes && !plan.legacy) hv_fb_metal_hold_for_size(plan.modeWidth, plan.modeHeight, 3000);
