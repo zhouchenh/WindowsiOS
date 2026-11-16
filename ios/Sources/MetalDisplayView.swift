@@ -110,22 +110,51 @@ final class MetalCanvasUIView: UIView, UIKeyInput {
         updateDrawableScale()
     }
 
+    // MARK: drawable size, scale and sampling (display engine; see DisplaySettings.swift)
+
+    private var displayStateObserver: NSObjectProtocol?
+
+    /// The drawable is the view in native panel pixels (UIScreen.nativeScale, not .scale), so a 1:1 Windows
+    /// mode lands exactly on the panel's pixels; the presenter (fb_metal.m) samples with nearest at 1:1 and
+    /// 2x. HV_DISPLAY_LEGACY=1 keeps the former drawable at UIScreen.scale.
     private func updateDrawableScale() {
-        let scale = window?.screen.scale ?? UIScreen.main.scale
+        let bridge = WinIOSBridge.shared
+        let screen = window?.windowScene?.screen ?? window?.screen ?? UIScreen.main
+        let legacy = bridge.displayLegacy
+        let scale = legacy ? screen.scale : screen.nativeScale
         contentScaleFactor = scale
         metalLayer.contentsScale = scale
-        let w = max(1.0, bounds.width * scale)
-        let h = max(1.0, bounds.height * scale)
-        metalLayer.drawableSize = CGSize(width: w, height: h)
+        let px = CGSize(width: bounds.width * scale, height: bounds.height * scale)
+        let drawable = legacy ? CGSize(width: max(1.0, px.width), height: max(1.0, px.height))
+                              : CGSize(width: max(1.0, (px.width + 0.01).rounded(.down)), height: max(1.0, (px.height + 0.01).rounded(.down)))
+        if metalLayer.drawableSize != drawable { metalLayer.drawableSize = drawable }
+        updateContentsGravity(exact: abs(px.width - drawable.width) < 0.02 && abs(px.height - drawable.height) < 0.02)
         if let winBounds = window?.bounds.size, winBounds.width > 0 {
-            WinIOSBridge.shared.updateScreenSize(winBounds, scale: scale)
+            bridge.updateScreenSize(winBounds, scale: screen.scale)
         }
         // While the on-screen keyboard is up the view is shorter: do not ask Windows to change
         // resolution for that. With a hardware keyboard (focus without the on-screen keyboard) or in
         // the laptop lid (never resized by the keyboard) the size is the real one.
         if bounds.width > 0 && bounds.height > 0 && (!isFirstResponder || hardwareKeyboard || !keyboardResizesView) {
-            WinIOSBridge.shared.updateDisplayViewSize(bounds.size)
+            bridge.updateDisplayViewSize(bounds.size, nativeScale: screen.nativeScale)
         }
+        if window != nil && bounds.width > 0 { DisplaySettings.shared.record(view: self, drawable: drawable) }
+        if displayStateObserver == nil {
+            displayStateObserver = NotificationCenter.default.addObserver(
+                forName: .WinIOSDisplayStateDidChange, object: nil, queue: .main) { [weak self] _ in
+                MainActor.assumeIsolated { self?.updateDrawableScale() }
+            }
+        }
+    }
+
+    /// A drawable that is exactly the view's pixels is shown as is. When the view is a fraction of a pixel
+    /// off, it is shown unscaled at the top left (a sub-pixel margin, no resampling); while Windows takes a
+    /// new size the last frame is scaled to the view instead (the old picture, not a cropped one).
+    private func updateContentsGravity(exact: Bool) {
+        let b = WinIOSBridge.shared
+        let reshaping = b.displayReshapeState != .idle || b.presenterStats().holding != 0
+        let gravity: CALayerContentsGravity = (b.displayLegacy || exact || reshaping) ? .resizeAspect : .topLeft
+        if metalLayer.contentsGravity != gravity { metalLayer.contentsGravity = gravity }
     }
 
     private func normalizedPoint(for pt: CGPoint) -> (Double, Double) {
