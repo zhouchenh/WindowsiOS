@@ -34,15 +34,41 @@ if ($Remove) {
 }
 New-Item -ItemType Directory -Force -Path $dir, $startup | Out-Null
 
-# ---- the helper: asks the app for jobs and runs them
+# ---- the display code the helper loads (mode + Windows scale, see WinKitDisplay.cs)
+$dispSrc = Join-Path $PSScriptRoot 'WinKitDisplay.cs'
+if ($PSScriptRoot -and (Test-Path $dispSrc)) { Copy-Item -Force $dispSrc (Join-Path $dir 'WinKitDisplay.cs') }
+
+# ---- the helper: asks the app for jobs and runs them, and keeps the display shaped as the app asks
 @'
 # WinKit helper: asks the app (http://10.0.2.4/agent_job.txt: a job id, then a command line) every
 # second or two and starts each new job in its own console window. It also tells the app it is alive.
+# Display: whenever http://10.0.2.4/res.txt changes ("WxH@scale"), it sets that mode and then Windows'
+# scale, live, in this (the signed-in user's) session, and reports what Windows took (res_applied.txt).
 $u = 'http://10.0.2.4'; $wc = New-Object Net.WebClient; $last = ''; $n = 0
 try { $last = ($wc.DownloadString("$u/agent_job.txt") -split "`r?`n")[0].Trim() } catch {}   # a job from before this logon: not again
+$disp = $false; $lastRes = ''; $attempted = ''; $retryAt = $null; $tries = 0
+$cs = Join-Path $PSScriptRoot 'WinKitDisplay.cs'
+try { if (Test-Path $cs) { Add-Type -Path $cs -ErrorAction Stop; $disp = $true } } catch {}
 while ($true) {
-    if (($n++ % 6) -eq 0) { try { [void]$wc.UploadString("$u/agent_alive.txt", 'PUT', (Get-Date -Format s)) } catch {} }
-    Start-Sleep -Milliseconds 1500
+    if (($n % 15) -eq 0) { try { [void]$wc.UploadString("$u/agent_alive.txt", 'PUT', (Get-Date -Format s)) } catch {} }
+    Start-Sleep -Milliseconds 400
+    if ($disp) {
+        try {
+            $r = $wc.DownloadString("$u/res.txt").Trim()
+            if ($retryAt -and (Get-Date) -ge $retryAt) { $lastRes = ''; $retryAt = $null }
+            if ($r -ne $lastRes -and $r -match '^(\d+)x(\d+)(@(\d+))?$') {
+                if ($r -ne $attempted) { $tries = 0; $attempted = $r }   # a failed apply is retried 3 times, 5 s apart
+                $lastRes = $r
+                $sc = 0; if ($Matches[4]) { $sc = [int]$Matches[4] }
+                $rep = ''
+                $log = [WinKitDisplay]::Apply([int]$Matches[1], [int]$Matches[2], $sc, 800, [ref]$rep)
+                try { [void]$wc.UploadString("$u/res_applied.txt", 'PUT', $rep) } catch {}
+                try { [void]$wc.UploadString("$u/setres.txt", 'PUT', "helper $(Get-Date -Format s)`r`n$log") } catch {}
+                if ($rep -match ' failed' -and $tries -lt 3) { $tries++; $retryAt = (Get-Date).AddSeconds(5) }
+            }
+        } catch {}
+    }
+    if ((($n++) % 4) -ne 0) { continue }
     try {
         $t = $wc.DownloadString("$u/agent_job.txt") -split "`r?`n"
         $id = $t[0].Trim()
