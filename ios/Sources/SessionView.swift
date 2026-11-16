@@ -8,64 +8,69 @@ func L(_ zh: String, _ en: String) -> String {
     (Locale.preferredLanguages.first ?? "en").hasPrefix("zh") ? zh : en
 }
 
-/// Where the laptop posture puts things: the top half of the screen is the lid (a thin bezel around
-/// the Windows screen), the bottom half the keyboard and trackpad deck. The halves meet at the hinge.
-private struct LaptopMetrics {
-    static let chinHeight: CGFloat = 15
-    static let sideBezel: CGFloat = 6
-
-    let lidHeight: CGFloat
-    let deckHeight: CGFloat
-    let cameraBezel: CGFloat
-    /// The Windows screen inside the lid, in screen coordinates.
-    let screen: CGRect
-
-    init(full: CGSize, safeTop: CGFloat) {
-        lidHeight = (full.height * 0.5).rounded(.down)
-        deckHeight = max(0, full.height - lidHeight)
-        cameraBezel = max(safeTop > 20 ? safeTop - 8 : 9, 9)
-        screen = CGRect(x: Self.sideBezel, y: cameraBezel,
-                        width: max(1, full.width - Self.sideBezel * 2),
-                        height: max(1, lidHeight - cameraBezel - Self.chinHeight))
-    }
-}
-
-/// The whole app: the Windows screen with one small floating toolbar (Studio), or on a half-folded
-/// foldable the Windows screen on the top half and a keyboard and trackpad on the bottom half (Laptop);
-/// a launch page while Windows is not running, and a settings sheet.
+/// The whole app: the Windows screen under standard toolbar items (Studio and the cover screen; on
+/// the iPhone Duo iOS puts them in its vertical bar beside the status items, elsewhere in a top bar),
+/// or on a half-folded foldable the Windows screen above the fold and a keyboard and trackpad below
+/// it (Laptop); Immersive hides every bar and gives Windows the whole screen. A launch page while
+/// Windows is not running, and a settings sheet.
 struct SessionView: View {
     @ObservedObject var vm: VMViewModel
+    @ObservedObject private var chrome = ChromeModel.shared
+    @Environment(\.horizontalSizeClass) private var horizontalSizeClass
     @State private var showPowerConfirm = false
-    /// When the toolbar last appeared (it does not hide itself in its first moment).
-    @State private var controlBarShownAt = Date()
+    /// The display's "In immersive full screen": keep Windows' size (the canvas keeps its windowed size,
+    /// drawn larger) or give it the whole panel (DisplaySettings.immersiveSizing).
+    @State private var immersiveKeepsSize = DisplaySettings.shared.immersiveSizing == .keepSize
+
+    /// Windows is on screen with nothing over it: the chrome's gestures and hooks apply.
+    private var sessionActive: Bool { vm.isVMRunning && !vm.showSettings && vm.activeSafariURL == nil }
+    private var laptopNow: Bool { vm.isVMRunning && vm.isLaptopLayoutActive }
+    /// The toolbar: Studio and the cover screen with the controls shown (Laptop has the deck).
+    private var toolbarShown: Bool { vm.isVMRunning && !laptopNow && !chrome.isImmersive }
 
     var body: some View {
-        GeometryReader { geo in
-            // The whole screen, whatever the safe areas (and the on-screen keyboard) leave.
-            let full = CGSize(width: geo.size.width + geo.safeAreaInsets.leading + geo.safeAreaInsets.trailing,
-                              height: geo.size.height + geo.safeAreaInsets.top + geo.safeAreaInsets.bottom)
-            let laptop = vm.isVMRunning && vm.isLaptopLayoutActive(for: full)
-            session(full: full, laptop: laptop, lid: LaptopMetrics(full: full, safeTop: geo.safeAreaInsets.top))
-                .onAppear { vm.viewportSize = full }
-                .onChange(of: full) { _, newSize in vm.viewportSize = newSize }
-                .onChange(of: laptop) { _, on in
-                    if on {
-                        vm.systemKeyboardVisible = false // the deck is the keyboard
-                    } else {
-                        vm.rightClickArmed = false
-                    }
+        ZStack {
+            Color.black.ignoresSafeArea()
+
+            // Invisible: UIHingeInteraction (iOS 27.1) reports the fold; it also hands the window and
+            // the vertical bar's edge to the chrome.
+            HingeSensorView { statusRaw, angleDeg in
+                DispatchQueue.main.async {
+                    vm.updateHinge(statusRaw: statusRaw, angleDegrees: angleDeg, viewportSize: vm.viewportSize)
                 }
+            }
+            .frame(width: 0, height: 0)
+            .allowsHitTesting(false)
+
+            NavigationStack {
+                stage
+                    .sessionToolbar(SessionToolbarItems(
+                        vm: vm, chrome: chrome, shown: toolbarShown,
+                        compact: horizontalSizeClass == .compact && chrome.verticalBarSide == .none,
+                        showPower: { showPowerConfirm = true }))
+                    .toolbar(toolbarShown ? .visible : .hidden, for: .navigationBar)
+                    .navigationBarTitleDisplayMode(.inline)
+                    .modifier(DarkBarBackground())
+            }
+
+            if !vm.isVMRunning {
+                LaunchPage(vm: vm)
+            }
         }
-        .statusBarHidden(true)
-        .persistentSystemOverlays(.hidden)
-        .defersSystemGestures(on: .all)
+        // Immersive hides the status bar and the home indicator and keeps edge swipes for Windows
+        // first; otherwise iOS shows its status (on the Duo in the vertical bar) and only the bottom
+        // edge, where the Windows taskbar sits under the home indicator, asks for a second swipe.
+        .statusBarHidden(chrome.hidesSystemUI)
+        .persistentSystemOverlays(chrome.hidesSystemUI ? .hidden : .automatic)
+        .defersSystemGestures(on: chrome.hidesSystemUI ? .all : (vm.isVMRunning ? .bottom : []))
         .onOpenURL { JITSetup.shared.handleOpenURL($0) } // app-jit hook
+        .clipboardSync(windows: !vm.isLinux) // clipboard hook
         .onAppear {
             WinIOSBridge.shared.updateScreenSize(UIScreen.main.bounds.size, scale: UIScreen.main.scale)
+            chrome.updateSessionActive(sessionActive)
         }
-        .onChange(of: vm.controlBarVisible) { _, visible in
-            if visible { controlBarShownAt = Date() }
-        }
+        .onChange(of: sessionActive) { _, active in chrome.updateSessionActive(active) }
+        .onReceive(DisplaySettings.shared.$immersiveSizing) { immersiveKeepsSize = $0 == .keepSize }
         .sheet(item: $vm.activeSafariURL) { item in
             SafariSheet(url: item.url).ignoresSafeArea()
         }
@@ -92,33 +97,72 @@ struct SessionView: View {
         }
     }
 
-    /// One Windows screen for both postures (the same view, so Windows keeps its display and the
-    /// keyboard focus): full screen under the toolbar, or the lid's screen above the deck. Its size
-    /// is what Windows' resolution follows, so in Laptop Windows gets the lid's shape.
-    private func session(full: CGSize, laptop: Bool, lid: LaptopMetrics) -> some View {
-        ZStack(alignment: .top) {
-            Color.black.ignoresSafeArea()
-
-            // Invisible: UIHingeInteraction (iOS 27.1) reports the fold.
-            HingeSensorView { statusRaw, angleDeg in
-                DispatchQueue.main.async {
-                    vm.updateHinge(statusRaw: statusRaw, angleDegrees: angleDeg, viewportSize: vm.viewportSize)
+    /// The whole screen in screen coordinates: the Windows screen, the laptop deck and the floating
+    /// keyboard button are placed from the bars' safe area. A reader that ignores the safe area
+    /// reports no insets, so one reader keeps to the safe area (status bar, toolbar, the vertical bar)
+    /// and a second one inside it covers the whole screen; the insets are the difference.
+    private var stage: some View {
+        GeometryReader { safe in
+            let safeFrame = safe.frame(in: .global)
+            Color.clear.overlay(alignment: .topLeading) {
+                GeometryReader { geo in
+                    stageBody(geo: geo, insets: StageLayout.insets(safe: safeFrame, full: geo.frame(in: .global)))
                 }
+                .ignoresSafeArea()
             }
-            .frame(width: 0, height: 0)
-            .allowsHitTesting(false)
+        }
+    }
+
+    private func stageBody(geo: GeometryProxy, insets: EdgeInsets) -> some View {
+        let full = geo.size
+        let laptop = vm.isVMRunning && vm.isLaptopLayoutActive(for: full)
+        let surface = ChromeSurface.of(laptop: laptop, size: full, hingeStatus: vm.hingeStatusRaw,
+                                       foldable: vm.supportsLaptopPosture)
+        let immersive = vm.isVMRunning && chrome.isImmersive(surface)
+        let division = ReservedRegions.division(geo)
+        // With the keyboard pan (KeyboardOptions.panInsteadOfShrink) the Windows screen keeps its size under
+        // the on-screen keyboard and the picture moves up inside it (MetalCanvasUIView), so nothing is cut
+        // off at the keyboard's top and the transparent key bar shows the picture behind it.
+        let layout = StageLayout(full: full, insets: insets, laptop: laptop, immersive: immersive,
+                                 fold: FoldLayout(full: full, division: division),
+                                 keyboardTop: KeyboardOptions.panInsteadOfShrink ? nil : chrome.keyboardTop,
+                                 windowedSize: immersiveKeepsSize ? chrome.windowedCanvasSize[surface] : nil,
+                                 nativeScale: Self.nativeScale)
+        let occlusions = ReservedRegions.occlusions(geo)
+
+        return stageContent(layout: layout, laptop: laptop, occlusions: occlusions)
+            .modifier(StageObservers(vm: vm, chrome: chrome, full: full, laptop: laptop, surface: surface,
+                                     immersive: immersive, insets: insets, layout: layout, division: division,
+                                     occlusions: occlusions))
+    }
+
+    /// One Windows screen for every posture (the same view, so Windows keeps its display and the
+    /// keyboard focus). Its size is what Windows' resolution follows.
+    /// Panel pixels per point of the screen the app is on (the Windows view's frame is snapped to them).
+    private static var nativeScale: CGFloat {
+        let scenes = UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }
+        let scene = scenes.first { $0.activationState == .foregroundActive } ?? scenes.first
+        return scene?.screen.nativeScale ?? 0
+    }
+
+    /// Near the top of the Windows screen, below the camera island when it reaches in (as ChromeHintView).
+    private static func noticeTop(in area: CGRect, below occlusions: [CGRect]) -> CGFloat {
+        var y = area.minY + 14
+        let band = CGRect(x: area.minX, y: y, width: area.width, height: 44)
+        for r in occlusions where r.intersects(band) { y = max(y, r.maxY + 8) }
+        return y
+    }
+
+    private func stageContent(layout: StageLayout, laptop: Bool, occlusions: [CGRect]) -> some View {
+        let canvas = layout.canvas
+        return ZStack(alignment: .topLeading) {
+            Color.black
 
             if laptop {
-                VStack(spacing: 0) {
-                    laptopLid(width: full.width, lid: lid)
-                        .frame(width: full.width, height: lid.lidHeight)
-                    LaptopDeckView(vm: vm)
-                        .frame(width: full.width, height: lid.deckHeight)
-                }
-                .frame(width: full.width, height: full.height)
-                .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
-                .ignoresSafeArea()
-                .transition(.opacity)
+                LaptopDeckView(vm: vm, showPower: { showPowerConfirm = true })
+                    .frame(width: layout.full.width, height: max(0, layout.full.height - layout.fold.deckTop))
+                    .offset(y: layout.fold.deckTop)
+                    .transition(.opacity)
             }
 
             MetalDisplayView(
@@ -127,259 +171,177 @@ struct SessionView: View {
                 hardwareKeyboard: vm.hardwareKeyboard,
                 focusAllowed: vm.isVMRunning && !vm.showSettings && vm.activeSafariURL == nil,
                 onThreeFingerTap: {
-                    if laptop {
-                        withAnimation(.spring(response: 0.28, dampingFraction: 0.88)) {
-                            vm.setPostureMode(.fullScreen, viewportSize: full)
-                        }
-                    } else {
-                        withAnimation(.snappy(duration: 0.2)) { vm.controlBarVisible.toggle() }
-                    }
+                    // the alias of the four-finger tap: controls in or out
+                    withAnimation(.snappy(duration: 0.22)) { chrome.toggleImmersive(reason: "three-finger tap") }
                 },
                 rightClickArmed: $vm.rightClickArmed,
-                keyboardResizesView: !laptop,
-                onUserInteraction: {
-                    guard !laptop, vm.autoHideControlBar, vm.controlBarVisible,
-                          Date().timeIntervalSince(controlBarShownAt) > 1.0 else { return }
-                    withAnimation(.snappy(duration: 0.2)) { vm.controlBarVisible = false }
-                }
+                keyboardResizesView: !laptop
             )
-            .clipShape(RoundedRectangle(cornerRadius: laptop ? 5.5 : 0, style: .continuous))
-            .overlay {
-                RoundedRectangle(cornerRadius: laptop ? 5.5 : 0, style: .continuous)
-                    .strokeBorder(Color.white.opacity(laptop ? 0.07 : 0), lineWidth: 0.5)
-                    .allowsHitTesting(false)
-            }
-            .frame(width: laptop ? lid.screen.width : nil, height: laptop ? lid.screen.height : nil)
-            .padding(.leading, laptop ? lid.screen.minX : 0)
-            .padding(.top, laptop ? lid.screen.minY : 0)
-            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
-            .ignoresSafeArea(laptop ? .all : .container, edges: laptop ? .all : [.bottom, .horizontal])
+            .frame(width: canvas.frame.width, height: canvas.frame.height)
+            .scaleEffect(canvas.scale, anchor: .topLeading)
+            .offset(x: canvas.origin.x, y: canvas.origin.y)
             .opacity(vm.isVMRunning ? 1 : 0)
 
+            if vm.isVMRunning && !laptop && !vm.hardwareKeyboard && !vm.systemKeyboardVisible {
+                KeyboardFloatingButton(chrome: chrome, area: canvas.visibleRect, occlusions: occlusions) {
+                    UIImpactFeedbackGenerator(style: .light).impactOccurred()
+                    vm.systemKeyboardVisible = true
+                }
+                .transition(.opacity)
+            }
+
+            if vm.isVMRunning, let hint = chrome.hint {
+                ChromeHintView(text: hint, area: canvas.visibleRect, occlusions: occlusions)
+            }
+
             if vm.isVMRunning {
-                if !laptop {
-                    toolbar
-                        .padding(.top, 6)
-                        .transition(.move(edge: .top).combined(with: .opacity))
-                }
-            } else {
-                LaunchPage(vm: vm)
+                // "Windows is taking the new size" while a re-mode is slow or stuck (DisplaySettings.swift).
+                DisplayReshapeNotice()
+                    .frame(width: canvas.visibleRect.width)
+                    .offset(x: canvas.visibleRect.minX,
+                            y: Self.noticeTop(in: canvas.visibleRect, below: occlusions) + (chrome.hint != nil ? 48 : 0))
+                    .allowsHitTesting(false)
+                    .transition(.opacity)
             }
         }
+        .frame(width: layout.full.width, height: layout.full.height, alignment: .topLeading)
+    }
+}
+
+/// Where the Windows screen goes, in screen coordinates.
+struct StageLayout: Equatable {
+    struct Canvas: Equatable {
+        /// The view's own size (what Windows' resolution follows).
+        var frame: CGSize
+        /// Drawn larger than its size: immersive that keeps Windows' resolution.
+        var scale: CGFloat
+        var origin: CGPoint
+        var visibleRect: CGRect { CGRect(origin: origin, size: CGSize(width: frame.width * scale, height: frame.height * scale)) }
     }
 
-    // MARK: - Laptop lid
-
-    /// The lid around the Windows screen (which is drawn on top of it): a camera bezel, and a chin
-    /// with the sign-in browser switch and the posture switch.
-    private func laptopLid(width: CGFloat, lid: LaptopMetrics) -> some View {
-        ZStack(alignment: .top) {
-            RoundedRectangle(cornerRadius: 12, style: .continuous)
-                .fill(LinearGradient(colors: [Color(red: 0.038, green: 0.046, blue: 0.072),
-                                              Color(red: 0.020, green: 0.024, blue: 0.038)],
-                                     startPoint: .top, endPoint: .bottom))
-                .overlay(
-                    RoundedRectangle(cornerRadius: 12, style: .continuous)
-                        .strokeBorder(LinearGradient(colors: [Color(red: 0.64, green: 0.75, blue: 0.96).opacity(0.28),
-                                                              Color(red: 0.45, green: 0.56, blue: 0.78).opacity(0.10),
-                                                              Color.black.opacity(0.60)],
-                                                     startPoint: .top, endPoint: .bottom),
-                                      lineWidth: 0.85)
-                )
-
-            VStack(spacing: 0) {
-                // Camera bezel: the camera, and a status light (orange without JIT)
-                HStack(spacing: 7) {
-                    Circle().fill(Color(red: 0.10, green: 0.12, blue: 0.18)).frame(width: 3.5, height: 3.5)
-                    ZStack {
-                        Circle()
-                            .fill(Color(red: 0.05, green: 0.07, blue: 0.12))
-                            .frame(width: 5.5, height: 5.5)
-                            .overlay(Circle().strokeBorder(Color.white.opacity(0.16), lineWidth: 0.4))
-                        Circle()
-                            .fill(Color(red: 0.45, green: 0.65, blue: 1.0).opacity(0.55))
-                            .frame(width: 1.6, height: 1.6)
-                            .offset(x: -0.8, y: -0.8)
-                    }
-                    Circle()
-                        .fill(vm.isJITLive ? Color.white.opacity(0.32) : Color.orange.opacity(0.6))
-                        .frame(width: 2.4, height: 2.4)
-                }
-                .frame(height: lid.cameraBezel)
-
-                RoundedRectangle(cornerRadius: 5.5, style: .continuous)
-                    .fill(Color.black)
-                    .padding(.horizontal, LaptopMetrics.sideBezel)
-                    .frame(height: lid.screen.height)
-
-                ZStack {
-                    HStack(spacing: 5) {
-                        WindowsLogoMark(size: 7.5, color: Color.white.opacity(0.22))
-                        Text("SURFACE")
-                            .font(.system(size: 7.5, weight: .semibold))
-                            .tracking(2.2)
-                            .foregroundStyle(Color.white.opacity(0.22))
-                    }
-                    HStack {
-                        if !vm.isLinux {
-                            chinButton(vm.useSafariForOAuth ? "OAUTH: SAFARI" : "OAUTH: EDGE",
-                                       accessibility: vm.useSafariForOAuth
-                                           ? L("登录链接用 Safari 打开", "Sign-in links open in Safari")
-                                           : L("登录链接用 Edge 打开", "Sign-in links open in Edge")) {
-                                vm.toggleOAuthBrowserMode()
-                            }
-                        }
-                        Spacer()
-                        chinButton(vm.hingeAngleDegrees.map { String(format: "%.0f°", $0) } ?? vm.postureMode.rawValue.uppercased(),
-                                   accessibility: L("姿态：", "Posture: ") + vm.postureMode.title) {
-                            vm.cyclePostureMode(viewportSize: vm.viewportSize)
-                        }
-                    }
-                    .padding(.horizontal, 10)
-                }
-                .frame(height: LaptopMetrics.chinHeight)
-            }
-        }
-        .frame(width: width)
+    /// The safe area's insets inside the whole screen (both frames in global coordinates).
+    static func insets(safe: CGRect, full: CGRect) -> EdgeInsets {
+        EdgeInsets(top: max(0, safe.minY - full.minY), leading: max(0, safe.minX - full.minX),
+                   bottom: max(0, full.maxY - safe.maxY), trailing: max(0, full.maxX - safe.maxX))
     }
 
-    private func chinButton(_ text: String, accessibility: String, action: @escaping () -> Void) -> some View {
-        Button(action: action) {
-            Text(text)
-                .font(.system(size: 8.0, weight: .medium, design: .monospaced))
-                .foregroundStyle(Color.white.opacity(0.28))
-                .padding(.horizontal, 6)
-                .padding(.vertical, 1.5)
-                .contentShape(Rectangle().inset(by: -6))
-        }
-        .buttonStyle(.plain)
-        .accessibilityLabel(accessibility)
-    }
+    let full: CGSize
+    let fold: FoldLayout
+    let canvas: Canvas
+    /// The Windows screen with the controls shown (what immersive without a new resolution keeps).
+    let windowed: CGSize
 
-    // MARK: - Floating toolbar (Studio)
-
-    @ViewBuilder
-    private var toolbar: some View {
-        if vm.controlBarVisible {
-            // On a narrow screen the row scrolls instead of being cut off.
-            ViewThatFits(in: .horizontal) {
-                toolbarRow
-                ScrollView(.horizontal, showsIndicators: false) {
-                    toolbarRow.padding(.horizontal, 8).padding(.vertical, 12)
-                }
-                .padding(.vertical, -12)
-            }
+    init(full: CGSize, insets: EdgeInsets, laptop: Bool, immersive: Bool, fold: FoldLayout,
+         keyboardTop: CGFloat?, windowedSize: CGSize?, nativeScale: CGFloat = 0) {
+        self.full = full
+        self.fold = fold
+        // The bars' safe area: status bar and toolbar on top, the vertical bar or the camera at the
+        // sides. The bottom (home indicator) stays Windows': its taskbar sits there, as on a tablet.
+        let top = insets.top, lead = insets.leading, trail = insets.trailing
+        let windowedRect: CGRect
+        let immersiveRect: CGRect
+        if laptop {
+            // The lid: everything above the fold (P0-8: no bezel, no chin).
+            windowedRect = CGRect(x: lead, y: top, width: full.width - lead - trail, height: fold.lidBottom - top)
+            immersiveRect = CGRect(x: 0, y: 0, width: full.width, height: fold.lidBottom)
         } else {
-            // A small handle so the toolbar can always be brought back (a three-finger tap does it too).
-            Button {
-                withAnimation(.snappy(duration: 0.2)) { vm.controlBarVisible = true }
-            } label: {
-                Image(systemName: "chevron.down")
-                    .font(.system(size: 12, weight: .bold))
-                    .foregroundStyle(.white.opacity(0.75))
-                    .frame(width: 44, height: 18)
-                    .background(.ultraThinMaterial, in: Capsule())
-                    .contentShape(Rectangle().inset(by: -10))
-            }
-            .accessibilityLabel(L("显示工具栏", "Show toolbar"))
-            .opacity(0.7)
+            // While the on-screen keyboard is up, the Windows screen ends above it (as before).
+            let bottom = min(full.height, keyboardTop ?? full.height)
+            windowedRect = CGRect(x: lead, y: top, width: full.width - lead - trail, height: bottom - top)
+            immersiveRect = CGRect(x: 0, y: 0, width: full.width, height: bottom)
+        }
+        windowed = CGSize(width: max(1, windowedRect.width), height: max(1, windowedRect.height))
+        let r = immersive ? immersiveRect : windowedRect
+        let area = CGRect(x: r.minX, y: r.minY, width: max(1, r.width), height: max(1, r.height))
+        // On whole panel pixels (DisplayGeometry): the drawable is then exactly the view's pixels and the
+        // compositor shows it with no resampling.
+        let n = nativeScale
+        if immersive, let keep = windowedSize, keep.width > 1, keep.height > 1 {
+            // Windows keeps the size it had with the controls, drawn as large as fits.
+            let s = min(area.width / keep.width, area.height / keep.height)
+            let origin = CGPoint(x: area.minX + (area.width - keep.width * s) / 2,
+                                 y: area.minY + (area.height - keep.height * s) / 2)
+            canvas = Canvas(frame: keep, scale: s,
+                            origin: n > 0 ? CGPoint(x: (origin.x * n).rounded() / n, y: (origin.y * n).rounded() / n) : origin)
+        } else {
+            let r = DisplayGeometry.snapped(area, nativeScale: n)
+            canvas = Canvas(frame: CGSize(width: max(1, r.width), height: max(1, r.height)), scale: 1, origin: r.origin)
         }
     }
+}
 
-    private var toolbarRow: some View {
-        HStack(spacing: 2) {
-            if vm.supportsLaptopPosture { // a foldable: Laptop or Studio
-                Menu {
-                    Picker(L("姿态", "Posture"), selection: Binding(
-                        get: { vm.postureMode },
-                        set: { mode in
-                            withAnimation(.spring(response: 0.28, dampingFraction: 0.88)) {
-                                vm.setPostureMode(mode, viewportSize: vm.viewportSize)
-                            }
-                        }
-                    )) {
-                        ForEach(PostureMode.allCases, id: \.self) { mode in
-                            Label(mode.title, systemImage: mode.iconName).tag(mode)
-                        }
-                    }
-                } label: {
-                    barIcon("laptopcomputer", active: false)
-                }
-                .accessibilityLabel(L("姿态", "Posture"))
+/// Keeps the view model and the chrome up to date with the layout, and logs what the system reports.
+private struct StageObservers: ViewModifier {
+    let vm: VMViewModel
+    let chrome: ChromeModel
+    let full: CGSize
+    let laptop: Bool
+    let surface: ChromeSurface
+    /// Immersive is on screen: the display's reshape filter is told (DisplaySettings.immersive).
+    let immersive: Bool
+    let insets: EdgeInsets
+    let layout: StageLayout
+    let division: CGRect?
+    let occlusions: [CGRect]
+
+    func body(content: Content) -> some View {
+        content
+            .onAppear {
+                vm.viewportSize = full
+                chrome.setSurface(surface)
+                chrome.reportInsets(insets)
+                chrome.reportScreen(viewport: full)
+                chrome.reportOcclusions(occlusions)
+                rememberWindowed()
+                DisplaySettings.shared.immersive = immersive
             }
-            if !vm.hardwareKeyboard { // with a hardware keyboard attached there is nothing to bring up
-                barButton(vm.systemKeyboardVisible ? "keyboard.fill" : "keyboard", L("键盘", "Keyboard"),
-                          active: vm.systemKeyboardVisible) {
-                    vm.systemKeyboardVisible.toggle()
-                }
+            .onChange(of: immersive) { _, on in DisplaySettings.shared.immersive = on }
+            // The display remembers immersive per screen and loads its own on a screen change: the
+            // chrome's is what is on screen.
+            .onReceive(DisplaySettings.shared.$surface.dropFirst()) { _ in
+                DispatchQueue.main.async { DisplaySettings.shared.immersive = immersive }
             }
-            barButton(vm.directTouch ? "hand.point.up.left.fill" : "rectangle.and.hand.point.up.left",
-                      vm.directTouch ? L("直接触摸", "Direct touch") : L("触控板", "Trackpad"),
-                      active: vm.directTouch) {
-                vm.directTouch.toggle()
+            .onChange(of: full) { _, newSize in
+                vm.viewportSize = newSize
+                chrome.reportScreen(viewport: newSize)
             }
-            barButton("square.grid.2x2.fill", L("Win 键", "Windows key")) {
-                WinIOSBridge.shared.sendWindowsKey()
-            }
-            if !vm.isLinux { // these run inside Windows
-                Menu {
-                    Button("Claude Code", systemImage: "terminal") { vm.installClaudeCode() }
-                    Button("Paint", systemImage: "paintbrush.pointed") { vm.launchGuestPaint() }
-                    Button("Edge", systemImage: "globe") { vm.launchGuestEdgeBrowser() }
-                } label: {
-                    barIcon("sparkles", active: false)
-                }
-                .accessibilityLabel(L("应用", "Apps"))
-                barButton(vm.useSafariForOAuth ? "safari" : "network",
-                          vm.useSafariForOAuth ? L("登录链接用 Safari 打开", "Sign-in links open in Safari")
-                                               : L("登录链接用 Edge 打开", "Sign-in links open in Edge"),
-                          active: vm.useSafariForOAuth) {
-                    vm.toggleOAuthBrowserMode()
+            .onChange(of: surface) { _, s in chrome.setSurface(s) }
+            .onChange(of: insets) { _, i in chrome.reportInsets(i) }
+            .onChange(of: occlusions) { _, o in chrome.reportOcclusions(o) }
+            .onChange(of: layout) { _, _ in rememberWindowed() }
+            .onChange(of: laptop) { _, on in
+                if on {
+                    vm.systemKeyboardVisible = false // the deck is the keyboard
+                    chrome.reportFold(source: layout.fold.sourceText, rect: division)
+                } else {
+                    vm.rightClickArmed = false
                 }
             }
-            Menu {
-                Section(L("快捷键", "Shortcuts")) {
-                    Button("Ctrl + Alt + Del", systemImage: "lock") { WinIOSBridge.shared.sendCtrlAltDel() }
-                    Button(L("任务管理器", "Task Manager"), systemImage: "waveform.path.ecg") { vm.sendTaskManager() }
-                    Button("Alt + Tab", systemImage: "rectangle.on.rectangle") { WinIOSBridge.shared.sendAltTab() }
-                    Button("Esc", systemImage: "escape") { WinIOSBridge.shared.sendEscape() }
-                }
-                Section {
-                    Button(L("设置", "Settings"), systemImage: "gearshape") { vm.showSettings = true }
-                    Button(L("电源…", "Power…"), systemImage: "power") { showPowerConfirm = true }
-                }
-            } label: {
-                barIcon("ellipsis.circle", active: false)
+            .onChange(of: layout.fold) { _, f in
+                if laptop { chrome.reportFold(source: f.sourceText, rect: division) }
             }
-            .accessibilityLabel(L("更多", "More"))
-            Divider().frame(height: 20).padding(.horizontal, 2)
-            barButton("chevron.up", L("收起工具栏", "Hide toolbar")) {
-                withAnimation(.snappy(duration: 0.2)) { vm.controlBarVisible = false }
-            }
-        }
-        .padding(.horizontal, 6)
-        .padding(.vertical, 4)
-        .background(.ultraThinMaterial, in: Capsule())
-        .overlay(Capsule().strokeBorder(.white.opacity(0.12)))
-        .shadow(color: .black.opacity(0.35), radius: 10, y: 3)
     }
 
-    private func barIcon(_ symbol: String, active: Bool) -> some View {
-        Image(systemName: symbol)
-            .font(.system(size: 17, weight: .medium))
-            .foregroundStyle(active ? Color.accentColor : .white)
-            .frame(width: 42, height: 36)
-            .contentShape(Rectangle())
+    /// Immersive without a new resolution keeps the size the Windows screen has with the controls.
+    private func rememberWindowed() {
+        guard vm.isVMRunning, !chrome.isImmersive(surface),
+              chrome.keyboardTop == nil || laptop || KeyboardOptions.panInsteadOfShrink else { return }
+        chrome.rememberWindowedCanvas(layout.windowed, for: surface)
     }
+}
 
-    private func barButton(_ symbol: String, _ label: String, active: Bool = false, action: @escaping () -> Void) -> some View {
-        Button {
-            UIImpactFeedbackGenerator(style: .light).impactOccurred()
-            action()
-        } label: {
-            barIcon(symbol, active: active)
+/// Before Liquid Glass (iOS 26) the bar gets a black background; from iOS 26 the glass items float
+/// over the black stage on their own.
+private struct DarkBarBackground: ViewModifier {
+    func body(content: Content) -> some View {
+        if #available(iOS 26.0, *) {
+            content.toolbarColorScheme(.dark, for: .navigationBar)
+        } else {
+            content
+                .toolbarBackground(Color.black, for: .navigationBar)
+                .toolbarBackground(.visible, for: .navigationBar)
+                .toolbarColorScheme(.dark, for: .navigationBar)
         }
-        .accessibilityLabel(label)
     }
 }
 
@@ -667,123 +629,52 @@ private struct LaunchPage: View {
 
 // MARK: - Settings
 
+/// The settings' pages: a sidebar beside the page on wide screens (the Duo's inner screen, iPad), a
+/// list that opens each page on narrow ones, like the system's Settings app.
+private enum SettingsPage: String, CaseIterable, Identifiable {
+    case display, input, network, system, status
+    var id: String { rawValue }
+
+    var title: String {
+        switch self {
+        case .display: return L("显示", "Display")
+        case .input: return L("输入", "Input")
+        case .network: return L("网络", "Network")
+        case .system: return L("系统", "System")
+        case .status: return L("状态", "Status")
+        }
+    }
+
+    var icon: String {
+        switch self {
+        case .display: return "display"
+        case .input: return "hand.point.up.left"
+        case .network: return "network"
+        case .system: return "gearshape"
+        case .status: return "info.circle"
+        }
+    }
+}
+
 private struct SettingsSheet: View {
     @ObservedObject var vm: VMViewModel
+    @ObservedObject private var chrome = ChromeModel.shared
+    @ObservedObject private var display = DisplaySettings.shared
+    @AppStorage("winios.keyboard.autoShow") private var keyboardAutoShow = true
+    @AppStorage("winios.keyboard.follow") private var keyboardFollow = true
     @Environment(\.dismiss) private var dismiss
+    @Environment(\.horizontalSizeClass) private var horizontalSizeClass
+    @State private var page: SettingsPage? = nil
+    @State private var columns: NavigationSplitViewVisibility = .all
 
     var body: some View {
-        NavigationStack {
-            Form {
-                Section {
-                    if vm.isLinux {
-                        LabeledContent("OpenGL", value: "virgl")
-                        LabeledContent("Vulkan", value: "Venus")
-                    } else {
-                        Toggle(L("3D 加速（DirectX 11）", "3D acceleration (DirectX 11)"), isOn: Binding(
-                            get: { vm.gpu3DEnabled },
-                            set: { vm.setGPU3D($0) }
-                        ))
-                    }
-                    Picker(L("刷新率", "Refresh rate"), selection: $vm.frameRate) {
-                        ForEach(VMViewModel.frameRateChoices, id: \.self) { hz in
-                            Text("\(hz) Hz").tag(hz)
-                        }
-                    }
-                    Toggle(L("高分辨率（HiDPI）", "High resolution (HiDPI)"), isOn: Binding(
-                        get: { vm.hiDPIDisplay },
-                        set: { _ in vm.toggleHiDPIDisplay() }
-                    ))
-                } header: {
-                    Text(L("显示", "Display"))
-                } footer: {
-                    Text(vm.isLinux
-                         ? L("Arch Linux 的 GPU 加速始终开启：OpenGL 走 virgl，Vulkan 走 Venus（驱动随系统装好）。高分辨率在下次启动时生效。刷新率是全局设置，虚拟机下次启动时生效。",
-                             "GPU acceleration is always on for Arch Linux: OpenGL through virgl, Vulkan through Venus (the drivers come with the system). High resolution applies at the next start. The refresh rate is global and applies when the machine next starts.")
-                         : L("3D 需要先在 Windows 里装好 3D 驱动（运行 WINKIT 盘里的 START.bat）。如果开启后黑屏，在这里关掉再重启 App。这两项在下次启动 Windows 时生效。刷新率只影响 iPad 上的画面刷新：Windows 的显卡驱动只支持 60 Hz，Windows 里始终是 60 Hz。",
-                             "3D needs the 3D driver installed in Windows first (run START.bat on the WINKIT disk). If the screen stays black after turning it on, turn it off here and restart the app. Both apply the next time Windows starts. The refresh rate only changes how often the iPad draws the screen: the Windows display driver only takes 60 Hz, so Windows itself stays at 60 Hz."))
-                }
-
-                Section {
-                    Picker(L("触摸屏幕时", "Touching the screen"), selection: $vm.directTouch) {
-                        Text(L("触控板", "Trackpad")).tag(false)
-                        Text(L("直接触摸", "Direct touch")).tag(true)
-                    }
-                    .pickerStyle(.segmented)
-                    Toggle(L("使用 Windows 时自动收起工具栏", "Hide the toolbar while using Windows"), isOn: $vm.autoHideControlBar)
-                } header: {
-                    Text(L("触控", "Touch"))
-                } footer: {
-                    Text(vm.directTouch
-                        ? L("轻点 = 在手指位置左键 · 双指轻点或长按 = 右键 · 单指拖动 = 拖拽 · 双指滑动 = 滚动 · 三指轻点 = 显示/隐藏工具栏",
-                            "Tap = left click where you touch · Two-finger tap or long press = right click · Drag = drag · Two-finger slide = scroll · Three-finger tap = toolbar")
-                        : L("单指滑动 = 移动光标 · 单指轻点 = 左键 · 双指轻点 = 右键 · 双指滑动 = 滚动 · 轻点后立刻按住拖动（或长按后拖动）= 拖拽 · 三指轻点 = 显示/隐藏工具栏",
-                            "Slide = move pointer · Tap = left click · Two-finger tap = right click · Two-finger slide = scroll · Tap then hold and move (or long press, then move) = drag · Three-finger tap = toolbar"))
-                }
-
-                if vm.supportsLaptopPosture {
-                    Section {
-                        Picker(L("姿态", "Posture"), selection: Binding(
-                            get: { vm.postureMode },
-                            set: { vm.setPostureMode($0, viewportSize: vm.viewportSize) }
-                        )) {
-                            ForEach(PostureMode.allCases, id: \.self) { mode in
-                                Text(mode.title).tag(mode)
-                            }
-                        }
-                    } header: {
-                        Text(L("折叠屏", "Foldable"))
-                    } footer: {
-                        Text(L("笔记本：半折时上半屏是 Windows，下半屏是键盘和触控板（上半屏直接触摸；F8 让下一次轻点变成右键，F12 或三指轻点回到全屏）。全屏：Windows 占满整个屏幕。自动：按折叠角度切换，没有角度读数时，竖着拿展开的内屏就是笔记本。Windows 的分辨率跟着画面大小变（需要 WinKit 的显卡驱动）。",
-                               "Laptop: half folded, Windows is on the top half and a keyboard and trackpad on the bottom half (touch the top half directly; F8 makes the next tap a right click, F12 or a three-finger tap goes back to Studio). Studio: Windows fills the screen. Automatic follows the hinge; without a hinge reading, the unfolded inner screen held upright is Laptop. Windows' resolution follows the screen's shape (with the WinKit display driver)."))
-                    }
-                }
-
-                Section {
-                    if !vm.isLinux {
-                        HStack {
-                            Text(L("CPU 名称", "CPU name"))
-                            TextField(L("自动", "Automatic"), text: $vm.cpuName)
-                                .multilineTextAlignment(.trailing)
-                                .autocorrectionDisabled()
-                                .onSubmit { vm.saveCPUName() }
-                        }
-                    }
-                    Toggle(L("JIT 就绪后自动启动 ", "Start ") + vm.machineTitle + L("", " automatically once JIT is on"), isOn: $vm.autoStart)
-                    if !vm.isLinux {
-                        Toggle(L("Windows 里的登录链接用 Safari 打开", "Open sign-in links from Windows in Safari"), isOn: Binding(
-                            get: { vm.useSafariForOAuth },
-                            set: { _ in vm.toggleOAuthBrowserMode() }
-                        ))
-                    }
-                } header: {
-                    Text(L("系统", "System"))
-                } footer: {
-                    if !vm.isLinux {
-                        Text(L("CPU 名称是 Windows 里显示的处理器名字，下次启动生效。留空时用设备的芯片名（例如 Apple A20 Pro），不认识的设备显示 Apple Silicon。",
-                               "The CPU name is what Windows shows for the processor; applies at the next start. Left empty, it is the device's chip (e.g. Apple A20 Pro), or Apple Silicon on a device the app does not know."))
-                    }
-                }
-
-                Section {
-                    NavigationLink(L("高级设置", "Advanced")) { AdvancedSettings(vm: vm) }
-                }
-
-                Section(L("状态", "Status")) {
-                    LabeledContent(L("虚拟机", "Machine"), value: vm.vmStatusText)
-                    LabeledContent("JIT", value: vm.isJITLive ? L("已开启", "On") : L("未开启", "Off"))
-                    ThermalStateRow() // app-jit hook
-                    LabeledContent(L("画面", "Screen"),
-                                   value: vm.fbWidth > 0 ? "\(vm.fbWidth) × \(vm.fbHeight)" : "-")
-                    LabeledContent(L("显卡", "Graphics"), value: vm.gpuStatusSummary)
-                    LabeledContent(L("外接键盘", "Hardware keyboard"),
-                                   value: vm.hardwareKeyboard ? L("已连接", "Connected") : L("未连接", "Not connected"))
-                    if vm.supportsLaptopPosture {
-                        LabeledContent(L("铰链", "Hinge"), value: hingeText)
-                    }
+        NavigationSplitView(columnVisibility: $columns) {
+            List(SettingsPage.allCases, selection: $page) { p in
+                NavigationLink(value: p) {
+                    Label(p.title, systemImage: p.icon)
                 }
             }
-            .navigationTitle(vm.machineTitle + L(" 设置", " Settings"))
-            .navigationBarTitleDisplayMode(.inline)
+            .navigationTitle(L("设置", "Settings"))
             .toolbar {
                 ToolbarItem(placement: .confirmationAction) {
                     Button(L("完成", "Done")) {
@@ -792,8 +683,228 @@ private struct SettingsSheet: View {
                     }
                 }
             }
+        } detail: {
+            NavigationStack {
+                pageView(page ?? .display)
+                    .navigationTitle((page ?? .display).title)
+                    .navigationBarTitleDisplayMode(.inline)
+            }
+            .id(page) // another page starts at its top, not inside the last one's Advanced
+        }
+        .navigationSplitViewStyle(.balanced)
+        // DisplaySettingsSection and PortForwardingSection may read the model from the environment.
+        .environmentObject(vm)
+        .onAppear {
+            // Wide: open on the first page beside the sidebar. Narrow: start at the list.
+            if page == nil && horizontalSizeClass == .regular { page = .display }
         }
         .onDisappear { vm.saveCPUName() }
+        .modifier(PageSizedSheet())
+    }
+
+    @ViewBuilder
+    private func pageView(_ p: SettingsPage) -> some View {
+        switch p {
+        case .display: displayPage
+        case .input: inputPage
+        case .network: networkPage
+        case .system: systemPage
+        case .status: statusPage
+        }
+    }
+
+    // MARK: Display
+
+    private var displayPage: some View {
+        Form {
+            DisplaySettingsSection() // display size, sharpness: DisplaySettings.swift
+
+            Section {
+                if vm.isLinux {
+                    LabeledContent("OpenGL", value: "virgl")
+                    LabeledContent("Vulkan", value: "Venus")
+                } else {
+                    Toggle(L("3D 加速（DirectX 11）", "3D acceleration (DirectX 11)"), isOn: Binding(
+                        get: { vm.gpu3DEnabled },
+                        set: { vm.setGPU3D($0) }
+                    ))
+                }
+                // Frame rate and Sharpness (the former HiDPI switch) are per screen in the Display section
+                // above; the switch stays only for the former sizing, which has no Sharpness.
+                if display.legacy {
+                    Toggle(L("高分辨率（HiDPI）", "High resolution (HiDPI)"), isOn: Binding(
+                        get: { vm.hiDPIDisplay },
+                        set: { _ in vm.toggleHiDPIDisplay() }
+                    ))
+                }
+            } header: {
+                Text(L("图形", "Graphics"))
+            } footer: {
+                Text(vm.isLinux
+                     ? L("Arch Linux 的 GPU 加速始终开启：OpenGL 走 virgl，Vulkan 走 Venus（驱动随系统装好）。高分辨率在下次启动时生效。",
+                         "GPU acceleration is always on for Arch Linux: OpenGL through virgl, Vulkan through Venus (the drivers come with the system). High resolution applies at the next start.")
+                     : L("3D 需要先在 Windows 里装好 3D 驱动（运行 WINKIT 盘里的 START.bat）。如果开启后黑屏，在这里关掉再重启 App。在下次启动 Windows 时生效。",
+                         "3D needs the 3D driver installed in Windows first (run START.bat on the WINKIT disk). If the screen stays black after turning it on, turn it off here and restart the app. Applies the next time Windows starts."))
+            }
+
+            Section {
+                ForEach(chromeSurfaces, id: \.self) { s in
+                    Toggle(s.title, isOn: Binding(
+                        get: { chrome.isImmersive(s) },
+                        set: { on in chrome.setImmersive(on, for: s, reason: "Settings") }
+                    ))
+                }
+            } header: {
+                Text(L("沉浸全屏", "Immersive"))
+            } footer: {
+                Text(L("沉浸全屏时没有工具栏、状态栏和侧边栏，Windows 铺满屏幕。四指轻点（或三指轻点），或从左右边缘向内轻扫，控制按钮就回来。每种姿态分别记住。上面“沉浸全屏时”选改成整块屏幕：最清晰，切换时 Windows 改一次分辨率；选保持分辨率：放大显示，不闪。",
+                       "Immersive hides the toolbar, the status bar and the side bar: Windows fills the screen. Tap with four fingers (or three), or swipe in from the left or right edge, to bring the controls back. Remembered for each posture. \"In immersive full screen\" above: the whole panel is sharpest, Windows changes resolution once; keeping the resolution draws Windows larger, with no flash."))
+            }
+        }
+    }
+
+    /// Immersive is remembered per surface: the cover and Laptop only on a foldable.
+    private var chromeSurfaces: [ChromeSurface] {
+        vm.supportsLaptopPosture ? [.studio, .laptop, .cover] : [.studio]
+    }
+
+    // MARK: Input
+
+    private var inputPage: some View {
+        Form {
+            Section {
+                Picker(L("触摸屏幕时", "Touching the screen"), selection: $vm.directTouch) {
+                    Text(L("触控板", "Trackpad")).tag(false)
+                    Text(L("直接触摸", "Direct touch")).tag(true)
+                }
+                .pickerStyle(.segmented)
+            } header: {
+                Text(L("触控", "Touch"))
+            } footer: {
+                Text(vm.directTouch
+                    ? L("轻点 = 在手指位置左键 · 双指轻点或长按 = 右键 · 单指拖动 = 拖拽 · 双指滑动 = 滚动 · 四指（或三指）轻点 = 显示/隐藏控制按钮",
+                        "Tap = left click where you touch · Two-finger tap or long press = right click · Drag = drag · Two-finger slide = scroll · Four-finger (or three-finger) tap = show or hide the controls")
+                    : L("单指滑动 = 移动光标 · 单指轻点 = 左键 · 双指轻点 = 右键 · 双指滑动 = 滚动 · 轻点后立刻按住拖动（或长按后拖动）= 拖拽 · 四指（或三指）轻点 = 显示/隐藏控制按钮",
+                        "Slide = move pointer · Tap = left click · Two-finger tap = right click · Two-finger slide = scroll · Tap then hold and move (or long press, then move) = drag · Four-finger (or three-finger) tap = show or hide the controls"))
+            }
+
+            Section {
+                Picker(L("键盘按钮", "Keyboard button"), selection: $chrome.keyboardButtonOnLeft) {
+                    Text(L("右下角", "Bottom right")).tag(false)
+                    Text(L("左下角", "Bottom left")).tag(true)
+                }
+                Toggle(L("在文本框里自动弹出键盘", "Keyboard comes up in text boxes"), isOn: $keyboardAutoShow)
+                Toggle(L("画面跟随光标", "Follow the cursor"), isOn: $keyboardFollow)
+                LabeledContent(L("外接键盘", "Hardware keyboard"),
+                               value: vm.hardwareKeyboard ? L("已连接", "Connected") : L("未连接", "Not connected"))
+            } header: {
+                Text(L("键盘", "Keyboard"))
+            } footer: {
+                Text(L("也可以直接把键盘按钮拖到另一侧。连着外接键盘时不显示。自动弹出和跟随光标需要 WinKit 的焦点助手（运行 WINKIT 盘里的 START.bat）：Windows 里的文本框得到焦点时弹出 iPhone 键盘；键盘挡住光标时画面上移，不再缩小。",
+                       "You can also drag the keyboard button to the other side. Hidden while a hardware keyboard is attached. Coming up by itself and following the cursor need WinKit's focus agent (run START.bat from the WINKIT drive): the iPhone keyboard comes up when a text box in Windows gets the focus, and the picture moves up instead of shrinking when the keyboard would cover the cursor."))
+            }
+
+            if !vm.isLinux { ClipboardSettingsSection() } // clipboard hook
+
+            if vm.supportsLaptopPosture {
+                Section {
+                    Picker(L("姿态", "Posture"), selection: Binding(
+                        get: { vm.postureMode },
+                        set: { vm.setPostureMode($0, viewportSize: vm.viewportSize) }
+                    )) {
+                        ForEach(PostureMode.allCases, id: \.self) { mode in
+                            Text(mode.title).tag(mode)
+                        }
+                    }
+                } header: {
+                    Text(L("折叠屏", "Foldable"))
+                } footer: {
+                    Text(L("笔记本：半折时折痕以上是 Windows，以下是键盘和触控板（上面直接触摸；“更多”里可以让下一次轻点变成右键，F12 回到全屏）。全屏：Windows 占满整个屏幕。自动：按折叠角度切换，没有角度读数时，竖着拿展开的内屏就是笔记本。Windows 的分辨率跟着画面大小变（需要 WinKit 的显卡驱动）。",
+                           "Laptop: half folded, Windows is above the fold and a keyboard and trackpad below it (touch Windows directly; More can make the next tap a right click, F12 goes back to Studio). Studio: Windows fills the screen. Automatic follows the hinge; without a hinge reading, the unfolded inner screen held upright is Laptop. Windows' resolution follows the screen's shape (with the WinKit display driver)."))
+                }
+            }
+        }
+    }
+
+    // MARK: Network
+
+    private var networkPage: some View {
+        Form {
+            PortForwardingSection() // forwarded ports: PortForwarding.swift
+        }
+    }
+
+    // MARK: System
+
+    private var systemPage: some View {
+        Form {
+            Section {
+                if !vm.isLinux {
+                    HStack {
+                        Text(L("CPU 名称", "CPU name"))
+                        TextField(L("自动", "Automatic"), text: $vm.cpuName)
+                            .multilineTextAlignment(.trailing)
+                            .autocorrectionDisabled()
+                            .onSubmit { vm.saveCPUName() }
+                    }
+                }
+                Toggle(L("JIT 就绪后自动启动 ", "Start ") + vm.machineTitle + L("", " automatically once JIT is on"), isOn: $vm.autoStart)
+                if !vm.isLinux {
+                    Toggle(L("Windows 里的登录链接用 Safari 打开", "Open sign-in links from Windows in Safari"), isOn: Binding(
+                        get: { vm.useSafariForOAuth },
+                        set: { _ in vm.toggleOAuthBrowserMode() }
+                    ))
+                }
+            } footer: {
+                if !vm.isLinux {
+                    Text(L("CPU 名称是 Windows 里显示的处理器名字，下次启动生效。留空时用设备的芯片名（例如 Apple A20 Pro），不认识的设备显示 Apple Silicon。",
+                           "The CPU name is what Windows shows for the processor; applies at the next start. Left empty, it is the device's chip (e.g. Apple A20 Pro), or Apple Silicon on a device the app does not know."))
+                }
+            }
+
+            Section {
+                NavigationLink(L("高级设置", "Advanced")) { AdvancedSettings(vm: vm) }
+            }
+        }
+    }
+
+    // MARK: Status
+
+    private var statusPage: some View {
+        Form {
+            Section {
+                LabeledContent(L("虚拟机", "Machine"), value: vm.vmStatusText)
+                LabeledContent("JIT", value: vm.isJITLive ? L("已开启", "On") : L("未开启", "Off"))
+                ThermalStateRow() // app-jit hook
+                LabeledContent(L("画面", "Screen"),
+                               value: vm.fbWidth > 0 ? "\(vm.fbWidth) × \(vm.fbHeight)" : "-")
+                LabeledContent(L("显卡", "Graphics"), value: vm.gpuStatusSummary)
+                LabeledContent(L("外接键盘", "Hardware keyboard"),
+                               value: vm.hardwareKeyboard ? L("已连接", "Connected") : L("未连接", "Not connected"))
+                if vm.supportsLaptopPosture {
+                    LabeledContent(L("铰链", "Hinge"), value: hingeText)
+                }
+                TimelineView(.periodic(from: .now, by: 2)) { _ in
+                    LabeledContent(L("键盘", "Keyboard"), value: KeyboardDiagnostics.shared.statusLine)
+                }
+            }
+
+            DisplayStatusSection() // what the display does and costs: DisplaySettings.swift
+
+            // What iOS reported for the chrome, to check the layout on a device (also in winvm.log, "chrome:").
+            Section {
+                LabeledContent(L("当前屏幕", "Surface"), value: chrome.surface.title
+                               + (chrome.isImmersive ? L("（沉浸）", " (immersive)") : ""))
+                LabeledContent(L("显示区域", "Display area"), value: chrome.screenSummary)
+                LabeledContent(L("安全区 上/前/下/后", "Safe area T/L/B/T"), value: chrome.safeAreaSummary)
+                LabeledContent(L("竖栏", "Vertical bar"), value: chrome.verticalBarSide.title)
+                LabeledContent(L("竖栏行为", "Vertical bar behaviour"), value: chrome.verticalBarPath)
+                LabeledContent(L("折痕", "Fold"), value: chrome.foldSource)
+                LabeledContent(L("遮挡区域", "Occluded regions"), value: chrome.occlusionSummary)
+            } header: {
+                Text(L("布局", "Layout"))
+            }
+        }
     }
 
     /// The hinge as UIHingeInteraction last reported it.
@@ -807,6 +918,17 @@ private struct SettingsSheet: View {
         default: status = L("未知", "unknown")
         }
         return String(format: "%.0f° · ", deg) + status
+    }
+}
+
+/// iOS 18 and later: the settings sheet is page sized, wide enough for the sidebar where there is room.
+private struct PageSizedSheet: ViewModifier {
+    func body(content: Content) -> some View {
+        if #available(iOS 18.0, *) {
+            content.presentationSizing(.page)
+        } else {
+            content
+        }
     }
 }
 

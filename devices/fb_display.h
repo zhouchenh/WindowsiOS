@@ -77,7 +77,39 @@ void hv_fb_metal_set_layer(HvFbDisplay *fb, void *ca_metal_layer);
 /* Refresh rate of the presented frames (default 60): set any time, global. */
 void hv_fb_metal_set_fps(int fps);
 int hv_fb_metal_fps(void);
+/* Pan/zoom of the shown picture (keyboard pan, viewport zoom): zoom >= 1 about the drawable's centre, then
+   moved by (tx, ty) as fractions of the drawable (y down). 1, 0, 0 = as fitted. Any thread. */
+void hv_fb_metal_set_view_transform(float zoom, float tx, float ty);
 uint64_t hv_fb_metal_frames(HvFbDisplay *fb);
+
+/* Presentation engine controls (one presenter per process; set from any thread). */
+/* Hold the last good frame: frames of another size are not shown until one of w x h arrives, or ms have
+   passed (then the newest frame is shown letterboxed). w == 0 (or ms == 0) ends a hold. */
+void hv_fb_metal_hold_for_size(uint32_t w, uint32_t h, uint32_t ms);
+/* Called (on the presenter's thread) when a hold ends by itself: a frame of its size came, or its deadline
+   passed, frame or no frame. Not for hv_fb_metal_hold_for_size's own clearing. */
+void hv_fb_metal_set_hold_end_handler(void (*fn)(void *opaque), void *opaque);
+/* Touch, key or pointer input: the display link goes back to its full rate at once (idle throttling). */
+void hv_fb_metal_note_input(void);
+/* 1: the former placement (aspect fit, linear filtering) for HV_DISPLAY_LEGACY; 0: whole-pixel placement,
+   nearest sampling at integer scales. */
+void hv_fb_metal_set_legacy_fit(int legacy);
+
+typedef struct HvFbMetalStats {
+    uint64_t frames;       /* frames presented */
+    uint64_t ticks;        /* display-link callbacks */
+    uint64_t held;         /* frames not shown while holding for a new size */
+    uint64_t cpu_ns;       /* presenter thread CPU time */
+    uint64_t upload_bytes; /* guest pixels copied into textures */
+    int link_hz;           /* the display link's current preferred rate */
+    int idle;              /* throttled: no new guest frame and no input for a while */
+    int nearest;           /* the last frame was drawn at an integer scale with nearest sampling */
+    int holding;           /* a hold for a new size is in effect */
+    uint32_t src_w, src_h; /* the last frame */
+    uint32_t dst_w, dst_h; /* the drawable it went to */
+    uint32_t scale_x100;   /* the last frame's on-screen scale (drawable pixels per guest pixel) x 100 */
+} HvFbMetalStats;
+void hv_fb_metal_get_stats(HvFbMetalStats *out);
 int hv_fb_save_png(HvFbDisplay *fb, const char *path);
 
 #endif

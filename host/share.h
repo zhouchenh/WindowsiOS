@@ -9,11 +9,36 @@
 #define HV_SHARE_ADDR "10.0.2.4"
 int hv_share_start(const char *folder, const char *socket_path, const char *agent);
 
-/* The device's clipboard, for the guest to pick up. */
-void hv_share_set_clipboard(const char *text);
+/* The clipboard: one slot of UTF-8 text both sides copy into (docs/clipboard.md). The guest's helper
+   waits for the device's with GET /.henge/clipboard?since=N and sends its own with PUT. */
+#define HV_SHARE_CLIP_MAX (1024 * 1024) /* bytes of text */
+#define HV_SHARE_CLIP_FROM_DEVICE 0
+#define HV_SHARE_CLIP_FROM_GUEST 1
+/* The device's clipboard, for the guest to pick up. Returns the slot's new sequence number, or 0 if
+   nothing changed: empty, not UTF-8, larger than HV_SHARE_CLIP_MAX, or the text the slot has already. */
+unsigned long hv_share_set_clipboard(const char *text);
+/* The same, but always a change, even with the slot's own text: the person sent it on purpose, and
+   Windows may have copied something that is not text since. */
+unsigned long hv_share_push_clipboard(const char *text);
 /* What the guest last copied, once: a malloc'd string, or NULL if nothing is new. */
 char *hv_share_take_clipboard(void);
-/* Seconds since the helper in macOS was last heard from, or -1 if it never has been. */
+/* The slot as it is (malloc'd, or NULL when empty), its sequence number and HV_SHARE_CLIP_FROM_*. */
+char *hv_share_get_clipboard(unsigned long *seq, int *origin);
+/* Called on the server's thread, without locks held, when the guest copies something new and nothing
+   the guest copied is waiting for hv_share_take_clipboard already: once until the app takes it, however
+   often the guest copies meanwhile (the take gets the newest). */
+typedef void (*hv_share_clip_fn)(unsigned long seq, void *opaque);
+void hv_share_set_clipboard_listener(hv_share_clip_fn fn, void *opaque);
+/* Seconds since the guest's clipboard helper was last heard from: 0 while it waits for news, -1 never. */
+long hv_share_clipboard_agent_seen(void);
+/* The sequence number the helper last asked ?since= for. It asks again only once it has put what it got
+   on the guest's clipboard (or with &missed=1 when it could not, or &active=0 from a session not on the
+   screen, which leave this as it was), so a value >= what hv_share_push_clipboard returned means Ctrl+V
+   can go. */
+unsigned long hv_share_clipboard_agent_has(void);
+/* 1 if len bytes at text are UTF-8 without NUL and at most HV_SHARE_CLIP_MAX long. */
+int hv_share_clip_valid(const char *text, size_t len);
+/* Seconds since any helper in the guest was last heard from, or -1 if it never has been. */
 long hv_share_agent_seen(void);
 
 /* Enable/disable host SafariSheet handling of guest `/.henge/open-url` requests (0 -> guest falls back to Edge). */
@@ -23,5 +48,17 @@ int hv_share_url_handler_enabled(void);
 char *hv_share_take_open_url(void);
 /* Returns 1 (once) when the guest OAuth callback relay completed an auth redirect. */
 int hv_share_take_oauth_done(void);
+
+/* ---- /.henge/focus: the WinKit focus agent in Windows (winkit/FocusAgent.cs) ---- */
+/* Called on a connection thread with each focus report the agent PUTs (a JSON object, NUL-terminated). */
+typedef void (*HvShareFocusHandler)(const char *json, size_t len, void *opaque);
+void hv_share_set_focus_handler(HvShareFocusHandler handler, void *opaque);
+/* Seconds since the focus agent was last heard from, or -1 if never. */
+long hv_share_focus_agent_seen(void);
+/* Queues UTF-8 text for the agent to type (\b = Backspace, \n = Enter). 0, or -1 when no agent is listening. */
+int hv_share_focus_send_text(const char *utf8);
+/* 1 while queued text waits for the agent, or just after it took some: keys sent another way now could
+   overtake it. */
+int hv_share_focus_text_busy(void);
 
 #endif

@@ -23,7 +23,7 @@ MAC_FRAMEWORKS = -framework Cocoa -framework Foundation -framework QuartzCore -f
                  -framework AudioToolbox
 
 CORE_TESTS = $(B)/test_classify $(B)/test_jit_region $(B)/test_operands $(B)/test_jit $(B)/test_mem \
-             $(B)/test_mmu $(B)/test_exc
+             $(B)/test_mmu $(B)/test_exc $(B)/test_share_clip $(B)/test_share_focus
 
 all: $(CORE_TESTS) $(B)/hvsparse $(B)/winvm
 
@@ -56,6 +56,15 @@ $(B)/test_operands: tests/test_operands.c tests/operand_cases.s $(B)/operands.o
 	$(CC) $(CFLAGS) $^ -o $@
 $(B)/test_mmu: tests/test_mmu.c $(ENGINE)
 	$(CC) $(CFLAGS) tests/test_mmu.c $(ENGINE) -o $@
+# The shared clipboard (host/share.c) over its socket, under the address and UB sanitizers.
+# share.c's /.henge/forwards calls the port-forward engine: stubbed (tests/share_net_fwd_stub.c).
+$(B)/test_share_clip: tests/test_share_clip.c host/share.c host/share.h tests/share_net_fwd_stub.c | $(B)
+	$(CC) $(CFLAGS) -fsanitize=address,undefined -fno-sanitize-recover=all tests/test_share_clip.c host/share.c \
+		tests/share_net_fwd_stub.c -o $@
+# /.henge/focus (the WinKit focus agent's endpoint) over the same socket.
+$(B)/test_share_focus: tests/test_share_focus.c host/share.c host/share.h tests/share_net_fwd_stub.c | $(B)
+	$(CC) $(CFLAGS) -fsanitize=address,undefined -fno-sanitize-recover=all tests/test_share_focus.c host/share.c \
+		tests/share_net_fwd_stub.c -o $@
 
 # Guest DNS proxy against a stand-in resolver (no network needed).
 $(B)/test_dns_lifecycle: tests/test_dns_lifecycle.c $(B)/dns_proxy.o
@@ -76,8 +85,13 @@ $(B)/libresolv_no_ipv6.dylib: tests/resolv_no_ipv6.c | $(B)
 $(B)/test_net_ipv6: tests/test_net_ipv6.c host/net_slirp.c host/dns_proxy.c host/*.h $(B)/libresolv_no_ipv6.dylib | $(B)
 	$(CC) $(CFLAGS) $(SLIRP_CFLAGS) tests/test_net_ipv6.c host/net_slirp.c host/dns_proxy.c \
 	      $(B)/libresolv_no_ipv6.dylib -Wl,-rpath,@executable_path $(SLIRP_LIBS) -lresolv -o $@
-test-net: $(B)/test_net_ipv6
+# Port forwards (TCP and UDP, IPv4 and IPv6, loopback / local network / VPN, add, edit, remove, port in use, the saved
+# list) through libslirp to a stand-in guest that echoes: no network needed.
+$(B)/test_net_fwd: tests/test_net_fwd.c host/net_slirp.c host/dns_proxy.c host/*.h | $(B)
+	$(CC) $(CFLAGS) $(SLIRP_CFLAGS) tests/test_net_fwd.c host/net_slirp.c host/dns_proxy.c $(SLIRP_LIBS) -lresolv -o $@
+test-net: $(B)/test_net_ipv6 $(B)/test_net_fwd
 	$(B)/test_net_ipv6
+	$(B)/test_net_fwd
 
 $(B)/hvsparse: tools/hvsparse_main.c host/hvsparse.c host/hvsparse.h | $(B)
 	$(CC) $(CFLAGS) tools/hvsparse_main.c host/hvsparse.c -o $@

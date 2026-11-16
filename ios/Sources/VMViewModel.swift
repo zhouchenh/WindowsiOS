@@ -98,13 +98,19 @@ final class VMViewModel: ObservableObject {
         didSet { UserDefaults.standard.set(postureMode.rawValue, forKey: "winios.posture") }
     }
     @Published var deckLayout: DeckLayout = .split
-    @Published var controlBarVisible: Bool = true
+    // chrome (feat/chrome): the session controls are standard toolbar items now, shown or hidden by
+    // immersive mode per surface (ChromeModel in SessionChrome.swift), so controlBarVisible and
+    // autoHideControlBar (winios.autoHideBar) are gone.
     @Published var trackpadMode: Bool = false
     @Published var rightClickArmed: Bool = false
     @Published var systemKeyboardVisible: Bool = false
     @Published var activeSafariURL: IdentifiableURL? = nil
     @Published var useSafariForOAuth: Bool = WinIOSBridge.shared.useSafariForGuestLinks
+    /// Sharp (true) or Balanced on the current screen; kept in step by DisplaySettings.
     @Published var hiDPIDisplay: Bool = WinIOSBridge.shared.hiDPIDisplay
+    /// Display Size, Sharpness, frame rate and immersive sizing per screen (DisplaySettings.swift). The session
+    /// view sets display.immersive while Windows is shown edge to edge.
+    let display = DisplaySettings.shared
 
     // MARK: Settings shown in the app
     /// false: the screen works like a trackpad. true: taps land where the finger is.
@@ -112,11 +118,6 @@ final class VMViewModel: ObservableObject {
         didSet { UserDefaults.standard.set(directTouch, forKey: "winios.directTouch") }
     }
     @Published var showSettings: Bool = false
-    /// The toolbar hides by itself once Windows is used again (a tap, a drag, a click on the screen).
-    /// On by default on a foldable, where the screen is small and the toolbar covers part of it.
-    @Published var autoHideControlBar: Bool = (UserDefaults.standard.object(forKey: "winios.autoHideBar") as? Bool) ?? VMViewModel.isKnownFoldable {
-        didSet { UserDefaults.standard.set(autoHideControlBar, forKey: "winios.autoHideBar") }
-    }
     /// Advanced: JIT code cache in MiB (0 = default, the largest) and the most guest RAM in MiB (0 = automatic).
     /// Both are fixed when JIT is acquired, so a change applies after the app is closed and opened again.
     /// Refresh rate of the machine's screen (all machines): 30, 60 (default) or 120 where the screen can.
@@ -124,6 +125,7 @@ final class VMViewModel: ObservableObject {
         didSet {
             UserDefaults.standard.set(frameRate, forKey: "winios.fps")
             WinIOSBridge.shared.setDisplayFrameRate(frameRate)
+            DisplaySettings.shared.frameRateDidChange(frameRate) // remembered for the current screen
         }
     }
     static var frameRateChoices: [Int] { [30, 60, 120].filter { $0 <= UIScreen.main.maximumFramesPerSecond } }
@@ -546,6 +548,7 @@ function ai {
         let bridge = WinIOSBridge.shared
         bridge.installTrapGuard()
         bridge.setDisplayFrameRate(frameRate)
+        display.attach(to: self) // per-screen display settings, pushed before Windows can start
         bridge.onStateChanged = { [weak self] in
             Task { @MainActor in
                 self?.syncFromBridge()
@@ -579,10 +582,15 @@ function ai {
         }
     }
 
-    /// Native-pixel Windows resolution (sharp; set Windows scaling to ~200%). Applies at the next Windows boot.
+    /// The former HiDPI switch: Sharp (on) or Balanced (off) for the current screen; changes now, Windows'
+    /// scale with it. With HV_DISPLAY_LEGACY it is the old native-pixel switch.
     func toggleHiDPIDisplay() {
         hiDPIDisplay.toggle()
-        WinIOSBridge.shared.hiDPIDisplay = hiDPIDisplay
+        if WinIOSBridge.shared.displayLegacy {
+            WinIOSBridge.shared.hiDPIDisplay = hiDPIDisplay
+        } else {
+            display.sharpness = hiDPIDisplay ? .sharp : .balanced
+        }
         UIImpactFeedbackGenerator(style: .light).impactOccurred()
     }
 
