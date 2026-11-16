@@ -16,12 +16,21 @@ final class MetalCanvasUIView: UIView, UIKeyInput {
     var directTouch: Bool = false
     var onThreeFingerTap: (() -> Void)?
     var onKeyboardDismissed: (() -> Void)?
+    /// The laptop deck's F8: the next one-finger tap is a right click.
+    var rightClickArmed: Bool = false
+    var onRightClickConsumed: (() -> Void)?
+    /// Windows was used: a touch gesture (not the three-finger tap) or a click with a mouse.
+    var onUserInteraction: (() -> Void)?
+    /// false when the view's size never follows the on-screen keyboard (the laptop lid): then it
+    /// reports its size for the Windows resolution even while it has the keyboard focus.
+    var keyboardResizesView: Bool = true
     /// A hardware keyboard (Magic Keyboard, Bluetooth, USB) is attached: its keys go straight to
     /// Windows, and the on-screen key row is not shown.
     var hardwareKeyboard: Bool = false {
         didSet {
             guard oldValue != hardwareKeyboard else { return }
             if isFirstResponder { reloadInputViews() }
+            setNeedsLayout()
         }
     }
     private var keysDown: Set<UInt8> = []
@@ -112,8 +121,9 @@ final class MetalCanvasUIView: UIView, UIKeyInput {
             WinIOSBridge.shared.updateScreenSize(winBounds, scale: scale)
         }
         // While the on-screen keyboard is up the view is shorter: do not ask Windows to change
-        // resolution for that.
-        if bounds.width > 0 && bounds.height > 0 && !isFirstResponder {
+        // resolution for that. With a hardware keyboard (focus without the on-screen keyboard) or in
+        // the laptop lid (never resized by the keyboard) the size is the real one.
+        if bounds.width > 0 && bounds.height > 0 && (!isFirstResponder || hardwareKeyboard || !keyboardResizesView) {
             WinIOSBridge.shared.updateDisplayViewSize(bounds.size)
         }
     }
@@ -161,6 +171,7 @@ final class MetalCanvasUIView: UIView, UIKeyInput {
             let (nx, ny) = normalizedPoint(for: t.location(in: self))
             pointerButtons = (event?.buttonMask.contains(.secondary) ?? false) ? 2 : 1
             PointerController.shared.moveAbsolute(x: nx, y: ny, extraButtons: pointerButtons)
+            onUserInteraction?()
         }
         let newFingers = touches.filter { $0.type != .indirectPointer }
         guard !newFingers.isEmpty else { return }
@@ -253,6 +264,7 @@ final class MetalCanvasUIView: UIView, UIKeyInput {
         cancelLongPress()
         let now = CACurrentMediaTime()
         let wasTap = !cancelled && travelled <= tapSlop && (now - gestureStart) <= tapMaxDuration
+        if maxFingers < 3 && !cancelled { onUserInteraction?() }
 
         if dragging {
             dragging = false
@@ -263,6 +275,19 @@ final class MetalCanvasUIView: UIView, UIKeyInput {
         guard wasTap, !consumed else { return }
         switch maxFingers {
         case 1:
+            if rightClickArmed {
+                // armed from the deck (F8): this tap is a right click, once
+                rightClickArmed = false
+                onRightClickConsumed?()
+                mediumHaptic.impactOccurred(intensity: 0.7)
+                if directTouch {
+                    let (nx, ny) = normalizedPoint(for: firstPoint)
+                    PointerController.shared.directTapAt(x: nx, y: ny, buttonMask: 2)
+                } else {
+                    PointerController.shared.clickAtCurrent(buttonMask: 2)
+                }
+                break
+            }
             lightHaptic.impactOccurred(intensity: 0.5)
             if directTouch {
                 let (nx, ny) = normalizedPoint(for: firstPoint)
@@ -611,6 +636,11 @@ struct MetalDisplayView: UIViewRepresentable {
     /// False while a sheet (settings, Safari) needs the keyboard.
     var focusAllowed: Bool
     var onThreeFingerTap: () -> Void
+    /// Set by the laptop deck's F8: the next one-finger tap is a right click (cleared once used).
+    var rightClickArmed: Binding<Bool> = .constant(false)
+    /// false for the laptop lid, whose size does not change with the on-screen keyboard.
+    var keyboardResizesView: Bool = true
+    var onUserInteraction: (() -> Void)? = nil
 
     func makeUIView(context: Context) -> MetalCanvasUIView {
         let view = MetalCanvasUIView(frame: .zero)
@@ -625,6 +655,16 @@ struct MetalDisplayView: UIViewRepresentable {
         uiView.directTouch = directTouch
         uiView.hardwareKeyboard = hardwareKeyboard
         uiView.onThreeFingerTap = onThreeFingerTap
+        uiView.onUserInteraction = onUserInteraction
+        uiView.rightClickArmed = rightClickArmed.wrappedValue
+        let armed = rightClickArmed
+        uiView.onRightClickConsumed = {
+            DispatchQueue.main.async { armed.wrappedValue = false }
+        }
+        if uiView.keyboardResizesView != keyboardResizesView {
+            uiView.keyboardResizesView = keyboardResizesView
+            uiView.setNeedsLayout()
+        }
         let wantsFocus = focusAllowed && (keyboardVisible || hardwareKeyboard)
         if wantsFocus && !uiView.isFirstResponder {
             DispatchQueue.main.async { _ = uiView.becomeFirstResponder() }

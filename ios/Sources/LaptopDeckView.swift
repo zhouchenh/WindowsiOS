@@ -31,6 +31,9 @@ struct WindowsLogoMark: View {
 final class TrackpadGlassUIView: UIView {
     var onActivityChanged: ((Bool) -> Void)?
     var onCornerClickState: ((Int) -> Void)? // 0 = none, 1 = left held, 2 = right held
+    /// F8 armed a right click: the next tap on the pad is one (the Windows screen takes it too).
+    var rightClickArmed: Bool = false
+    var onRightClickConsumed: (() -> Void)?
 
     private var panLast: CGPoint = .zero
     private var scrollAccum: CGFloat = 0
@@ -140,6 +143,13 @@ final class TrackpadGlassUIView: UIView {
             PointerController.shared.clickAtCurrent(buttonMask: 2)
             return
         }
+        if rightClickArmed {
+            rightClickArmed = false
+            onRightClickConsumed?()
+            rightHaptic.impactOccurred(intensity: 0.75)
+            PointerController.shared.clickAtCurrent(buttonMask: 2)
+            return
+        }
         lastTapEndedTime = CACurrentMediaTime()
         clickHaptic.impactOccurred(intensity: 0.55)
         PointerController.shared.clickAtCurrent(buttonMask: 1)
@@ -208,6 +218,7 @@ final class TrackpadGlassUIView: UIView {
 struct TrackpadGlassRepresentable: UIViewRepresentable {
     @Binding var isTouching: Bool
     @Binding var cornerClickState: Int
+    @Binding var rightClickArmed: Bool
 
     func makeUIView(context: Context) -> TrackpadGlassUIView {
         let v = TrackpadGlassUIView(frame: .zero)
@@ -220,7 +231,12 @@ struct TrackpadGlassRepresentable: UIViewRepresentable {
         return v
     }
 
-    func updateUIView(_ uiView: TrackpadGlassUIView, context: Context) {}
+    func updateUIView(_ uiView: TrackpadGlassUIView, context: Context) {
+        uiView.rightClickArmed = rightClickArmed
+        uiView.onRightClickConsumed = {
+            DispatchQueue.main.async { self.rightClickArmed = false }
+        }
+    }
 }
 
 // MARK: - Surface Laptop 6-Row Keyboard Model
@@ -231,6 +247,7 @@ private enum FunctionAction: Equatable {
     case search
     case explorer
     case edgeBrowser
+    case claudeCode
     case paintApp
     case taskManager
     case altTab
@@ -242,6 +259,9 @@ private enum FunctionAction: Equatable {
     case openStudioMode
     case acpiPower
     case forwardDelete
+
+    /// Runs something inside Windows (Win+R or the WinKit helper): on Arch Linux the key is its F key.
+    var isWindowsOnly: Bool { self == .edgeBrowser || self == .claudeCode || self == .paintApp }
 }
 
 private enum KeyRole: Equatable {
@@ -317,6 +337,7 @@ struct LaptopDeckView: View {
         .fnKey("f2",    action: .search,          fnHid: 0x3b, fnTag: "F2", symbol: "magnifyingglass"),
         .fnKey("f3",    action: .explorer,        fnHid: 0x3c, fnTag: "F3", symbol: "folder"),
         .fnKey("f4",    action: .edgeBrowser,     fnHid: 0x3d, fnTag: "F4", symbol: "globe"),
+        .fnKey("f5",    action: .claudeCode,      fnHid: 0x3e, fnTag: "F5", symbol: "sparkles"),
         .fnKey("f6",    action: .paintApp,        fnHid: 0x3f, fnTag: "F6", symbol: "paintbrush.pointed"),
         .fnKey("f7",    action: .showDesktop,     fnHid: 0x40, fnTag: "F7", symbol: "menubar.rectangle"),
         .fnKey("f8",    action: .rightClickArm,   fnHid: 0x41, fnTag: "F8", symbol: "computermouse"),
@@ -657,7 +678,7 @@ struct LaptopDeckView: View {
                             isFunctionStrip: isFunctionStrip,
                             isShiftActive: shiftLatched || capsLocked,
                             isLatchedOrLED: isKeyLEDLit(spec),
-                            isFnActive: fnActive,
+                            isFnActive: fnActive || showsPlainFunctionKey(spec),
                             onKeyDown: { handleKeyDown(spec, viewportWidth: rowGeo.size.width) },
                             onKeyUp: { handleKeyUp(spec) }
                         )
@@ -694,6 +715,12 @@ struct LaptopDeckView: View {
         }
     }
 
+    /// On Arch Linux the keys that run something inside Windows are plain F keys, and say so.
+    private func showsPlainFunctionKey(_ spec: LaptopKeySpec) -> Bool {
+        if case .functionKey(let action, _, _, _, _) = spec.role { return vm.isLinux && action.isWindowsOnly }
+        return false
+    }
+
     private func sendModifiedTap(_ hid: UInt8) {
         if ctrlLatched { WinIOSBridge.shared.sendKeyHid(0xe0, down: true) }
         if altLatched  { WinIOSBridge.shared.sendKeyHid(0xe2, down: true) }
@@ -724,7 +751,7 @@ struct LaptopDeckView: View {
             toggleModifierLatch(hid: hid)
 
         case .functionKey(let action, let fnHid, _, _, _):
-            if fnActive, let fnHid {
+            if fnActive || (vm.isLinux && action.isWindowsOnly), let fnHid {
                 sendModifiedTap(fnHid)
                 return
             }
@@ -769,6 +796,8 @@ struct LaptopDeckView: View {
             WinIOSBridge.shared.sendKeyCombo(withModifiers: [NSNumber(value: 0xe3)], key: 0x08) // Win+E
         case .edgeBrowser:
             vm.launchGuestEdgeBrowser()
+        case .claudeCode:
+            vm.installClaudeCode()
         case .paintApp:
             vm.launchGuestPaint()
         case .taskManager:
@@ -878,7 +907,8 @@ struct LaptopDeckView: View {
 
                 TrackpadGlassRepresentable(
                     isTouching: $padTouching,
-                    cornerClickState: $cornerClickState
+                    cornerClickState: $cornerClickState,
+                    rightClickArmed: $vm.rightClickArmed
                 )
             }
             .frame(width: padW, height: height)
