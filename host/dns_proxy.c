@@ -11,7 +11,12 @@
 
    Ported from Henge (Leviidev/Henge 2eb9b77, 17e9ed9, b537dbb, 6aefa03). Here the on/off switch is this file's own
    (HV_DNS_PROXY, read at each hv_dns_proxy_start) instead of one of Henge's engine knobs, and the reverse names of
-   link-local addresses also stay with libslirp. */
+   link-local addresses also stay with libslirp.
+
+   IPv6: queries to the guest's IPv6 name server (hv_dns_proxy_set_nameserver6) are answered the same way. Only the
+   plain form is taken: UDP right after the fixed IPv6 header (no extension headers), a payload length that the frame
+   holds and that is exactly the UDP datagram, and a correct UDP checksum (mandatory over IPv6); anything else goes
+   to libslirp untouched. The answer carries its own UDP checksum. */
 #include "dns_proxy.h"
 
 #include <dns_sd.h>
@@ -29,6 +34,8 @@
 #define MAX_RDATA 1024
 #define MAX_INFLIGHT 64
 #define TIMEOUT_MS 4000
+#define MAX_UDP4 1472 /* the largest answer in one unfragmented 1500-byte frame: 1500 - 20 (IPv4) - 8 (UDP) */
+#define MAX_UDP6 1452 /* 1500 - 40 (IPv6) - 8 */
 
 typedef struct {
     uint16_t type, rclass, rdlen;
@@ -42,7 +49,7 @@ typedef struct {
     uint32_t len;
     uint32_t ip_off, udp_off, dns_off, qend; /* offsets into frame; qend: the end of the question */
     uint16_t qtype, qclass, udp_max;
-    int edns;
+    int edns, v6;
     char name[1025];
     Answer ans[MAX_ANSWERS];
     int nans, nodata, failed, done;
@@ -55,6 +62,15 @@ static atomic_int stopping;
 static atomic_int enabled; /* this session: HV_DNS_PROXY (on unless 0), until the resolver gives up (GIVE_UP) */
 static pthread_mutex_t lifecycle_mu = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t lifecycle_cv = PTHREAD_COND_INITIALIZER;
+static uint8_t nameserver6[16]; /* the guest's IPv6 name server, if ns6_set */
+static atomic_int ns6_set;
+
+void hv_dns_proxy_set_nameserver6(const uint8_t *addr16) {
+    atomic_store(&ns6_set, 0);
+    if (!addr16) return;
+    memcpy(nameserver6, addr16, 16);
+    atomic_store(&ns6_set, 1); /* sequentially consistent: the address is visible to whoever sees the flag */
+}
 
 static void lookup_finished(void) {
     pthread_mutex_lock(&lifecycle_mu);
@@ -160,24 +176,38 @@ static void DNSSD_API on_record(DNSServiceRef ref, DNSServiceFlags flags, uint32
     if (!more && (q->nans || q->nodata)) q->done = 1;
 }
 
-static uint16_t ip_checksum(const uint8_t *p, uint32_t n) {
-    uint32_t s = 0;
+/* One's-complement sum of n bytes (RFC 1071), added to s; folded to 16 bits. */
+static uint32_t sum16(uint32_t s, const uint8_t *p, uint32_t n) {
     for (uint32_t i = 0; i + 1 < n; i += 2) s += (uint32_t)(p[i] << 8 | p[i + 1]);
     if (n & 1) s += (uint32_t)p[n - 1] << 8;
     while (s >> 16) s = (s & 0xffff) + (s >> 16);
-    return (uint16_t)~s;
+    return s;
 }
 
-/* The reply frame, from 10.0.2.3:53 to the guest's port, with rcode and the answers that fit. */
+static uint16_t ip_checksum(const uint8_t *p, uint32_t n) {
+    return (uint16_t)~sum16(0, p, n);
+}
+
+/* The sum of a UDP datagram over IPv6 with its pseudo-header (RFC 8200 section 8.1): ip is the IPv6 header, for its
+   addresses. 0xffff when the datagram's own checksum field is right. */
+static uint32_t udp6_sum(const uint8_t *ip, const uint8_t *udp, uint32_t udplen) {
+    uint32_t s = sum16(0, ip + 8, 32); /* source and destination */
+    s += (udplen >> 16) + (udplen & 0xffff) + 17;
+    return sum16(s, udp, udplen);
+}
+
+/* The reply frame, from the name server the guest asked (10.0.2.3, or the IPv6 one) port 53 to the guest's port,
+   with rcode and the answers that fit. */
 static void reply(Query *q, int rcode) {
-    static const size_t cap = 14 + 20 + 8 + 4096;
+    const uint32_t hl = q->v6 ? 40 : 20;
+    const size_t cap = 14 + hl + 8 + 4096;
     uint8_t *f = calloc(1, cap);
     if (!f) return;
     const uint8_t *in = q->frame;
     memcpy(f, in + 6, 6);     /* to the guest's MAC */
     memcpy(f + 6, in, 6);     /* from the one it sent to */
-    f[12] = 0x08, f[13] = 0x00;
-    uint8_t *ip = f + 14, *udp = ip + 20, *dns = udp + 8;
+    f[12] = q->v6 ? 0x86 : 0x08, f[13] = q->v6 ? 0xdd : 0x00;
+    uint8_t *ip = f + 14, *udp = ip + hl, *dns = udp + 8;
     uint32_t qlen = q->qend - q->dns_off;  /* header and question, as asked */
     memcpy(dns, in + q->dns_off, qlen);
     const uint8_t *qh = in + q->dns_off;
@@ -186,7 +216,7 @@ static void reply(Query *q, int rcode) {
     wr16(dns + 4, 1);
     wr16(dns + 8, 0);
     uint32_t limit = q->udp_max, n = qlen, nans = 0;
-    if (limit > cap - 14 - 20 - 8) limit = (uint32_t)(cap - 14 - 20 - 8); /* never past the buffer above */
+    if (limit > cap - 14 - hl - 8) limit = (uint32_t)(cap - 14 - hl - 8); /* never past the buffer above */
     int truncated = 0;
     for (int i = 0; i < q->nans; i++) {
         const Answer *a = &q->ans[i];
@@ -218,19 +248,31 @@ static void reply(Query *q, int rcode) {
     } else {
         wr16(dns + 10, 0);
     }
-    uint32_t udplen = 8 + n, iplen = 20 + udplen;
+    uint32_t udplen = 8 + n, iplen = hl + udplen;
     const uint8_t *qip = in + q->ip_off, *qudp = in + q->udp_off;
-    ip[0] = 0x45;
-    wr16(ip + 2, iplen);
-    ip[8] = 64;
-    ip[9] = 17;
-    memcpy(ip + 12, qip + 16, 4); /* from 10.0.2.3 */
-    memcpy(ip + 16, qip + 12, 4); /* to the guest */
-    wr16(ip + 10, ip_checksum(ip, 20));
     wr16(udp, 53);
     memcpy(udp + 2, qudp, 2);
     wr16(udp + 4, udplen);
-    wr16(udp + 6, 0); /* no UDP checksum: allowed over IPv4 */
+    wr16(udp + 6, 0);
+    if (q->v6) {
+        ip[0] = 0x60;                  /* version 6, traffic class and flow label 0 */
+        wr16(ip + 4, udplen);          /* payload length */
+        ip[6] = 17;                    /* next header: UDP */
+        ip[7] = 64;                    /* hop limit */
+        memcpy(ip + 8, qip + 24, 16);  /* from the name server */
+        memcpy(ip + 24, qip + 8, 16);  /* to the guest */
+        uint16_t c = (uint16_t)~udp6_sum(ip, udp, udplen);
+        wr16(udp + 6, c ? c : 0xffff); /* mandatory over IPv6; a computed 0 is sent as 0xffff (RFC 768) */
+    } else {
+        ip[0] = 0x45;
+        wr16(ip + 2, iplen);
+        ip[8] = 64;
+        ip[9] = 17;
+        memcpy(ip + 12, qip + 16, 4); /* from 10.0.2.3 */
+        memcpy(ip + 16, qip + 12, 4); /* to the guest */
+        wr16(ip + 10, ip_checksum(ip, 20));
+        /* no UDP checksum: allowed over IPv4 */
+    }
     q->send(f, 14 + iplen, 1);
     free(f);
 }
@@ -285,15 +327,45 @@ int hv_dns_proxy_on(void) {
     return atomic_load(&enabled) != 0;
 }
 
-int hv_dns_proxy_take(const uint8_t *p, uint32_t len, HvDnsSend send) {
-    if (!hv_dns_proxy_on() || len < 14 + 20 + 8 + 12 || p[12] != 0x08 || p[13] != 0x00) return 0;
+/* An IPv6 query's frame: the IPv6 and UDP headers checked, its IP packet length (header and payload) in *iplen.
+   Returns 0 for anything to leave with libslirp. */
+static int ipv6_query(const uint8_t *p, uint32_t len, uint32_t *iplen) {
+    if (!atomic_load(&ns6_set) || len < 14 + 40 + 8 + 12) return 0;
+    if (p[0] & 1) return 0;                       /* to a multicast MAC: not ours to answer from */
     const uint8_t *ip = p + 14;
-    uint32_t ihl = (uint32_t)(ip[0] & 15) * 4;
-    if ((ip[0] >> 4) != 4 || ihl < 20 || ip[9] != 17) return 0;
-    if (ip[16] != 10 || ip[17] != 0 || ip[18] != 2 || ip[19] != 3) return 0; /* to 10.0.2.3 */
-    if ((rd16(ip + 6) & 0x3fff) != 0) return 0;                            /* fragments: libslirp's */
-    uint32_t iplen = rd16(ip + 2);
-    if (iplen > len - 14 || iplen < ihl + 8 + 12) return 0;
+    if ((ip[0] >> 4) != 6) return 0;
+    if (ip[6] != 17) return 0;                    /* UDP right after the header: extension headers are libslirp's */
+    if (memcmp(ip + 24, nameserver6, 16)) return 0; /* to the IPv6 name server */
+    static const uint8_t unspecified[16];
+    if (ip[8] == 0xff || !memcmp(ip + 8, unspecified, 16)) return 0; /* from a multicast or no address */
+    uint32_t plen = rd16(ip + 4);                 /* 0 would be a jumbogram, which needs a hop-by-hop header */
+    if (plen < 8 + 12 || plen > len - 14 - 40) return 0;
+    /* As over IPv4: the whole packet is kept (to hand back as it came), so it must fit Query.frame. */
+    if (14 + 40 + plen > sizeof ((Query *)0)->frame) return 0;
+    const uint8_t *udp = ip + 40;
+    if (rd16(udp + 4) != plen) return 0;          /* the payload is the UDP datagram, nothing before or after it */
+    if (!rd16(udp + 6) || udp6_sum(ip, udp, plen) != 0xffff) return 0; /* no or a wrong checksum: libslirp drops it */
+    *iplen = 40 + plen;
+    return 1;
+}
+
+int hv_dns_proxy_take(const uint8_t *p, uint32_t len, HvDnsSend send) {
+    if (!hv_dns_proxy_on() || len < 14 + 20 + 8 + 12) return 0;
+    const uint8_t *ip = p + 14;
+    uint32_t ihl, iplen;
+    int v6 = p[12] == 0x86 && p[13] == 0xdd;
+    if (v6) {
+        if (!ipv6_query(p, len, &iplen)) return 0;
+        ihl = 40;
+    } else {
+        if (p[12] != 0x08 || p[13] != 0x00) return 0;
+        ihl = (uint32_t)(ip[0] & 15) * 4;
+        if ((ip[0] >> 4) != 4 || ihl < 20 || ip[9] != 17) return 0;
+        if (ip[16] != 10 || ip[17] != 0 || ip[18] != 2 || ip[19] != 3) return 0; /* to 10.0.2.3 */
+        if ((rd16(ip + 6) & 0x3fff) != 0) return 0;                            /* fragments: libslirp's */
+        iplen = rd16(ip + 2);
+        if (iplen > len - 14 || iplen < ihl + 8 + 12) return 0;
+    }
     /* The whole IP packet is kept (to hand back as it came), so it must fit Query.frame: a total length past the
        UDP datagram's end would otherwise run over the fields after it. Real queries end with their UDP payload. */
     if (14 + iplen > sizeof ((Query *)0)->frame) return 0;
@@ -323,7 +395,8 @@ int hv_dns_proxy_take(const uint8_t *p, uint32_t len, HvDnsSend send) {
         }
         q->edns = 1;
         uint32_t size = rd16(dns + qend + 3);
-        q->udp_max = (uint16_t)(size < 512 ? 512 : size > 1472 ? 1472 : size); /* one unfragmented frame */
+        uint32_t most = v6 ? MAX_UDP6 : MAX_UDP4;  /* one unfragmented frame */
+        q->udp_max = (uint16_t)(size < 512 ? 512 : size > most ? most : size);
     }
     if (q->qclass != 1 || q->qtype == 0 || q->qtype == 252 || q->qtype == 251) { /* IN only; no zone transfers */
         free(q);
@@ -340,6 +413,7 @@ int hv_dns_proxy_take(const uint8_t *p, uint32_t len, HvDnsSend send) {
     memcpy(q->frame, p, 14 + iplen);
     q->len = 14 + iplen;
     q->ip_off = 14, q->udp_off = 14 + ihl, q->dns_off = 14 + ihl + 8, q->qend = q->dns_off + qend;
+    q->v6 = v6;
     q->send = send;
     pthread_t t;
     pthread_attr_t at;
@@ -354,6 +428,42 @@ int hv_dns_proxy_take(const uint8_t *p, uint32_t len, HvDnsSend send) {
         return 0;
     }
     return 1;
+}
+
+/* libslirp's Router Advertisements name its IPv6 name server (RDNSS, RFC 8106) only when the host's own resolver
+   configuration lists an IPv6 server (get_dns6_addr, res_ninit on Apple), and they do not set the O flag, so the
+   guest asks no DHCPv6 server either. Where that list has no IPv6 server (IPv4-only networks, or a resolver
+   configuration an iOS app cannot read), the guest would never learn of the IPv6 name server this proxy answers
+   for. While the proxy is on, each advertisement without an RDNSS option gets one, as libslirp's own would be. */
+#define RDNSS_LIFETIME 1200 /* seconds: libslirp's (twice its longest interval between advertisements) */
+
+uint32_t hv_dns_proxy_announce(const uint8_t *p, uint32_t len, uint8_t *out, uint32_t cap) {
+    if (!hv_dns_proxy_on() || !atomic_load(&ns6_set)) return 0;
+    if (len < 14 + 40 + 16 || p[12] != 0x86 || p[13] != 0xdd) return 0;
+    const uint8_t *ip = p + 14, *icmp = ip + 40;
+    if ((ip[0] >> 4) != 6 || ip[6] != 58 || icmp[0] != 134 || icmp[1] != 0) return 0; /* ICMPv6 RA */
+    uint32_t plen = rd16(ip + 4);
+    if (plen < 16 || 14 + 40 + plen != len) return 0;
+    for (uint32_t off = 16; off < plen;) { /* the options after the RA's 16 bytes */
+        if (off + 2 > plen) return 0;
+        uint32_t olen = icmp[off + 1] * 8u;
+        if (!olen || off + olen > plen) return 0;
+        if (icmp[off] == 25) return 0; /* has an RDNSS already */
+        off += olen;
+    }
+    if (len + 24 > cap || plen + 24 > 0xffff) return 0;
+    memcpy(out, p, len);
+    uint8_t *oip = out + 14, *oicmp = oip + 40, *o = out + len;
+    o[0] = 25, o[1] = 3, o[2] = o[3] = 0; /* RDNSS, 3 x 8 bytes, reserved */
+    o[4] = (uint8_t)(RDNSS_LIFETIME >> 24), o[5] = (uint8_t)(RDNSS_LIFETIME >> 16);
+    o[6] = (uint8_t)(RDNSS_LIFETIME >> 8), o[7] = (uint8_t)RDNSS_LIFETIME;
+    memcpy(o + 8, nameserver6, 16);
+    plen += 24;
+    wr16(oip + 4, plen);
+    wr16(oicmp + 2, 0);
+    uint32_t s = sum16(0, oip + 8, 32) + (plen >> 16) + (plen & 0xffff) + 58;
+    wr16(oicmp + 2, (uint16_t)~sum16(s, oicmp, plen));
+    return len + 24;
 }
 
 void hv_dns_proxy_stats(uint64_t *n_answered, uint64_t *n_handed_back, uint64_t *n_timed_out) {

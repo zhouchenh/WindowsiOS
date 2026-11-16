@@ -42,6 +42,7 @@ cd AppleVM-Duo
 
 ```sh
 make -j8 all && make test-core      # macOS runner build/winvm, build/hvsparse, core JIT/MMU tests
+make test-dns test-net              # guest DNS proxy (sanitizers, fuzz) and guest network, IPv4 + IPv6
 scripts/build_ios_deps.sh           # once: libffi + glib + libslirp for iOS into ios/deps/
 make -j8 ios-lib                    # build/ios/libwinvm.a (the engine for the app)
 ```

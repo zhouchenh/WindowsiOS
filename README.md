@@ -23,6 +23,10 @@ template. See `git log` for the full list of changes.
 notes further down name the original author's bundle id and signing; follow docs/building.md
 instead.
 
+**Networking:** the guest is behind user-mode NAT, with IPv4 and IPv6 (`HV_IPV6=0` turns IPv6
+off). Addresses, DNS, port forwards, why there is no bridged mode and what to use instead:
+[docs/networking.md](docs/networking.md).
+
 **Licences and credits:** the source is GPL-2.0-or-later ([`LICENSE`](LICENSE)), from the projects
 above. Built apps may also contain unmodified frameworks from [UTM](https://github.com/utmapp/UTM)'s
 iOS build (virglrenderer, DXMT, ANGLE, libepoxy, the Vulkan loader, MoltenVK, KosmicKrisp, zstd),

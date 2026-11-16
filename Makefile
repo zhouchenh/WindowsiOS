@@ -67,6 +67,18 @@ test-dns: $(B)/test_dns_lifecycle $(B)/test_dns_parse
 	$(B)/test_dns_lifecycle
 	$(B)/test_dns_parse
 
+# The guest's network end to end (IPv6 router and neighbour discovery, DNS over IPv6 and IPv4, fail-fast
+# connections, HV_IPV6=0): host/net_slirp.c and dns_proxy.c over Homebrew's libslirp, with stand-ins for the
+# virtio-net device and the system resolver. No network needed. libresolv_no_ipv6.dylib hides this Mac's IPv6
+# name servers from libslirp, so the DNS proxy's own announcement is what gets tested.
+$(B)/libresolv_no_ipv6.dylib: tests/resolv_no_ipv6.c | $(B)
+	$(CC) $(CFLAGS) -dynamiclib -install_name @rpath/libresolv_no_ipv6.dylib $< -lresolv -o $@
+$(B)/test_net_ipv6: tests/test_net_ipv6.c host/net_slirp.c host/dns_proxy.c host/*.h $(B)/libresolv_no_ipv6.dylib | $(B)
+	$(CC) $(CFLAGS) $(SLIRP_CFLAGS) tests/test_net_ipv6.c host/net_slirp.c host/dns_proxy.c \
+	      $(B)/libresolv_no_ipv6.dylib -Wl,-rpath,@executable_path $(SLIRP_LIBS) -lresolv -o $@
+test-net: $(B)/test_net_ipv6
+	$(B)/test_net_ipv6
+
 $(B)/hvsparse: tools/hvsparse_main.c host/hvsparse.c host/hvsparse.h | $(B)
 	$(CC) $(CFLAGS) tools/hvsparse_main.c host/hvsparse.c -o $@
 
@@ -114,7 +126,7 @@ ios-lib: $(IB)/libwinvm.a
 clean:
 	rm -rf $(B)
 
-.PHONY: all test-core test-dns ios-lib clean
+.PHONY: all test-core test-dns test-net ios-lib clean
 
 # ---- Windows guest tools: build/guest/WinIOSBrowser.exe (the OAuth bridge, see docs/oauth-bridge.md) ----
 # Freestanding AArch64 Win32: no CRT, only kernel32/ws2_32 imports. Needs Homebrew llvm and lld.

@@ -4,6 +4,13 @@
    host's own resolver (dns_proxy.c, from Henge), not libslirp's choice of name server;
    HV_DNS_PROXY=0 leaves it all to libslirp.
 
+   IPv6 too, unless HV_IPV6=0: the guest configures itself by SLAAC from libslirp's Router
+   Advertisements for fd2d:7064:6c3f:2::/64 (host ::2, DNS ::3, the DNS proxy announcing
+   ::3 when libslirp would not). The prefix is a unique local one (RFC 4193: fd + a random
+   40-bit global ID + subnet 2, like 10.0.2.x), so it cannot clash with real networks, and
+   Windows prefers IPv4 for names that have both (RFC 6724: ULA source, global destination).
+   docs/networking.md has the whole picture.
+
    libslirp is not thread-safe, so it lives on one thread with its sockets and
    timers. Frames the guest sends are queued to it (and the thread woken through
    a pipe); frames for the guest are queued the other way and handed to the
@@ -61,6 +68,11 @@ static int npfd;
 uint64_t hv_net_tx_frames, hv_net_rx_frames;
 
 static char share_socket[256];
+
+/* IPv6 (see the top): the /64 prefix, the host and the name server. */
+#define V6_PREFIX "fd2d:7064:6c3f:2::"
+#define V6_HOST V6_PREFIX "2"
+#define V6_DNS V6_PREFIX "3"
 
 typedef struct FwdReq {
     int host_port, guest_port;
@@ -210,6 +222,14 @@ static void log_frame(const char *dir, const uint8_t *p, uint32_t len) {
         }
         fprintf(stderr, "net %s ipv4 %u.%u.%u.%u:%u -> %u.%u.%u.%u:%u proto %u len %u\n", dir, p[26], p[27], p[28],
                 p[29], sp, p[30], p[31], p[32], p[33], dp, proto, len);
+    } else if (et == 0x86dd && len >= 54) {
+        char src[INET6_ADDRSTRLEN], dst[INET6_ADDRSTRLEN];
+        inet_ntop(AF_INET6, p + 22, src, sizeof src);
+        inet_ntop(AF_INET6, p + 38, dst, sizeof dst);
+        unsigned nh = p[20], sp = 0, dp = 0;
+        if ((nh == 6 || nh == 17) && len >= 58) sp = p[54] << 8 | p[55], dp = p[56] << 8 | p[57];
+        else if (nh == 58 && len >= 55) sp = p[54]; /* ICMPv6: its type */
+        fprintf(stderr, "net %s ipv6 [%s]:%u -> [%s]:%u nh %u len %u\n", dir, src, sp, dst, dp, nh, len);
     } else {
         fprintf(stderr, "net %s ethertype %#06x len %u\n", dir, et, len);
     }
@@ -226,8 +246,13 @@ static int64_t now_ms(void) {
 static slirp_ssize_t send_packet(const void *buf, size_t len, void *opaque) {
     (void)opaque;
     if (len > MAX_FRAME) return (slirp_ssize_t)len;
-    log_frame("rx", buf, (uint32_t)len);
-    if (push(&to_guest, buf, (uint32_t)len)) hv_machine_wake(machine);
+    const uint8_t *frame = buf;
+    uint32_t n = (uint32_t)len;
+    uint8_t ra[1600]; /* a Router Advertisement with the DNS proxy's address added (dns_proxy.c) */
+    uint32_t ra_len = n <= sizeof ra - 24 ? hv_dns_proxy_announce(frame, n, ra, sizeof ra) : 0;
+    if (ra_len) frame = ra, n = ra_len;
+    log_frame("rx", frame, n);
+    if (push(&to_guest, frame, n)) hv_machine_wake(machine);
     return (slirp_ssize_t)len;
 }
 
@@ -430,12 +455,25 @@ int hv_net_attach(HvMachine *m, HvVirtioNet *n) {
     inet_pton(AF_INET, "10.0.2.2", &cfg.vhost);
     inet_pton(AF_INET, "10.0.2.15", &cfg.vdhcp_start);
     inet_pton(AF_INET, "10.0.2.3", &cfg.vnameserver);
+    const char *v6env = getenv("HV_IPV6");
+    int v6 = !v6env || atoi(v6env) != 0; /* on unless 0 */
+    struct in6_addr dns6;
+    inet_pton(AF_INET6, V6_DNS, &dns6);
+    if (v6) {
+        cfg.in6_enabled = true;
+        inet_pton(AF_INET6, V6_PREFIX, &cfg.vprefix_addr6);
+        cfg.vprefix_len = 64;
+        inet_pton(AF_INET6, V6_HOST, &cfg.vhost6);
+        cfg.vnameserver6 = dns6;
+    }
     cfg.vhostname = "hengevm";
     cfg.if_mtu = 1500;
     cfg.if_mru = 1500;
     slirp = slirp_new(&cfg, &callbacks, NULL);
     if (!slirp) return -1;
-    hv_dns_proxy_start(); /* before the guest can transmit: queries to 10.0.2.3 go to the host's resolver */
+    hv_dns_proxy_set_nameserver6(v6 ? dns6.s6_addr : NULL);
+    hv_dns_proxy_start(); /* before the guest can transmit: queries to 10.0.2.3 (and ::3) go to the host's resolver */
+    fprintf(stderr, "winvm: net: IPv4 10.0.2.15/24%s\n", v6 ? ", IPv6 " V6_PREFIX "/64 (SLAAC)" : ", IPv6 off (HV_IPV6=0)");
     if (getenv("HV_NET_FWD")) { /* debugging: "hostport:guestport", from this Mac's loopback into the guest */
         int hp, gp;
         struct in_addr h, g;
