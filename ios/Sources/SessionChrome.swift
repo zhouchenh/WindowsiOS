@@ -46,6 +46,10 @@ final class ChromeModel: ObservableObject {
     @Published var keyboardButtonOnLeft: Bool = UserDefaults.standard.bool(forKey: "winios.chrome.fabLeft") {
         didSet { UserDefaults.standard.set(keyboardButtonOnLeft, forKey: "winios.chrome.fabLeft") }
     }
+    /// The floating keyboard button is shown at all. Off: the controls' Keyboard button is the way in.
+    @Published var keyboardButtonShown: Bool = UserDefaults.standard.object(forKey: "winios.chrome.fabShown") as? Bool ?? true {
+        didSet { UserDefaults.standard.set(keyboardButtonShown, forKey: "winios.chrome.fabShown") }
+    }
     @Published private(set) var hint: String? = nil
 
     // What the system reported, for Settings > Status and the log.
@@ -830,6 +834,13 @@ struct KeyboardFloatingButton: View {
         .buttonStyle(.plain)
         .accessibilityLabel(L("键盘", "Keyboard"))
         .accessibilityHint(L("拖到另一侧可以换到左下角或右下角", "Drag to the other side to move it to the other corner"))
+        .contextMenu {
+            Button(L("隐藏键盘按钮", "Hide Keyboard Button"), systemImage: "eye.slash") {
+                withAnimation(.snappy(duration: 0.2)) { chrome.keyboardButtonShown = false }
+                chrome.showHint(L("键盘按钮已隐藏：用控制栏里的“键盘”，或在设置 › 键盘里打开。",
+                                  "Keyboard button hidden: use Keyboard in the controls, or turn it back on in Settings › Keyboard."))
+            }
+        }
         .simultaneousGesture(
             DragGesture(minimumDistance: 12)
                 .onChanged { drag = $0.translation.width }

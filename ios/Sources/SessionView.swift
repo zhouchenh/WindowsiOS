@@ -182,7 +182,7 @@ struct SessionView: View {
             .offset(x: canvas.origin.x, y: canvas.origin.y)
             .opacity(vm.isVMRunning ? 1 : 0)
 
-            if vm.isVMRunning && !laptop && !vm.hardwareKeyboard && !vm.systemKeyboardVisible {
+            if vm.isVMRunning && !laptop && chrome.keyboardButtonShown && !vm.hardwareKeyboard && !vm.systemKeyboardVisible {
                 KeyboardFloatingButton(chrome: chrome, area: canvas.visibleRect, occlusions: occlusions) {
                     UIImpactFeedbackGenerator(style: .light).impactOccurred()
                     vm.systemKeyboardVisible = true
@@ -789,9 +789,12 @@ private struct SettingsSheet: View {
             }
 
             Section {
-                Picker(L("键盘按钮", "Keyboard button"), selection: $chrome.keyboardButtonOnLeft) {
-                    Text(L("右下角", "Bottom right")).tag(false)
-                    Text(L("左下角", "Bottom left")).tag(true)
+                Toggle(L("悬浮键盘按钮", "Floating keyboard button"), isOn: $chrome.keyboardButtonShown.animation(.snappy(duration: 0.2)))
+                if chrome.keyboardButtonShown {
+                    Picker(L("键盘按钮位置", "Keyboard button position"), selection: $chrome.keyboardButtonOnLeft) {
+                        Text(L("右下角", "Bottom right")).tag(false)
+                        Text(L("左下角", "Bottom left")).tag(true)
+                    }
                 }
                 Toggle(L("在文本框里自动弹出键盘", "Keyboard comes up in text boxes"), isOn: $keyboardAutoShow)
                 Toggle(L("画面跟随光标", "Follow the cursor"), isOn: $keyboardFollow)
@@ -800,8 +803,8 @@ private struct SettingsSheet: View {
             } header: {
                 Text(L("键盘", "Keyboard"))
             } footer: {
-                Text(L("也可以直接把键盘按钮拖到另一侧。连着外接键盘时不显示。自动弹出和跟随光标需要 WinKit 的焦点助手（运行 WINKIT 盘里的 START.bat）：Windows 里的文本框得到焦点时弹出 iPhone 键盘；键盘挡住光标时画面上移，不再缩小。",
-                       "You can also drag the keyboard button to the other side. Hidden while a hardware keyboard is attached. Coming up by itself and following the cursor need WinKit's focus agent (run START.bat from the WINKIT drive): the iPhone keyboard comes up when a text box in Windows gets the focus, and the picture moves up instead of shrinking when the keyboard would cover the cursor."))
+                Text(L("也可以直接把键盘按钮拖到另一侧，长按它可以隐藏。隐藏后用控制栏里的“键盘”（沉浸全屏时四指或三指轻点显示控制栏）。连着外接键盘时不显示。自动弹出和跟随光标需要 WinKit 的焦点助手（运行 WINKIT 盘里的 START.bat）：Windows 里的文本框得到焦点时弹出 iPhone 键盘；键盘挡住光标时画面上移，不再缩小。",
+                       "You can also drag the keyboard button to the other side, or long-press it to hide it. Without it, use Keyboard in the controls (in immersive full screen a four-finger or three-finger tap shows them). Hidden while a hardware keyboard is attached. Coming up by itself and following the cursor need WinKit's focus agent (run START.bat from the WINKIT drive): the iPhone keyboard comes up when a text box in Windows gets the focus, and the picture moves up instead of shrinking when the keyboard would cover the cursor."))
             }
 
             if !vm.isLinux { ClipboardSettingsSection() } // clipboard hook
