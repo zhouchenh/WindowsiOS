@@ -20,3 +20,9 @@ CODE_SIGN_ENTITLEMENTS = WindowsiOS.entitlements
 
 // Optional and gitignored: your team, bundle id and entitlements. Later settings win.
 #include? "Signing.local.xcconfig"
+
+// scripts/package_ipa.sh --bundle-id sets APPLEVM_RELEASE_BUNDLE_ID on the xcodebuild command line:
+// a release IPA has the repository's bundle id whatever Signing.local.xcconfig says. Not
+// PRODUCT_BUNDLE_IDENTIFIER itself there, which would give the JIT helper (WinJITHelper.xcconfig)
+// the app's id too.
+PRODUCT_BUNDLE_IDENTIFIER = $(APPLEVM_RELEASE_BUNDLE_ID:default=$(inherited))

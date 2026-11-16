@@ -26,6 +26,12 @@ targets:
           - "Resources/**"
       - path: Sources/Resources/henge-jit.js
         buildPhase: resources
+      # builtin-jit: the messages the app and its JIT helper exchange, and the licences of the
+      # helper's StikJIT and of the pairing library (copied as the folder legal/).
+      - path: WinJITHelper/WinJITMessages.swift
+      - path: Sources/Resources/legal
+        type: folder
+        buildPhase: resources
     info:
       path: Sources/Info.plist
       properties:
@@ -57,6 +63,14 @@ targets:
         GCSupportsGameMode: true
         UIBackgroundModes:
           - audio
+        # builtin-jit: on-device pairing (iOS 27) advertises the first, the JIT helper finds the
+        # device's RemotePairing port through the second; the pairing keeps running in the background
+        # as a continued-processing task (docs/builtin-jit.md).
+        NSBonjourServices:
+          - _remotepairing-pairable-host._tcp
+          - _remotepairing._tcp
+        BGTaskSchedulerPermittedIdentifiers:
+          - $(PRODUCT_BUNDLE_IDENTIFIER).pairing.*
         UISupportedInterfaceOrientations:
           - UIInterfaceOrientationLandscapeLeft
           - UIInterfaceOrientationLandscapeRight
@@ -98,7 +112,11 @@ targets:
           - -lffi
           - -lresolv
           - -liconv
+          # builtin-jit: on-device pairing (scripts/build_jit_deps.sh, ios/Sources/Native/HuskRPPairing.h)
+          - -lhusk_rppairing
     dependencies:
+      # builtin-jit: Built-in JIT's debugger process, embedded into PlugIns/ (docs/builtin-jit.md)
+      - target: WinJITHelper
       - sdk: AVFoundation.framework
       - sdk: SafariServices.framework
       - sdk: Metal.framework
@@ -107,3 +125,69 @@ targets:
       - sdk: CoreGraphics.framework
       - sdk: ImageIO.framework
       - sdk: UniformTypeIdentifiers.framework
+    # builtin-jit: the helper links StikJIT; it lives in the app's Frameworks with a minimal
+    # Info.plist (installd refuses a framework without one), signed here when signing is on.
+    # From Henge's project.yml (7b55730).
+    postBuildScripts:
+      - name: Embed StikJIT
+        basedOnDependencyAnalysis: false
+        script: |
+          set -e
+          SRC="$SRCROOT/deps/StikJIT.xcframework/ios-arm64/StikJIT.framework"
+          if [ ! -d "$SRC" ]; then
+            echo "error: $SRC is missing: run scripts/build_jit_deps.sh"
+            exit 1
+          fi
+          DST="$TARGET_BUILD_DIR/$FRAMEWORKS_FOLDER_PATH/StikJIT.framework"
+          rm -rf "$DST"
+          mkdir -p "$(dirname "$DST")"
+          ditto "$SRC" "$DST"
+          rm -rf "$DST/Headers" "$DST/Modules" "$DST/_CodeSignature"
+          PLIST="$DST/Info.plist"
+          if [ ! -f "$PLIST" ]; then
+            plutil -create xml1 "$PLIST"
+            plutil -insert CFBundleIdentifier -string "$PRODUCT_BUNDLE_IDENTIFIER.StikJIT" "$PLIST"
+            plutil -insert CFBundleExecutable -string StikJIT "$PLIST"
+            plutil -insert CFBundleName -string StikJIT "$PLIST"
+            plutil -insert CFBundlePackageType -string FMWK "$PLIST"
+            plutil -insert CFBundleInfoDictionaryVersion -string 6.0 "$PLIST"
+            plutil -insert CFBundleShortVersionString -string 1.9.0 "$PLIST"
+            plutil -insert CFBundleVersion -string 1.9.0 "$PLIST"
+            plutil -insert MinimumOSVersion -string 17.4 "$PLIST"
+            plutil -insert CFBundleSupportedPlatforms -array "$PLIST"
+            plutil -insert CFBundleSupportedPlatforms.0 -string iPhoneOS "$PLIST"
+          fi
+          if [ -n "$EXPANDED_CODE_SIGN_IDENTITY" ] && [ "$CODE_SIGNING_ALLOWED" != "NO" ]; then
+            codesign --force --sign "$EXPANDED_CODE_SIGN_IDENTITY" --timestamp=none "$DST"
+          fi
+
+  # builtin-jit: Built-in JIT's debugger (docs/builtin-jit.md). A process cannot debug itself, so
+  # StikJIT runs in this app extension and attaches to the app over LocalDevVPN. iOS 26 and later.
+  # From Henge's HengeJITHelper (7b55730). Its bundle id is the app's plus ".JITHelper"
+  # (WinJITHelper.xcconfig): a second App ID for free teams.
+  WinJITHelper:
+    type: app-extension
+    platform: iOS
+    deploymentTarget: "26.0"
+    sources:
+      - path: WinJITHelper
+        excludes:
+          - "Info.plist"
+    configFiles:
+      Debug: WinJITHelper.xcconfig
+      Release: WinJITHelper.xcconfig
+    settings:
+      base:
+        PRODUCT_NAME: WinJITHelper
+        INFOPLIST_FILE: WinJITHelper/Info.plist
+        GENERATE_INFOPLIST_FILE: NO
+        APPLICATION_EXTENSION_API_ONLY: YES
+        TARGETED_DEVICE_FAMILY: "1,2"
+        LD_RUNPATH_SEARCH_PATHS:
+          - $(inherited)
+          - "@executable_path/../../Frameworks"
+    dependencies:
+      # StikJIT 1.9.0 (MPL-2.0) with ios/patches/stikjit-high-address.patch, from
+      # scripts/build_jit_deps.sh; embedded into the app's Frameworks by its Embed StikJIT script.
+      - framework: deps/StikJIT.xcframework
+        embed: false

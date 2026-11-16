@@ -14,7 +14,8 @@
 #                       (default ios/WindowsiOS.entitlements: get-task-allow).
 #   --bundle-id ID      Bundle identifier of the IPA (default com.applevm.duo, the one in repo.json).
 #                       ios/Signing.local.xcconfig does not change it: a release IPA always has the
-#                       repository's bundle id unless this option is given.
+#                       repository's bundle id unless this option is given. The Built-in JIT helper
+#                       (PlugIns/WinJITHelper.appex) gets ID.JITHelper.
 #   --tipa              Also write dist/AppleVM-Duo-unsigned.tipa (same archive, other extension).
 #   --out DIR           Output directory (default dist/).
 #
@@ -22,9 +23,11 @@
 # as winkit.img; `make winkit-img` builds it) and the Arch Linux installer (dist/ArchInstaller/*.z,
 # scripts/build_arch_installer.py) when they exist; the summary says which were embedded.
 #
-# Needs ios/deps (scripts/build_ios_deps.sh), Xcode and xcodegen. "Unsigned" means no developer
-# certificate: the app is ad-hoc signed with its entitlements so that re-signing tools (SideStore,
-# AltStore, Sideloadly, LiveContainer, ...) see get-task-allow and keep it.
+# Needs ios/deps (scripts/build_ios_deps.sh and scripts/build_jit_deps.sh), Xcode and xcodegen.
+# "Unsigned" means no developer certificate: the app is ad-hoc signed with its entitlements so that
+# re-signing tools (SideStore, AltStore, Sideloadly, LiveContainer, ...) see get-task-allow and keep
+# it. The JIT helper extension and Frameworks/StikJIT.framework are ad-hoc signed first, without
+# entitlements; a re-signing tool must keep app extensions for Built-in JIT (docs/builtin-jit.md).
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -63,6 +66,8 @@ OUT_DIR="$(cd "$OUT_DIR" && pwd)"
 
 [ -f ios/deps/lib/libslirp.a ] && [ -f ios/deps/lib/libglib-2.0.a ] ||
     die "ios/deps is missing: run scripts/build_ios_deps.sh first"
+[ -d ios/deps/StikJIT.xcframework ] && [ -f ios/deps/lib/libhusk_rppairing.a ] ||
+    die "ios/deps lacks Built-in JIT's StikJIT.xcframework or libhusk_rppairing.a: run scripts/build_jit_deps.sh first"
 command -v xcodegen >/dev/null || die "xcodegen not found (brew install xcodegen)"
 
 WORK="$ROOT/build/package"
@@ -80,7 +85,7 @@ echo "== Release build, unsigned ($(xcodebuild -version | sed -n 1p))"
 if ! xcodebuild -project ios/WindowsiOS.xcodeproj -scheme WindowsiOS -configuration Release \
         -sdk iphoneos -destination 'generic/platform=iOS' -derivedDataPath "$DD" \
         CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY= DEVELOPMENT_TEAM= \
-        PRODUCT_BUNDLE_IDENTIFIER="$BUNDLE_ID" \
+        APPLEVM_RELEASE_BUNDLE_ID="$BUNDLE_ID" \
         build > "$WORK/xcodebuild.log" 2>&1; then
     grep -E "error:|BUILD FAILED" "$WORK/xcodebuild.log" | sort -u | tail -40
     die "xcodebuild failed (full log: $WORK/xcodebuild.log)"
@@ -108,6 +113,16 @@ done
 ARCH_IN="${ARCH_IN# }"
 [ -z "$ARCH_IN" ] || [ "$ARCH_IN" = "$ARCH_FILES" ] ||
     warn "dist/ArchInstaller is incomplete (has only: $ARCH_IN): the app cannot install Arch Linux by itself"
+
+# Built-in JIT: the StikJIT framework and the helper extension that links it, ad-hoc signed inside
+# out before the app (an unsigned build leaves them unsigned). No entitlements: the helper is the
+# debugger, not the app being debugged.
+JIT_FW="$APP/Frameworks/StikJIT.framework"
+JIT_APPEX="$APP/PlugIns/WinJITHelper.appex"
+[ -d "$JIT_FW" ] || die "the build has no Frameworks/StikJIT.framework (Embed StikJIT build phase)"
+[ -d "$JIT_APPEX" ] || die "the build has no PlugIns/WinJITHelper.appex"
+codesign --force --sign - --timestamp=none "$JIT_FW"
+codesign --force --sign - --timestamp=none --generate-entitlement-der "$JIT_APPEX"
 
 # Ad-hoc signature carrying the entitlements; scripts/embed_gpu3d.sh reads them back from it.
 codesign --force --sign - --timestamp=none --entitlements "$ENTITLEMENTS" --generate-entitlement-der "$APP"
@@ -164,6 +179,22 @@ BID="$(plist CFBundleIdentifier)" || fail "Info.plist has no CFBundleIdentifier"
 MINOS="$(plist MinimumOSVersion)" || fail "Info.plist has no MinimumOSVersion"
 VER="$(plist CFBundleShortVersionString || echo '?') ($(plist CFBundleVersion || echo '?'))"
 [ -f "$X/henge-jit.js" ] || fail "henge-jit.js (JIT script) missing"
+# Built-in JIT: the helper, its framework and the licences that travel with them.
+XA="$X/PlugIns/WinJITHelper.appex"
+XF="$X/Frameworks/StikJIT.framework"
+[ -d "$XA" ] || fail "PlugIns/WinJITHelper.appex (Built-in JIT helper) missing"
+[ -f "$XF/StikJIT" ] && [ -f "$XF/Info.plist" ] || fail "Frameworks/StikJIT.framework (binary and Info.plist) missing"
+HBID="$(/usr/libexec/PlistBuddy -c "Print :CFBundleIdentifier" "$XA/Info.plist" 2>/dev/null)" ||
+    fail "WinJITHelper.appex has no CFBundleIdentifier"
+[ "$HBID" = "$BUNDLE_ID.JITHelper" ] || fail "JIT helper bundle id is $HBID, expected $BUNDLE_ID.JITHelper"
+[ "$(/usr/libexec/PlistBuddy -c "Print :NSExtension:NSExtensionPrincipalClass" "$XA/Info.plist" 2>/dev/null)" = WinJITHelperHandler ] ||
+    fail "WinJITHelper.appex has no NSExtensionPrincipalClass WinJITHelperHandler"
+otool -L "$XA/WinJITHelper" > "$WORK/helper-libs.txt"
+grep -q "@rpath/StikJIT.framework/StikJIT" "$WORK/helper-libs.txt" ||
+    fail "WinJITHelper does not link @rpath/StikJIT.framework"
+for f in LICENSE-StikJIT-MPL-2.0.txt LICENSE-idevice-MIT.txt LICENSES-rppairing-crates.txt stikjit-high-address.patch; do
+    [ -f "$X/legal/$f" ] || fail "legal/$f missing"
+done
 codesign --verify --deep --strict "$X" || fail "the ad-hoc signature does not verify"
 codesign -d --entitlements - --xml "$X" 2>/dev/null | grep -q "get-task-allow" || fail "get-task-allow missing from the signature"
 if [ "$GPU3D" = 1 ]; then
@@ -182,6 +213,7 @@ echo "size:         $(stat -f %z "$IPA") bytes"
 echo "sha256:       $(shasum -a 256 "$IPA" | cut -d' ' -f1)"
 echo "bundle id:    $BID, version $VER, iOS $MINOS+"
 echo "entitlements: $(basename "$ENTITLEMENTS") (ad-hoc signed)"
+echo "Built-in JIT: PlugIns/WinJITHelper.appex ($HBID) + Frameworks/StikJIT.framework"
 if [ "$GPU3D" = 1 ]; then echo "3D:           embedded"; else echo "3D:           not embedded (2D graphics only)"; fi
 if [ "$WINKIT" = 1 ]; then echo "WinKit disk:  embedded ($WK)"
 else echo "WinKit disk:  not embedded (no $WK; make winkit-img builds it)"; fi
