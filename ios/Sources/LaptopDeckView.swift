@@ -505,6 +505,17 @@ struct LaptopDeckView: View {
             }
             .frame(width: w, height: h)
         }
+        .onDisappear {
+            // Leaving Laptop (or the deck going away): a modifier the deck pressed must not stay down
+            // in Windows. Each held keycap sends its own key-up in its onDisappear.
+            releaseLatchedModifiers()
+            // F9's drag lock holds the left button in the shared PointerController; this view's
+            // state goes away with the deck, so let the button up or Studio would drag on every touch.
+            if dragLocked {
+                dragLocked = false
+                PointerController.shared.setHeldButton(1, down: false)
+            }
+        }
     }
 
     // MARK: - Midnight-Sapphire Anodized Aluminum Unibody Surface
@@ -997,7 +1008,7 @@ private struct SurfaceKeycapView: View {
     let onKeyUp: () -> Void
 
     @State private var isPressed: Bool = false
-    @State private var repeatTimer: Timer? = nil
+    @State private var repeater = KeyAutoRepeater()
 
     var body: some View {
         let radius: CGFloat = isFunctionStrip ? 3.8 : 4.6
@@ -1068,13 +1079,20 @@ private struct SurfaceKeycapView: View {
                     }
                 }
                 .onEnded { _ in
-                    stopAutoRepeat()
-                    if isPressed {
-                        isPressed = false
-                        onKeyUp()
-                    }
+                    releaseIfPressed()
                 }
         )
+        // The deck can go away mid-press (unfolding flat, F12, a three-finger tap, or another deck
+        // layout); the gesture then never ends, so stop the repeat and let the key up here.
+        .onDisappear { releaseIfPressed() }
+    }
+
+    private func releaseIfPressed() {
+        stopAutoRepeat()
+        if isPressed {
+            isPressed = false
+            onKeyUp()
+        }
     }
 
     private var showsPinLED: Bool {
@@ -1187,17 +1205,31 @@ private struct SurfaceKeycapView: View {
             break
         }
         guard let code = repeatCode else { return }
+        repeater.start(code)
+    }
 
-        stopAutoRepeat()
-        repeatTimer = Timer.scheduledTimer(withTimeInterval: 0.36, repeats: false) { _ in
+    private func stopAutoRepeat() {
+        repeater.stop()
+    }
+}
+
+/// Repeats a held deck key. A reference type, so stopping it reaches the timers it scheduled even
+/// after the keycap view is gone; each start/stop bumps the generation, so a timer callback already
+/// queued from an earlier press does nothing.
+@MainActor
+private final class KeyAutoRepeater {
+    private var timer: Timer?
+    private var generation = 0
+
+    func start(_ code: UInt8) {
+        stop()
+        let gen = generation
+        timer = Timer.scheduledTimer(withTimeInterval: 0.36, repeats: false) { [weak self] _ in
             Task { @MainActor in
-                guard self.isPressed else { return }
-                self.repeatTimer = Timer.scheduledTimer(withTimeInterval: 0.065, repeats: true) { _ in
+                guard let self, self.generation == gen else { return }
+                self.timer = Timer.scheduledTimer(withTimeInterval: 0.065, repeats: true) { [weak self] _ in
                     Task { @MainActor in
-                        guard self.isPressed else {
-                            self.stopAutoRepeat()
-                            return
-                        }
+                        guard let self, self.generation == gen else { return }
                         WinIOSBridge.shared.tapKeyHid(code)
                     }
                 }
@@ -1205,8 +1237,9 @@ private struct SurfaceKeycapView: View {
         }
     }
 
-    private func stopAutoRepeat() {
-        repeatTimer?.invalidate()
-        repeatTimer = nil
+    func stop() {
+        generation &+= 1
+        timer?.invalidate()
+        timer = nil
     }
 }
