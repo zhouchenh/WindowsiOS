@@ -75,6 +75,11 @@ final class ClipboardSync: ObservableObject {
     /// longer there, so that what Check or the paste button in settings found can be read.
     @Published private(set) var notice: Toast?
 
+    /// Whether the machine is Windows. The Linux machine runs the same share server, but has no helper and
+    /// no clipboard settings: there nothing is read from or written to the iPhone's clipboard, and what a
+    /// program in Linux puts in the slot is dropped. Set by .clipboardSync(windows:).
+    var forWindows = true
+
     private let defaults = UserDefaults.standard
     private var bridge: WinIOSBridge { WinIOSBridge.shared }
     private var started = false
@@ -132,7 +137,7 @@ final class ClipboardSync: ObservableObject {
     private func takeGuestText() {
         lastGuestTake = CACurrentMediaTime()
         guard let text = bridge.takeGuestClipboard() else { return }
-        guard fromWindows else { return } // taken, so that it does not arrive later
+        guard fromWindows, forWindows else { return } // taken, so that it does not arrive later
         if UIApplication.shared.applicationState == .active {
             putOnPasteboard(text)
         } else {
@@ -150,6 +155,11 @@ final class ClipboardSync: ObservableObject {
     /// iPhone after it: a newer copy in another app is the one the person wants (and the one sent to Windows
     /// next, if that is on), not to be replaced by older text from Windows.
     private func becameActive() {
+        guard forWindows else {
+            pendingFromWindows = nil
+            _ = bridge.takeGuestClipboard() // dropped, as in takeGuestText
+            return
+        }
         let changeCount = UIPasteboard.general.changeCount // reading it never asks
         if let pending = pendingFromWindows {
             pendingFromWindows = nil
@@ -169,6 +179,7 @@ final class ClipboardSync: ObservableObject {
     /// the shared clipboard holds this text already (Windows may have copied a picture since), and pasted
     /// in Windows if that is on: only here, never after an automatic send, which no one asked to type.
     func sendToWindows(_ text: String) {
+        guard forWindows else { return }
         knownChangeCount = UIPasteboard.general.changeCount
         send(text, force: true, paste: pasteAfterSend)
     }

@@ -120,7 +120,9 @@ time, unless the person chose Allow for it. So:
   the slot and the helper takes it when it starts into an empty clipboard).
 
 `ClipboardSettingsSection` (the switches, the paste permission, the helper's status) is mounted in the
-settings sheet; `.clipboardSync()` starts the sync and shows the confirmations.
+settings sheet; `.clipboardSync(windows:)` starts the sync and shows the confirmations. Only for Windows:
+the Linux machine runs the same share server but has no helper and no clipboard settings, so there the
+app neither reads nor writes the iPhone's clipboard, and what a Linux program PUTs is dropped.
 
 ## Only on the device
 

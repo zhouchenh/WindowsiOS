@@ -59,7 +59,7 @@ struct SessionView: View {
         .statusBarHidden(true)
         .persistentSystemOverlays(.hidden)
         .defersSystemGestures(on: .all)
-        .clipboardSync() // clipboard hook
+        .clipboardSync(windows: !vm.isLinux) // clipboard hook
         .onOpenURL { JITSetup.shared.handleOpenURL($0) } // app-jit hook
         .onAppear {
             WinIOSBridge.shared.updateScreenSize(UIScreen.main.bounds.size, scale: UIScreen.main.scale)

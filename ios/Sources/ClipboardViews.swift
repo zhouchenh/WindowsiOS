@@ -97,11 +97,13 @@ struct ClipboardSettingsSection: View {
 }
 
 extension View {
-    /// Starts the clipboard sync and shows its short confirmations at the bottom of this view.
-    func clipboardSync() -> some View { modifier(ClipboardSyncModifier()) }
+    /// Starts the clipboard sync and shows its short confirmations at the bottom of this view. windows:
+    /// whether the machine is Windows; for any other, the iPhone's clipboard is left alone.
+    func clipboardSync(windows: Bool) -> some View { modifier(ClipboardSyncModifier(windows: windows)) }
 }
 
 private struct ClipboardSyncModifier: ViewModifier {
+    let windows: Bool
     @ObservedObject private var sync = ClipboardSync.shared
 
     func body(content: Content) -> some View {
@@ -124,6 +126,10 @@ private struct ClipboardSyncModifier: ViewModifier {
                 }
             }
             .animation(.snappy(duration: 0.25), value: sync.toast)
-            .onAppear { sync.start() }
+            .onAppear {
+                sync.forWindows = windows
+                sync.start()
+            }
+            .onChange(of: windows) { _, now in sync.forWindows = now }
     }
 }
