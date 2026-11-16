@@ -1,5 +1,6 @@
 # WinKit: completes a fresh Windows 11 ARM64 in WindowsiOS without a Mac.
 #   network driver -> 3D driver -> switches host 3D on -> (after the app restarts) fits the screen by itself.
+#   Also installs WinIOS Browser (oauth_setup.ps1), so that sign-in links open in Safari on the iPhone.
 # Run through START.bat. -Finish is what the logon task runs after the restart.
 param([switch]$Finish)
 $ErrorActionPreference = 'Continue'
@@ -31,14 +32,14 @@ Say '=== WinKit setup ===' 'Green'
 New-Item -ItemType Directory -Force -Path $home3d | Out-Null
 Copy-Item -Recurse -Force (Join-Path $here '*') $home3d
 
-Say '[1/4] Network driver (NetKVM)'
+Say '[1/5] Network driver (NetKVM)'
 $net = Get-PnpDevice -Class Net -ErrorAction SilentlyContinue | Where-Object { $_.InstanceId -like 'PCI\VEN_1AF4*' -and $_.Status -eq 'OK' }
 if ($net) { Write-Host '  already installed' }
 else {
     pnputil /add-driver (Join-Path $home3d 'NetKVM\netkvm.inf') /install | Select-Object -Last 3 | ForEach-Object { Write-Host "  $_" }
 }
 
-Say '[2/4] 3D graphics driver (viogpu3d)'
+Say '[2/5] 3D graphics driver (viogpu3d)'
 $g = Gpu
 if ($g | Where-Object { $_.FriendlyName -like '*3D*' }) { Write-Host '  already installed' }
 else {
@@ -49,7 +50,7 @@ else {
     pnputil /add-driver (Join-Path $home3d 'viogpu3d\viogpu3d.inf') /install | Select-Object -Last 3 | ForEach-Object { Write-Host "  $_" }
 }
 
-Say '[3/4] Switching 3D on in the app'
+Say '[3/5] Switching 3D on in the app'
 $up = $false
 for ($i = 0; $i -lt 20; $i++) { if (HostUp) { $up = $true; break }; Start-Sleep 3 }
 $switched = $up -and (PutText 'gpu3d.on' 'on')
@@ -73,7 +74,7 @@ if ($is3dOk) {
     Unregister-ScheduledTask -TaskName 'WinKit Finish' -Confirm:$false -ErrorAction SilentlyContinue
 }
 
-Say '[4/4] Optional clean-up'
+Say '[4/5] Optional clean-up'
 Write-Host '  Stops search indexing, telemetry and automatic updates, removes widgets and inbox apps.'
 Write-Host '  (No security updates afterwards. Windows Security settings are not touched.)'
 if ((Read-Host '  Run it now? (y/N)') -match '^[yY]') {
@@ -81,6 +82,11 @@ if ((Read-Host '  Run it now? (y/N)') -match '^[yY]') {
     & (Join-Path $home3d 'tune.ps1')
     Write-Host '  clean-up done'
 }
+
+Say '[5/5] Sign-in links in Safari on the iPhone (OAuth bridge)'
+Write-Host '  Installs WinIOS Browser: links that Windows apps open (e.g. "Sign in with Google") go to Safari on'
+Write-Host '  the iPhone, with its saved passwords, passkeys and Face ID, and the sign-in comes back to Windows.'
+try { & (Join-Path $home3d 'oauth_setup.ps1') } catch { Write-Host "  skipped: $($_.Exception.Message)" -ForegroundColor Yellow }
 
 # The background helper the app's toolbar uses (Claude Code); also removes the old command-line mode's logon hook.
 try { & (Join-Path $home3d 'cli_setup.ps1') | Out-Null } catch {}

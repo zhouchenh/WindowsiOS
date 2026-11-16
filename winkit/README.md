@@ -10,7 +10,8 @@
 
 1. **装 App，导入 Windows 镜像**，用 StikDebug 开 JIT，进 Windows 桌面。
 2. **双击运行**：文件资源管理器 → **WINKIT** 盘 → 双击 `START.bat` → 权限提示点“是”。
-   它会依次：装网络驱动、装 3D 驱动、通知 App 打开 3D、询问是否做后台精简（按 `y` 执行，直接回车跳过；不会关闭透明和动画效果）。
+   它会依次：装网络驱动、装 3D 驱动、通知 App 打开 3D、询问是否做后台精简（按 `y` 执行，直接回车跳过；不会关闭透明和动画效果）、
+   装登录链接桥 WinIOS Browser（见下文“登录链接用 Safari 打开”，会打开“设置”让你点一下“设为默认值”）。
 3. **彻底关掉 App 再打开**（上滑划掉），用 StikDebug 再开一次 JIT。
    Windows 登录后一分钟内会**自动**把分辨率调成贴合屏幕、只保留一个桌面，不用再操作。
 4. 验证：运行 `dxdiag`，“显示”页应为 **Red Hat VirtIO GPU 3D controller**，Feature Levels 到 **11_0**。
@@ -20,6 +21,25 @@
 **改用户名**：按教程做出的镜像，账户名是原项目的默认值 Ammaar。`START.bat` 最后会问一次要不要改；以后想改，双击 `C:\WinKit`（或 WINKIT 盘）里的 `RENAME-USER.bat`，输入新名字即可，重新登录后生效。个人文件夹仍是原来的 `C:\Users\旧名字`，属正常现象。
 
 **后台小助手**：`START.bat` 会装一个开机隐藏运行的小助手，App 顶部工具栏里的“Claude Code”一键安装靠它自动运行脚本。也可以单独安装：在 Windows 里运行 WINKIT 盘上的 `cli_setup.ps1`（右键 → 使用 PowerShell 运行，不需要管理员）。
+
+## 登录链接用 Safari 打开（OAuth 桥）
+
+Windows 里的软件（IDE、命令行工具、聊天软件等）登录时会用默认浏览器打开网页，登录完再跳回 `http://localhost:端口/...`。
+Windows 里的 Edge 没有你的账号、密码和通行密钥；装了 **WinIOS Browser** 之后，这些网页会改在 **iPhone 上的 Safari**（浮在 Windows 上面的一个页面）里打开，
+可以直接用 iPhone 上已登录的 Google 账号、钥匙串密码、通行密钥和面容 ID。登录完成后，跳回 `localhost` 的那一步会自动转回 Windows，Safari 页面自动关闭（有震动提示）。
+
+1. **安装**：`START.bat` 的第 5 步会自动装；以前跑过旧版 WinKit 的，双击 WINKIT 盘（或 `C:\WinKit`）里的 `SAFARI-SIGNIN.bat` 单独安装，权限提示点“是”。
+   它把 `WinIOSBrowser.exe` 复制到 `C:\Program Files\WinIOS`，注册成名为 WinIOS Browser 的浏览器（http、https、.htm、.html），并在防火墙里放行它的登录回调转发。可以重复运行。
+2. **设为默认浏览器**：Windows 11 不允许程序自己改默认浏览器，所以脚本会打开“设置 → 应用 → 默认应用 → WinIOS Browser”，
+   请点最上面的 **“设为默认值”**（没有这个按钮的旧版 Windows 11：把 .htm、.html、HTTP、HTTPS 逐个改成 WinIOS Browser），然后回到窗口按回车。
+3. **Safari / Edge 切换**：App 的“设置”里有 **“Windows 里的登录链接用 Safari 打开”**（默认打开）。
+   打开时，Windows 打开的链接都进 iPhone 上的 Safari；关掉时，WinIOS Browser 会把链接交给 Windows 里的 Edge。App 没在响应时也会自动退回 Edge。
+   关着的时候点了登录链接，5 分钟内再打开这个开关，Safari 会立刻弹出那个登录页。
+
+注意：设成默认后，**所有**从 Windows 打开的链接都会走这个桥，不只是登录。平时想在 Windows 里用 Edge 上网，就把 App 里的开关关掉；在 Edge 里点的链接始终留在 Edge。
+
+- **卸载**：管理员运行 `C:\WinKit\uninstall_oauth.ps1`，删除程序、注册信息和防火墙规则，默认浏览器回到 Edge（Windows 可能会问一次用哪个应用打开）。
+- **排查**：Windows 里的 `%TEMP%\winios_browser.log` 记录了每次调用、找到的端口和 App 的应答。工作原理见 [OAuth 桥说明（英文）](../docs/oauth-bridge.md)。
 
 ## 用 StikDebug 开 JIT
 
@@ -34,6 +54,8 @@
 - **分辨率没有自动调整**：在 Windows 里以管理员身份运行 `C:\WinKit\setres.ps1`。
 - **排查 3D**：运行 `C:\WinKit\d3dtest.ps1`，结果在 App 文件夹的 `Shared/d3dtest.txt`。
 - **卸载 3D 驱动**：管理员运行 `C:\WinKit\uninstall_3d.ps1`。
+- **登录链接还是在 Edge 里打开**：WinIOS Browser 还不是默认浏览器（再双击一次 `SAFARI-SIGNIN.bat` 按提示选它），或 App 设置里的 Safari 开关是关着的。
+- **登录页在 Safari 里打开了，但 Windows 里的软件没收到**：看 `%TEMP%\winios_browser.log`；出现 `relay_upstream_connect_failed` 说明软件已不在等待，回到软件里重新登录。
 
 ## 注意
 
@@ -48,4 +70,5 @@
 ## 许可
 
 补齐盘里的 NetKVM 来自 virtio-win（见盘内 `virtio-win_license.txt`），3D 驱动来自 osy/kvm-guest-drivers-windows v0.5，均为原样二进制。
+`WinIOSBrowser.exe` 由本仓库的 `tools/winios_browser_arm64.c` 编译（`make guest-tools`，GPL-2.0-or-later）；整个补齐盘用 `make winkit-img` 生成。
 App 及其包含的第三方组件见仓库根目录的 [`THIRD_PARTY.md`](../THIRD_PARTY.md)。
