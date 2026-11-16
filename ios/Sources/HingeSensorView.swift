@@ -160,28 +160,28 @@ final class HingeObserverViewController: UIViewController {
         installHingeObserverIfAvailable()
     }
 
+    /// UIHingeInteraction (iOS 27.1+) reports the fold of a foldable device. Elsewhere (older iOS, or a
+    /// device without a hinge, where the update's `hinge` is nil) nothing is reported, and the app
+    /// falls back to the screen's shape and the posture the user picks.
     private func installHingeObserverIfAvailable() {
         guard !didInstallHinge else { return }
         didInstallHinge = true
-        guard NSClassFromString("UIHingeInteraction") != nil else { return }
-        // UIHingeInteraction is only in the foldable-device SDK; build with -D WINIOS_HINGE to enable.
-        #if WINIOS_HINGE
-        if #available(iOS 27.1, *) {
-            let interaction = UIHingeInteraction { [weak self] _, update in
-                guard let self else { return }
-                guard let hinge = update.hinge else {
-                    WinIOSBridge.shared.updateHingeStatus(0, angleDegrees: -1.0)
-                    self.onHingeUpdate?(0, nil)
-                    return
-                }
-                let rawStatus = hinge.status.rawValue
-                let deg = Double(hinge.angle) * 180.0 / .pi
-                WinIOSBridge.shared.updateHingeStatus(rawStatus, angleDegrees: deg)
-                self.onHingeUpdate?(rawStatus, deg)
+        guard #available(iOS 27.1, *) else { return }
+        let interaction = UIHingeInteraction { [weak self] _, update in
+            guard let self else { return }
+            guard let hinge = update.hinge else {
+                WinIOSBridge.shared.updateHingeStatus(0, angleDegrees: -1.0)
+                self.onHingeUpdate?(0, nil)
+                return
             }
-            view.addInteraction(interaction)
+            let rawStatus = hinge.status.rawValue
+            // UIHinge.angle is in radians: the SDK's UIHinge.h ("The current angle of the hinge, in
+            // radians.") and Apple's documentation for UIHinge.angle say so.
+            let deg = Double(hinge.angle) * 180.0 / .pi
+            WinIOSBridge.shared.updateHingeStatus(rawStatus, angleDegrees: deg)
+            self.onHingeUpdate?(rawStatus, deg)
         }
-        #endif
+        view.addInteraction(interaction)
     }
 }
 
