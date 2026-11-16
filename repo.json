@@ -1,0 +1,46 @@
+{
+  "name": "Apple VM Duo",
+  "identifier": "com.applevm.duo.source",
+  "subtitle": "Windows 11 and Arch Linux virtual machines for iPhone Duo",
+  "description": "Unsigned builds of Apple VM (Duo edition): WindowsiOS with AppleVM's 3D graphics, settings and Arch Linux installer, adapted for the foldable iPhone Duo. Free software under GPL-2.0-or-later; source at https://github.com/zhouchenh/WindowsiOS (branch duo). You need your own licensed copy of Windows 11.",
+  "iconURL": "https://raw.githubusercontent.com/zhouchenh/WindowsiOS/duo/ios/Sources/Assets.xcassets/AppIcon.appiconset/AppIcon-1024.png",
+  "website": "https://github.com/zhouchenh/WindowsiOS/tree/duo",
+  "tintColor": "#0078D4",
+  "featuredApps": [
+    "com.applevm.duo"
+  ],
+  "apps": [
+    {
+      "name": "Apple VM Duo",
+      "bundleIdentifier": "com.applevm.duo",
+      "developerName": "Apple VM contributors",
+      "subtitle": "Windows 11 ARM64 and Arch Linux VMs with a JIT and GPU acceleration",
+      "localizedDescription": "Runs Windows 11 ARM64 and Arch Linux virtual machines on iPhone and iPad with an ARM64-to-ARM64 JIT (enable JIT with StikDebug or a Mac on every launch) and virtio-gpu 3D. Built for the foldable iPhone Duo (iPhone19,4); also runs on other devices with iOS 17 or later. The IPA is unsigned: SideStore or AltStore signs it with your Apple account. get-task-allow is required to enable JIT. Increased Memory Limit (paid developer accounts) lets the guest use more RAM.",
+      "iconURL": "https://raw.githubusercontent.com/zhouchenh/WindowsiOS/duo/ios/Sources/Assets.xcassets/AppIcon.appiconset/AppIcon-1024.png",
+      "tintColor": "#0078D4",
+      "category": "utilities",
+      "screenshotURLs": [],
+      "versions": [
+        {
+          "version": "1.0",
+          "buildVersion": "1",
+          "date": "2026-11-16",
+          "localizedDescription": "TEMPLATE: replace with the release notes. Set downloadURL to the release asset, and size (bytes) and sha256 to the values scripts/package_ipa.sh prints.",
+          "downloadURL": "https://github.com/zhouchenh/WindowsiOS/releases/download/duo-v1.0/AppleVM-Duo-unsigned.ipa",
+          "size": 0,
+          "sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+          "minOSVersion": "17.0"
+        }
+      ],
+      "appPermissions": {
+        "entitlements": [
+          "get-task-allow"
+        ],
+        "privacy": {
+          "NSMicrophoneUsageDescription": "Windows uses the microphone for voice input and audio recording."
+        }
+      }
+    }
+  ],
+  "news": []
+}
