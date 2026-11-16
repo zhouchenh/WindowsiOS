@@ -1,0 +1,22 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
+//
+// Signing settings of the WindowsiOS app target (attached to it by project.yml).
+// Keep this file free of personal values: it applies to every build.
+// To sign with your own Apple account, copy Signing.example.xcconfig to
+// Signing.local.xcconfig (gitignored) and edit that copy. See docs/building.md.
+//
+// Unsigned builds (CODE_SIGNING_ALLOWED=NO, used by CI and scripts/package_ipa.sh)
+// use only the bundle id from here.
+
+PRODUCT_BUNDLE_IDENTIFIER = com.applevm.duo
+CODE_SIGN_STYLE = Automatic
+CODE_SIGN_IDENTITY = Apple Development
+DEVELOPMENT_TEAM =
+PROVISIONING_PROFILE_SPECIFIER =
+
+// get-task-allow only (needed to enable JIT): works with a free personal team.
+// Paid teams can select WindowsiOS-IncreasedMemory.entitlements in Signing.local.xcconfig.
+CODE_SIGN_ENTITLEMENTS = WindowsiOS.entitlements
+
+// Optional and gitignored: your team, bundle id and entitlements. Later settings win.
+#include? "Signing.local.xcconfig"

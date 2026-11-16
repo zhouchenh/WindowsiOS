@@ -1,0 +1,21 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
+//
+// Template for your personal signing settings:
+//   cp ios/Signing.example.xcconfig ios/Signing.local.xcconfig
+// then edit ios/Signing.local.xcconfig (it is gitignored). See docs/building.md.
+
+// Your team id (10 characters). Xcode > Settings > Accounts shows your teams; a free
+// "Personal Team" works. It is also the "OU" of your certificate:
+//   security find-certificate -c "Apple Development" -p | openssl x509 -noout -subject
+DEVELOPMENT_TEAM = XXXXXXXXXX
+
+// Any reverse-DNS id of your own. An id registered by another team cannot be used.
+PRODUCT_BUNDLE_IDENTIFIER = com.example.applevm.duo
+
+// Let Xcode register the App ID and make the provisioning profile.
+CODE_SIGN_STYLE = Automatic
+
+// Paid Apple Developer Program teams only: lets the guest use more RAM and gives the
+// app a larger address space (increased-memory-limit + extended-virtual-addressing).
+// A free personal team cannot sign these; leave the line commented out.
+// CODE_SIGN_ENTITLEMENTS = WindowsiOS-IncreasedMemory.entitlements
