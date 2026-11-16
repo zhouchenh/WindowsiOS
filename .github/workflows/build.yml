@@ -85,7 +85,7 @@ jobs:
             ios/deps/StikJIT.xcframework
             ios/deps/lib/libhusk_rppairing.a
             ios/deps/lib/.libhusk_rppairing.applevm-build
-          key: jit-deps-v1-xcode27-${{ runner.arch }}-${{ hashFiles('scripts/build_jit_deps.sh', 'ios/patches/**', 'ios/Sources/Native/HuskRPPairing.h') }}
+          key: jit-deps-v1-xcode27-${{ runner.arch }}-${{ hashFiles('scripts/build_jit_deps.sh', 'scripts/crate_notices.py', 'ios/patches/**', 'ios/Sources/Native/HuskRPPairing.h') }}
 
       - name: Build Built-in JIT dependencies (scripts/build_jit_deps.sh)
         if: steps.jit-deps.outputs.cache-hit != 'true'

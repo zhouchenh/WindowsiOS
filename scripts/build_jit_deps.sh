@@ -14,18 +14,27 @@
 #
 # and refreshes, in ios/Sources/Resources/legal (bundled as the app's legal/ folder),
 # LICENSES-rppairing-crates.txt (the licence notices of every crate in libhusk_rppairing.a),
+# LICENSES-stikjit-idevice-crates.txt (the same for idevice's FFI inside StikJIT.framework),
 # LICENSE-StikJIT-MPL-2.0.txt and a copy of the StikJIT patch.
 #
 #   scripts/build_jit_deps.sh [--force]
 #
-# Both sources are pinned to a commit and checked. Needs Xcode, xcodegen, git, python3 and
+# All sources are pinned to a commit and checked. Needs Xcode, xcodegen, git, python3 and
 # rustup (https://rustup.rs) with any stable toolchain new enough for edition 2024 (1.85+); the
 # aarch64-apple-ios target is added when missing. $RUST_TOOLCHAIN picks the toolchain
 # (default: stable). Homebrew's own rustc has no iOS standard library, so the toolchain's cargo
 # and rustc are used by path (rustup which), whatever comes first in PATH.
 #
 # Provenance note: StikJIT's repository ships idevice's FFI as a prebuilt static library
-# (idevice/libidevice_ffi.a, MIT, built from jkcoxson/idevice); it is linked as shipped.
+# (idevice/libidevice_ffi.a, MIT, built from jkcoxson/idevice); it is linked as shipped. Neither
+# the library nor StikJIT's history names the idevice commit it was built from. StikJIT took it in
+# 4e08cec (2026-09-23, "feat: migrate DDI mounting to cryptex"); its idevice.h has the FFI of
+# idevice e98264c (2026-08-31) or later, and the crate versions compiled into it are those of
+# idevice's Cargo.lock from 7305894 (2026-08-24) to d32c818 (2026-09-14, 0.1.68), which lists
+# the same third-party crates throughout; the next Cargo.lock change (9c1ad29, 2026-10-19) no
+# longer matches. Its notices come from d32c818's Cargo.lock with the features the library was
+# built with (idevice-ffi's defaults, aws-lc among them, plus obfuscate), checked against every
+# crate the library names (scripts/crate_notices.py --check-binary).
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -39,6 +48,10 @@ STIKJIT_URL="https://github.com/StikDebug/StikJIT.git"
 STIKJIT_TAG="1.9.0"
 STIKJIT_REV="32287268fa5824f9edce4cb359f5833ce0cf7b00"
 STIKJIT_PATCH="$ROOT/ios/patches/stikjit-high-address.patch"
+# The idevice commit whose Cargo.lock gives the crates in StikJIT's libidevice_ffi.a (see above).
+IDEVICE_URL="https://github.com/jkcoxson/idevice.git"
+IDEVICE_REV="d32c8189c51c2789496b0768039419c3705498c3"
+IDEVICE_FEATURES="obfuscate"
 
 HUSK_URL="https://github.com/Leviidev/Husk.git"
 HUSK_REV="29abb512d81bf8cc08babcbe7f7007cb557208ef"
@@ -59,7 +72,34 @@ done
 command -v rustup >/dev/null || die "rustup not found (https://rustup.rs, or brew install rustup)"
 mkdir -p "$WORK" "$OUT/lib" "$LEGAL"
 
+# ---------------------------------------------------------------- Rust toolchain
+TOOL_CARGO=""
+TOOL_RUSTC=""
+rust_toolchain() {
+    [ -n "$TOOL_CARGO" ] && return
+    step "rustup: $RUST_TOOLCHAIN with $IOS_TARGET"
+    rustup toolchain list > "$WORK/toolchains.txt"
+    grep -q "^$RUST_TOOLCHAIN" "$WORK/toolchains.txt" || rustup toolchain install --profile minimal "$RUST_TOOLCHAIN"
+    rustup target list --installed --toolchain "$RUST_TOOLCHAIN" > "$WORK/targets.txt"
+    grep -qx "$IOS_TARGET" "$WORK/targets.txt" ||
+        rustup target add --toolchain "$RUST_TOOLCHAIN" "$IOS_TARGET"
+    # The toolchain's own cargo and rustc by path: `rustup run` does not put them first in PATH
+    # everywhere, and cargo then picks up a rustc without the iOS standard library.
+    TOOL_CARGO="$(rustup which --toolchain "$RUST_TOOLCHAIN" cargo)"
+    TOOL_RUSTC="$(rustup which --toolchain "$RUST_TOOLCHAIN" rustc)"
+}
+
 # ---------------------------------------------------------------- StikJIT.xcframework
+# A fresh clone of StikJIT's tag in $WORK/StikJIT, checked against STIKJIT_REV.
+fetch_stikjit() {
+    local src="$WORK/StikJIT"
+    step "StikJIT $STIKJIT_TAG ($STIKJIT_REV)"
+    rm -rf "$src"
+    git -c advice.detachedHead=false clone --quiet --depth 1 --branch "$STIKJIT_TAG" "$STIKJIT_URL" "$src"
+    [ "$(git -C "$src" rev-parse HEAD)" = "$STIKJIT_REV" ] ||
+        die "StikJIT tag $STIKJIT_TAG is $(git -C "$src" rev-parse HEAD), expected $STIKJIT_REV"
+}
+
 build_stikjit() {
     local src="$WORK/StikJIT"
     local stamp="$OUT/StikJIT.xcframework/.applevm-build"
@@ -68,11 +108,7 @@ build_stikjit() {
         step "StikJIT.xcframework is up to date ($STIKJIT_TAG + patch)"
         return
     fi
-    step "StikJIT $STIKJIT_TAG ($STIKJIT_REV)"
-    rm -rf "$src"
-    git -c advice.detachedHead=false clone --quiet --depth 1 --branch "$STIKJIT_TAG" "$STIKJIT_URL" "$src"
-    [ "$(git -C "$src" rev-parse HEAD)" = "$STIKJIT_REV" ] ||
-        die "StikJIT tag $STIKJIT_TAG is $(git -C "$src" rev-parse HEAD), expected $STIKJIT_REV"
+    fetch_stikjit
     git -C "$src" apply "$STIKJIT_PATCH"
     step "StikJIT: xcodegen and archive (Release, iphoneos, unsigned)"
     (cd "$src" && xcodegen generate --quiet)
@@ -90,6 +126,40 @@ build_stikjit() {
     # MPL-2.0: our modification travels with the app, next to the licence.
     cp "$STIKJIT_PATCH" "$LEGAL/stikjit-high-address.patch"
     echo "-> ios/deps/StikJIT.xcframework"
+}
+
+# ---------------------------------------------------------------- StikJIT's idevice crates
+# The licence notices of every crate in StikJIT's prebuilt libidevice_ffi.a (provenance note above).
+stikjit_notices() {
+    local src="$WORK/idevice"
+    local lib="$WORK/StikJIT/idevice/libidevice_ffi.a"
+    local notices="$LEGAL/LICENSES-stikjit-idevice-crates.txt"
+    local stamp="$OUT/StikJIT.xcframework/.applevm-notices"
+    local want="$STIKJIT_REV $IDEVICE_REV $IDEVICE_FEATURES $(shasum -a 256 "$ROOT/scripts/crate_notices.py" | cut -d' ' -f1)"
+    if [ "$FORCE" = 0 ] && [ -f "$stamp" ] && [ -f "$notices" ] && [ "$(cat "$stamp")" = "$want" ]; then
+        step "StikJIT's idevice crate notices are up to date (idevice $IDEVICE_REV)"
+        return
+    fi
+    if [ ! -f "$lib" ] || [ "$(git -C "$WORK/StikJIT" rev-parse HEAD 2>/dev/null)" != "$STIKJIT_REV" ]; then
+        fetch_stikjit
+    fi
+    step "idevice $IDEVICE_REV: the Cargo.lock of StikJIT's libidevice_ffi.a"
+    if [ ! -d "$src/.git" ]; then
+        rm -rf "$src"
+        git init --quiet "$src"
+        git -C "$src" remote add origin "$IDEVICE_URL"
+    fi
+    git -C "$src" fetch --quiet --depth 1 --filter=blob:none origin "$IDEVICE_REV"
+    git -C "$src" -c advice.detachedHead=false checkout --quiet --force "$IDEVICE_REV"
+    [ "$(git -C "$src" rev-parse HEAD)" = "$IDEVICE_REV" ] || die "idevice checkout is not $IDEVICE_REV"
+    rust_toolchain
+    step "crate licence notices for StikJIT's libidevice_ffi.a"
+    PATH="$(dirname "$TOOL_CARGO"):$PATH" RUSTC="$TOOL_RUSTC" python3 "$ROOT/scripts/crate_notices.py" \
+        --features "$IDEVICE_FEATURES" --check-binary "$lib" "$src/ffi" "$notices" \
+        "Third-party notices for idevice's FFI (StikJIT's prebuilt idevice/libidevice_ffi.a, built from
+https://github.com/jkcoxson/idevice; crates as in its Cargo.lock at $IDEVICE_REV, features:
+default + $IDEVICE_FEATURES), linked into Frameworks/StikJIT.framework/StikJIT."
+    echo "$want" > "$stamp"
 }
 
 # ---------------------------------------------------------------- libhusk_rppairing.a
@@ -119,17 +189,8 @@ build_rppairing() {
     cmp -s "$src/src/app/Husk/HuskRPPairing.h" "$ROOT/ios/Sources/Native/HuskRPPairing.h" ||
         die "ios/Sources/Native/HuskRPPairing.h differs from Husk $HUSK_REV's src/app/Husk/HuskRPPairing.h"
 
-    step "rustup: $RUST_TOOLCHAIN with $IOS_TARGET"
-    rustup toolchain list > "$WORK/toolchains.txt"
-    grep -q "^$RUST_TOOLCHAIN" "$WORK/toolchains.txt" || rustup toolchain install --profile minimal "$RUST_TOOLCHAIN"
-    rustup target list --installed --toolchain "$RUST_TOOLCHAIN" > "$WORK/targets.txt"
-    grep -qx "$IOS_TARGET" "$WORK/targets.txt" ||
-        rustup target add --toolchain "$RUST_TOOLCHAIN" "$IOS_TARGET"
-    # The toolchain's own cargo and rustc by path: `rustup run` does not put them first in PATH
-    # everywhere, and cargo then picks up a rustc without the iOS standard library.
-    local cargo rustc
-    cargo="$(rustup which --toolchain "$RUST_TOOLCHAIN" cargo)"
-    rustc="$(rustup which --toolchain "$RUST_TOOLCHAIN" rustc)"
+    rust_toolchain
+    local cargo="$TOOL_CARGO" rustc="$TOOL_RUSTC"
     step "cargo build --release --locked --target $IOS_TARGET ($("$rustc" --version))"
     # The app's deployment target, or the linker warns on every object.
     (cd "$crate" && IPHONEOS_DEPLOYMENT_TARGET=17.0 RUSTC="$rustc" \
@@ -148,6 +209,7 @@ build_rppairing() {
 }
 
 build_stikjit
+stikjit_notices
 build_rppairing
 echo "=== Built-in JIT dependencies staged in $OUT"
 ls -lh "$OUT/lib/libhusk_rppairing.a" "$OUT/StikJIT.xcframework/ios-arm64/StikJIT.framework/StikJIT"

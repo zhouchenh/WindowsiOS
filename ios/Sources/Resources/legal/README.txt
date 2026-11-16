@@ -17,7 +17,12 @@ Built-in JIT ships two third-party components inside this app:
    StikJIT is available at the address above; scripts/build_jit_deps.sh in the Apple VM
    repository rebuilds the framework from it with the patch.
    StikJIT contains idevice by Jackson Coxson (https://github.com/jkcoxson/idevice), MIT
-   licence, see LICENSE-idevice-MIT.txt.
+   licence, see LICENSE-idevice-MIT.txt, as the prebuilt idevice/libidevice_ffi.a in StikJIT's
+   repository, with the Rust crates idevice is built on (tokio, rustls, AWS-LC through
+   aws-lc-rs, curve25519-dalek and others) under MIT, Apache-2.0, BSD-3-Clause, ISC and other
+   licences: each is listed with its licence texts in LICENSES-stikjit-idevice-crates.txt
+   (from idevice's Cargo.lock at commit d32c8189c51c2789496b0768039419c3705498c3, which gives
+   the crate versions found in that library).
 
 2. On-device pairing, linked into the app as libhusk_rppairing.a
    Husk's src/rppairing-ios (commit 29abb512d81bf8cc08babcbe7f7007cb557208ef),

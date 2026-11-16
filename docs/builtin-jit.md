@@ -109,7 +109,11 @@ from source into the gitignored `ios/deps`:
 - `StikJIT.xcframework`: StikJIT 1.9.0 (tag checked against commit `32287268`) with
   `ios/patches/stikjit-high-address.patch` (Henge's `ci/stikjit-high-address.patch`: page
   addresses in its `$M` packets get 16 hex digits instead of 9). MPL-2.0; it contains idevice (MIT)
-  as the prebuilt `libidevice_ffi.a` that StikJIT's repository ships.
+  as the prebuilt `libidevice_ffi.a` that StikJIT's repository ships, with the Rust crates idevice
+  is built on (tokio, rustls, AWS-LC through aws-lc-rs, and others). StikJIT does not say which
+  idevice commit that library is; the crates in it are those of idevice's `Cargo.lock` at
+  `d32c818` (0.1.68), and the script generates their notices from it and checks them against the
+  library (the provenance note in `scripts/build_jit_deps.sh` says how that commit was found).
 - `lib/libhusk_rppairing.a`: Husk's `src/rppairing-ios` (commit `29abb51`, GPL-2.0-or-later), a
   small Rust wrapper of idevice 0.1.68's `PairableHost`, for on-device pairing. Built with rustup's
   toolchain for `aarch64-apple-ios` (`rustup target add` is done for you). Its C interface is
@@ -125,4 +129,5 @@ and `JITSetup.swift` (the requests, shared with StikDebug). The JIT protocol on 
 
 The licences that ship in the app are in `ios/Sources/Resources/legal` (the app's `legal/` folder):
 StikJIT's MPL-2.0 with our patch, idevice's MIT licence, and the licence notices of every Rust
-crate in the pairing library. See also `THIRD_PARTY_NOTICES.md`.
+crate in StikJIT's idevice library (`LICENSES-stikjit-idevice-crates.txt`) and in the pairing
+library (`LICENSES-rppairing-crates.txt`). See also `THIRD_PARTY_NOTICES.md`.
