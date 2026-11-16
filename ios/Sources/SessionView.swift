@@ -18,6 +18,9 @@ struct SessionView: View {
     @ObservedObject private var chrome = ChromeModel.shared
     @Environment(\.horizontalSizeClass) private var horizontalSizeClass
     @State private var showPowerConfirm = false
+    /// The display's "In immersive full screen": keep Windows' size (the canvas keeps its windowed size,
+    /// drawn larger) or give it the whole panel (DisplaySettings.immersiveSizing).
+    @State private var immersiveKeepsSize = DisplaySettings.shared.immersiveSizing == .keepSize
 
     /// Windows is on screen with nothing over it: the chrome's gestures and hooks apply.
     private var sessionActive: Bool { vm.isVMRunning && !vm.showSettings && vm.activeSafariURL == nil }
@@ -67,6 +70,7 @@ struct SessionView: View {
             chrome.updateSessionActive(sessionActive)
         }
         .onChange(of: sessionActive) { _, active in chrome.updateSessionActive(active) }
+        .onReceive(DisplaySettings.shared.$immersiveSizing) { immersiveKeepsSize = $0 == .keepSize }
         .sheet(item: $vm.activeSafariURL) { item in
             SafariSheet(url: item.url).ignoresSafeArea()
         }
@@ -116,20 +120,39 @@ struct SessionView: View {
                                        foldable: vm.supportsLaptopPosture)
         let immersive = vm.isVMRunning && chrome.isImmersive(surface)
         let division = ReservedRegions.division(geo)
+        // With the keyboard pan (KeyboardOptions.panInsteadOfShrink) the Windows screen keeps its size under
+        // the on-screen keyboard and the picture moves up inside it (MetalCanvasUIView), so nothing is cut
+        // off at the keyboard's top and the transparent key bar shows the picture behind it.
         let layout = StageLayout(full: full, insets: insets, laptop: laptop, immersive: immersive,
                                  fold: FoldLayout(full: full, division: division),
-                                 keyboardTop: chrome.keyboardTop,
-                                 windowedSize: chrome.immersiveTakesWholeScreen ? nil : chrome.windowedCanvasSize[surface])
+                                 keyboardTop: KeyboardOptions.panInsteadOfShrink ? nil : chrome.keyboardTop,
+                                 windowedSize: immersiveKeepsSize ? chrome.windowedCanvasSize[surface] : nil,
+                                 nativeScale: Self.nativeScale)
         let occlusions = ReservedRegions.occlusions(geo)
 
         return stageContent(layout: layout, laptop: laptop, occlusions: occlusions)
             .modifier(StageObservers(vm: vm, chrome: chrome, full: full, laptop: laptop, surface: surface,
-                                     insets: insets, layout: layout, division: division,
+                                     immersive: immersive, insets: insets, layout: layout, division: division,
                                      occlusions: occlusions))
     }
 
     /// One Windows screen for every posture (the same view, so Windows keeps its display and the
     /// keyboard focus). Its size is what Windows' resolution follows.
+    /// Panel pixels per point of the screen the app is on (the Windows view's frame is snapped to them).
+    private static var nativeScale: CGFloat {
+        let scenes = UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }
+        let scene = scenes.first { $0.activationState == .foregroundActive } ?? scenes.first
+        return scene?.screen.nativeScale ?? 0
+    }
+
+    /// Near the top of the Windows screen, below the camera island when it reaches in (as ChromeHintView).
+    private static func noticeTop(in area: CGRect, below occlusions: [CGRect]) -> CGFloat {
+        var y = area.minY + 14
+        let band = CGRect(x: area.minX, y: y, width: area.width, height: 44)
+        for r in occlusions where r.intersects(band) { y = max(y, r.maxY + 8) }
+        return y
+    }
+
     private func stageContent(layout: StageLayout, laptop: Bool, occlusions: [CGRect]) -> some View {
         let canvas = layout.canvas
         return ZStack(alignment: .topLeading) {
@@ -170,6 +193,16 @@ struct SessionView: View {
             if vm.isVMRunning, let hint = chrome.hint {
                 ChromeHintView(text: hint, area: canvas.visibleRect, occlusions: occlusions)
             }
+
+            if vm.isVMRunning {
+                // "Windows is taking the new size" while a re-mode is slow or stuck (DisplaySettings.swift).
+                DisplayReshapeNotice()
+                    .frame(width: canvas.visibleRect.width)
+                    .offset(x: canvas.visibleRect.minX,
+                            y: Self.noticeTop(in: canvas.visibleRect, below: occlusions) + (chrome.hint != nil ? 48 : 0))
+                    .allowsHitTesting(false)
+                    .transition(.opacity)
+            }
         }
         .frame(width: layout.full.width, height: layout.full.height, alignment: .topLeading)
     }
@@ -199,7 +232,7 @@ struct StageLayout: Equatable {
     let windowed: CGSize
 
     init(full: CGSize, insets: EdgeInsets, laptop: Bool, immersive: Bool, fold: FoldLayout,
-         keyboardTop: CGFloat?, windowedSize: CGSize?) {
+         keyboardTop: CGFloat?, windowedSize: CGSize?, nativeScale: CGFloat = 0) {
         self.full = full
         self.fold = fold
         // The bars' safe area: status bar and toolbar on top, the vertical bar or the camera at the
@@ -220,14 +253,19 @@ struct StageLayout: Equatable {
         windowed = CGSize(width: max(1, windowedRect.width), height: max(1, windowedRect.height))
         let r = immersive ? immersiveRect : windowedRect
         let area = CGRect(x: r.minX, y: r.minY, width: max(1, r.width), height: max(1, r.height))
+        // On whole panel pixels (DisplayGeometry): the drawable is then exactly the view's pixels and the
+        // compositor shows it with no resampling.
+        let n = nativeScale
         if immersive, let keep = windowedSize, keep.width > 1, keep.height > 1 {
             // Windows keeps the size it had with the controls, drawn as large as fits.
             let s = min(area.width / keep.width, area.height / keep.height)
+            let origin = CGPoint(x: area.minX + (area.width - keep.width * s) / 2,
+                                 y: area.minY + (area.height - keep.height * s) / 2)
             canvas = Canvas(frame: keep, scale: s,
-                            origin: CGPoint(x: area.minX + (area.width - keep.width * s) / 2,
-                                            y: area.minY + (area.height - keep.height * s) / 2))
+                            origin: n > 0 ? CGPoint(x: (origin.x * n).rounded() / n, y: (origin.y * n).rounded() / n) : origin)
         } else {
-            canvas = Canvas(frame: area.size, scale: 1, origin: area.origin)
+            let r = DisplayGeometry.snapped(area, nativeScale: n)
+            canvas = Canvas(frame: CGSize(width: max(1, r.width), height: max(1, r.height)), scale: 1, origin: r.origin)
         }
     }
 }
@@ -239,6 +277,8 @@ private struct StageObservers: ViewModifier {
     let full: CGSize
     let laptop: Bool
     let surface: ChromeSurface
+    /// Immersive is on screen: the display's reshape filter is told (DisplaySettings.immersive).
+    let immersive: Bool
     let insets: EdgeInsets
     let layout: StageLayout
     let division: CGRect?
@@ -253,6 +293,13 @@ private struct StageObservers: ViewModifier {
                 chrome.reportScreen(viewport: full)
                 chrome.reportOcclusions(occlusions)
                 rememberWindowed()
+                DisplaySettings.shared.immersive = immersive
+            }
+            .onChange(of: immersive) { _, on in DisplaySettings.shared.immersive = on }
+            // The display remembers immersive per screen and loads its own on a screen change: the
+            // chrome's is what is on screen.
+            .onReceive(DisplaySettings.shared.$surface.dropFirst()) { _ in
+                DispatchQueue.main.async { DisplaySettings.shared.immersive = immersive }
             }
             .onChange(of: full) { _, newSize in
                 vm.viewportSize = newSize
@@ -277,7 +324,8 @@ private struct StageObservers: ViewModifier {
 
     /// Immersive without a new resolution keeps the size the Windows screen has with the controls.
     private func rememberWindowed() {
-        guard vm.isVMRunning, !chrome.isImmersive(surface), chrome.keyboardTop == nil || laptop else { return }
+        guard vm.isVMRunning, !chrome.isImmersive(surface),
+              chrome.keyboardTop == nil || laptop || KeyboardOptions.panInsteadOfShrink else { return }
         chrome.rememberWindowedCanvas(layout.windowed, for: surface)
     }
 }
