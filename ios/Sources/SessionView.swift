@@ -496,7 +496,7 @@ private struct SettingsSheet: View {
                     if !vm.isLinux {
                         HStack {
                             Text(L("CPU 名称", "CPU name"))
-                            TextField("Apple Silicon", text: $vm.cpuName)
+                            TextField(L("自动", "Automatic"), text: $vm.cpuName)
                                 .multilineTextAlignment(.trailing)
                                 .autocorrectionDisabled()
                                 .onSubmit { vm.saveCPUName() }
@@ -513,7 +513,8 @@ private struct SettingsSheet: View {
                     Text(L("系统", "System"))
                 } footer: {
                     if !vm.isLinux {
-                        Text(L("CPU 名称是 Windows 里显示的处理器名字，下次启动生效。", "The CPU name is what Windows shows for the processor; applies at the next start."))
+                        Text(L("CPU 名称是 Windows 里显示的处理器名字，下次启动生效。留空时用设备的芯片名（例如 Apple A20 Pro），不认识的设备显示 Apple Silicon。",
+                               "The CPU name is what Windows shows for the processor; applies at the next start. Left empty, it is the device's chip (e.g. Apple A20 Pro), or Apple Silicon on a device the app does not know."))
                     }
                 }
 
