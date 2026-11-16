@@ -418,13 +418,17 @@ void hv_tlbi_apply(HvCpu *cpu, uint32_t op1, uint32_t crn, uint32_t crm, uint32_
     }
 }
 
-/* Translations are never out of date: CPU writes to code pages and device DMA drop them as
-   they happen. So IC IVAU has nothing to do, though xnu issues it for pages nobody wrote, and
-   dropping them there meant translating them all again and every CPU's branch cache starting
-   over. HV_IC_IVAU: as before. */
+/* CPU writes to code pages and device DMA drop translations as they happen, but not every write
+   is seen in time: a store in translated code that passed its TLB write check just before
+   another CPU marked the page as code (it is not ordered against that CPU reading the code)
+   lands after the translation was made. JITs in the guest (Windows' x86 emulators, which patch
+   and reuse code pages while other threads run) then run stale code. The guest's own IC IVAU
+   after such a write is what repairs it, so it drops the page's translations when the page holds
+   any (costs nothing otherwise: translate_ic_ivau checks inline). HV_IC_IVAU=0: ignore IC IVAU
+   (for xnu, which issues it for pages nobody wrote). */
 int hv_ic_ivau_drops(void) {
     static int v = -1;
-    if (v < 0) v = getenv("HV_IC_IVAU") != NULL;
+    if (v < 0) v = !getenv("HV_IC_IVAU") || atoi(getenv("HV_IC_IVAU")) != 0;
     return v;
 }
 
@@ -441,7 +445,10 @@ int hv_sysreg_sys(HvCpu *cpu, uint32_t insn, uint64_t pc) {
         if (!hv_ic_ivau_drops()) return 0;
         HvWalk w;
         hv_mmu_walk(cpu, xt, HV_ACC_READ, cpu->el, &w);
-        if (!w.fsc) hv_invalidate_code(cpu->m, w.pa);
+        /* PAN does not apply to cache maintenance: the kernel flushing a process's JIT range
+           (NtFlushInstructionCache) runs this at EL1 with PAN set on a user page. A permission
+           fault still leaves the walk's address. */
+        if (!w.fsc || (w.fsc & 0x3c) == HV_FSC_PERMISSION(0)) hv_invalidate_code(cpu->m, w.pa);
         return 0;
     }
     if (crn == 7 && (crm == 1 || crm == 5)) { /* IC IALLUIS, IALLU */

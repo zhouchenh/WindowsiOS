@@ -411,7 +411,7 @@ static int rmw_target(HvCpu *cpu, uint64_t va, uint32_t bytes, int el, uint64_t 
         uint64_t tag = __atomic_load_n(&t->write_tag, __ATOMIC_RELAXED);
         if (tag != HV_TLB_INVALID && tag + HV_TLB_ADJ == (va & ~((1ull << HV_TLB_PAGE_BITS) - 1))) {
             *host = (void *)(uintptr_t)(va + (uint64_t)t->addend);
-            *mmio_pa = 0;
+            *mmio_pa = ~0ull; /* writable in the TLB: the page was not code when the entry was filled */
             return 0;
         }
     }
@@ -428,13 +428,14 @@ static int rmw_target(HvCpu *cpu, uint64_t va, uint32_t bytes, int el, uint64_t 
         return 0;
     }
     *host = hv_phys_ptr(cpu->m, pa, bytes);
-    if (*host) {
-        /* Same rule as other writes: drop translations made from this page. */
-        uint64_t pg = (pa - ram->pa) >> HV_TLB_PAGE_BITS;
-        if (ram->code_pages[pg]) hv_invalidate_code(cpu->m, pa);
-    }
-    *mmio_pa = pa;
+    *mmio_pa = pa; /* with a host pointer too: the caller passes it to rmw_written after writing */
     return 0;
+}
+
+/* Same rule as other writes, and after the write as there (hv_phys_write): drop translations made
+   from the page. A TLB hit (pa ~0) was writable, so the page was not code when it was filled. */
+static void rmw_written(HvCpu *cpu, const void *host, uint64_t pa, uint32_t bytes) {
+    if (host && pa != ~0ull) hv_dma_written(cpu->m, pa, bytes);
 }
 
 static int cas_host(void *p, int size, uint64_t *expected, uint64_t desired) {
@@ -488,6 +489,7 @@ static int do_atomic(HvCpu *cpu, const HvMemOp *op, uint64_t va, int el, uint64_
         if (host) {
             old = s & mask;
             cas_host(host, size, &old, desired);
+            rmw_written(cpu, host, pa, bytes);
         } else {
             old = 0;
             if (hv_phys_read(cpu->m, pa, &old, bytes)) goto external;
@@ -500,6 +502,7 @@ static int do_atomic(HvCpu *cpu, const HvMemOp *op, uint64_t va, int el, uint64_
         old = load_host(host, size);
         while (!cas_host(host, size, &old, atomic_result(op->atomic_op, size, old, s))) {
         }
+        rmw_written(cpu, host, pa, bytes);
     } else {
         old = 0;
         if (hv_phys_read(cpu->m, pa, &old, bytes)) goto external;
@@ -543,6 +546,7 @@ static int do_casp(HvCpu *cpu, const HvMemOp *op, uint64_t va, int el, uint64_t 
             if (hv_phys_write(cpu->m, pa, &n0, esize) || hv_phys_write(cpu->m, pa + esize, &n1, esize)) goto external;
         }
     }
+    rmw_written(cpu, host, pa, bytes);
     set_gpr(cpu, op->rs, o0);
     set_gpr(cpu, op->rs + 1, o1);
     return 0;
@@ -588,6 +592,7 @@ static int do_exclusive(HvCpu *cpu, const HvMemOp *op, uint64_t va, int el, uint
                                              __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST);
         }
     }
+    if (ok) rmw_written(cpu, host, pa, bytes);
     cpu->excl_addr = ~0ull;
     set_gpr(cpu, op->rs, ok ? 0 : 1);
     return 0;

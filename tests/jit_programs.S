@@ -217,6 +217,50 @@ pcrel_target:
     sub x4, x28, x0
 END pcrel
 
+// FEAT_FlagM / FlagM2 flag instructions: CFINV is advertised (ISAR0.TS), and
+// Windows' x86 emulators use it. Each step records NZCV so a lost or trapped
+// flag change shows up in a register.
+PROGRAM flagm
+    mrs x0, nzcv
+    .inst 0xd500401f            // cfinv
+    mrs x1, nzcv
+    .inst 0xd500401f            // cfinv
+    mrs x2, nzcv
+    cmp x3, x4
+    .inst 0xd500401f            // cfinv
+    mrs x5, nzcv
+    .inst 0xd500403f            // xaflag
+    mrs x6, nzcv
+    .inst 0xd500405f            // axflag
+    mrs x7, nzcv
+    msr nzcv, xzr
+    .inst 0xd500401f            // cfinv
+    cset x8, cs
+    rmif x9, #3, #0xf
+    mrs x10, nzcv
+    setf8 w11
+    mrs x12, nzcv
+    .inst 0xd500401f            // cfinv
+    adcs x13, x14, x15
+    mrs x16, nzcv
+END flagm
+
+// Code changed behind the translator's back (a store that raced another CPU marking the page as
+// code), then the IC IVAU a guest JIT issues after writing code: the call must run the new code.
+// x1 points at the code (test_jit.c writes it).
+PROGRAM smc_call
+    blr x1
+END smc_call
+
+PROGRAM smc_ivau
+    dc cvau, x1
+    dsb ish
+    ic ivau, x1
+    dsb ish
+    isb
+    blr x1
+END smc_ivau
+
 // More instructions than one block holds.
 // DIT is a PSTATE bit the translator reads and writes inline; x6 and x7 live in the HvCpu.
 PROGRAM pstate_bits

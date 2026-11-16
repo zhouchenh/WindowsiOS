@@ -544,9 +544,13 @@ void hv_invalidate_code(HvMachine *m, uint64_t pa) {
     hv_machine_kick_all(m);
 }
 
+/* After bytes are written (by a device, or by a CPU's slow paths): drop translations made from them.
+   The fence orders the write before the code_pages loads, as lookup() orders its code_pages store
+   before reading the code, so either the translator reads the new bytes or this sees the page as code. */
 void hv_dma_written(HvMachine *m, uint64_t pa, uint64_t len) {
     HvRam *r = hv_ram_lookup(m, pa);
     if (!r || !len || pa + len - r->pa > r->size) return;
+    __atomic_thread_fence(__ATOMIC_SEQ_CST);
     uint64_t first = (pa - r->pa) >> HV_TLB_PAGE_BITS, last = (pa + len - 1 - r->pa) >> HV_TLB_PAGE_BITS;
     for (uint64_t pg = first; pg <= last; pg++)
         if (__atomic_load_n(&r->code_pages[pg], __ATOMIC_ACQUIRE)) hv_invalidate_code(m, r->pa + (pg << HV_TLB_PAGE_BITS));
@@ -596,10 +600,6 @@ int hv_phys_write(HvMachine *m, uint64_t pa, const void *buf, unsigned len) {
     HvRam *r = hv_ram_lookup(m, pa);
     if (r && pa + len - r->pa <= r->size) {
         if (r->readonly) return 0; /* ROM: writes are ignored */
-        uint64_t off = pa - r->pa;
-        uint64_t first = off >> HV_TLB_PAGE_BITS, last = (off + len - 1) >> HV_TLB_PAGE_BITS;
-        for (uint64_t pg = first; pg <= last; pg++)
-            if (r->code_pages[pg]) hv_invalidate_code(m, r->pa + (pg << HV_TLB_PAGE_BITS)); /* a write to code */
         if (m->watch_pa && m->watch_pa - pa < len) {
             uint64_t v = 0;
             memcpy(&v, (const uint8_t *)buf + (m->watch_pa - pa), len - (m->watch_pa - pa) < 8 ? len - (m->watch_pa - pa) : 8);
@@ -609,6 +609,11 @@ int hv_phys_write(HvMachine *m, uint64_t pa, const void *buf, unsigned len) {
         }
         uint8_t *dst = hv_phys_ptr(m, pa, len);
         if (dst) memcpy(dst, buf, len);
+        /* A write to code drops its translations after the new bytes are in, not before: dropping them
+           first sent the other CPUs (kicked out of their blocks) to translate the page again from the
+           old bytes in the gap, and nothing dropped that block again (the page was marked as code once
+           more, and the guest's IC IVAU did nothing). */
+        hv_dma_written(m, pa, len);
         return 0;
     }
     HvMmio *d = hv_mmio_lookup(m, pa);
