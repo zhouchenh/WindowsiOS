@@ -3,27 +3,21 @@ import QuartzCore
 import SwiftUI
 import UIKit
 
-// MARK: - Authentic 4-Pane Microsoft Surface / Windows Emblem
+// MARK: - The deck's look (ours: charcoal keys on a near-black deck, one accent for "on")
 
-struct WindowsLogoMark: View {
-    var size: CGFloat = 11
-    var color: Color = .white
-
-    var body: some View {
-        let gap = max(1.1, size * 0.12)
-        let tile = (size - gap) * 0.5
-        VStack(spacing: gap) {
-            HStack(spacing: gap) {
-                Rectangle().fill(color).frame(width: tile, height: tile)
-                Rectangle().fill(color).frame(width: tile, height: tile)
-            }
-            HStack(spacing: gap) {
-                Rectangle().fill(color).frame(width: tile, height: tile)
-                Rectangle().fill(color).frame(width: tile, height: tile)
-            }
-        }
-        .frame(width: size, height: size)
-    }
+enum DeckPalette {
+    static let deckTop = Color(white: 0.085)
+    static let deckBottom = Color(white: 0.055)
+    static let well = Color(white: 0.035)
+    static let key = Color(white: 0.155)
+    static let keyPressed = Color(white: 0.30)
+    static let keyLatched = Color.accentColor.opacity(0.42)
+    static let edge = Color.white.opacity(0.09)
+    static let edgeActive = Color.accentColor.opacity(0.85)
+    static let legend = Color.white.opacity(0.92)
+    static let legendDim = Color.white.opacity(0.5)
+    static let pad = Color(white: 0.115)
+    static let roundButton = Color(white: 0.15)
 }
 
 // MARK: - Precision Haptic Matte-Glass Touchpad (UIKit 120Hz + Invisible Bottom-Corner Click Zones)
@@ -87,7 +81,7 @@ final class TrackpadGlassUIView: UIView {
         addGestureRecognizer(scrollPan)
     }
 
-    // Invisible Surface Haptic Touchpad bottom-left (hold-drag) & bottom-right (right-click) zones
+    // Invisible bottom-left (hold-drag) & bottom-right (right-click) zones of the trackpad
     override func touchesBegan(_ touches: Set<UITouch>, with event: UIEvent?) {
         super.touchesBegan(touches, with: event)
         guard heldCornerTouch == nil, bounds.height > 20, bounds.width > 40 else { return }
@@ -239,7 +233,7 @@ struct TrackpadGlassRepresentable: UIViewRepresentable {
     }
 }
 
-// MARK: - Surface Laptop 6-Row Keyboard Model
+// MARK: - The 6-row keyboard model
 
 private enum FunctionAction: Equatable {
     case escape
@@ -259,6 +253,14 @@ private enum FunctionAction: Equatable {
     case openStudioMode
     case acpiPower
     case forwardDelete
+    // the action row (P1-5)
+    case taskView
+    case snapLayouts
+    case undo
+    case redo
+    case quickSettings
+    case shortcutsMenu
+    case keyboardToggle
 
     /// Runs something inside Windows (Win+R or the WinKit helper): on Arch Linux the key is its F key.
     var isWindowsOnly: Bool { self == .edgeBrowser || self == .claudeCode || self == .paintApp }
@@ -270,7 +272,7 @@ private enum KeyRole: Equatable {
     case modifier(hid: UInt8, label: String, isWindowsKey: Bool)
     case capsLock
     case fnToggle
-    case upDownStack // Authentic Surface half-height stacked Up / Down arrow pair!
+    case upDownStack // half-height Up / Down arrow pair
 }
 
 private struct LaptopKeySpec: Identifiable {
@@ -311,10 +313,12 @@ private struct LaptopKeySpec: Identifiable {
     }
 }
 
-// MARK: - Midnight-Sapphire Surface Laptop Ultra Lower Deck
+// MARK: - The laptop deck (below the fold)
 
 struct LaptopDeckView: View {
     @ObservedObject var vm: VMViewModel
+    /// More > Power… (the session view asks first).
+    var showPower: () -> Void = {}
 
     @State private var shiftLatched: Bool = false
     @State private var ctrlLatched: Bool = false
@@ -330,25 +334,26 @@ struct LaptopDeckView: View {
     private let keyDownHaptic = UIImpactFeedbackGenerator(style: .rigid)
     private let keyUpHaptic = UIImpactFeedbackGenerator(style: .soft)
 
-    // Row 0: Half-height Surface Laptop Function Row (replaces floating toolbars cleanly!)
+    // Row 0: the action row (Windows navigation instead of F keys; Fn brings F1–F12 back). The app
+    // launchers, right click, drag lock and rotate are in the More button beside the trackpad.
     private static let functionRow: [LaptopKeySpec] = [
         .fnKey("esc",   action: .escape,          text: "Esc", w: 1.08),
-        .fnKey("f1",    action: .startMenu,       fnHid: 0x3a, fnTag: "F1"),
+        .fnKey("f1",    action: .startMenu,       fnHid: 0x3a, fnTag: "F1", symbol: "square.grid.2x2"),
         .fnKey("f2",    action: .search,          fnHid: 0x3b, fnTag: "F2", symbol: "magnifyingglass"),
-        .fnKey("f3",    action: .explorer,        fnHid: 0x3c, fnTag: "F3", symbol: "folder"),
-        .fnKey("f4",    action: .edgeBrowser,     fnHid: 0x3d, fnTag: "F4", symbol: "globe"),
-        .fnKey("f5",    action: .claudeCode,      fnHid: 0x3e, fnTag: "F5", symbol: "sparkles"),
-        .fnKey("f6",    action: .paintApp,        fnHid: 0x3f, fnTag: "F6", symbol: "paintbrush.pointed"),
-        .fnKey("f7",    action: .showDesktop,     fnHid: 0x40, fnTag: "F7", symbol: "menubar.rectangle"),
-        .fnKey("f8",    action: .rightClickArm,   fnHid: 0x41, fnTag: "F8", symbol: "computermouse"),
-        .fnKey("f9",    action: .dragLockToggle,  fnHid: 0x42, fnTag: "F9", symbol: "hand.draw"),
-        .fnKey("f10",   action: .cycleDeckLayout, fnHid: 0x43, fnTag: "F10", symbol: "rectangle.split.2x1"),
-        .fnKey("f11",   action: .rotateScreen,    fnHid: 0x44, fnTag: "F11", symbol: "rotate.right"),
+        .fnKey("f3",    action: .taskView,        fnHid: 0x3c, fnTag: "F3", symbol: "rectangle.on.rectangle"),
+        .fnKey("f4",    action: .snapLayouts,     fnHid: 0x3d, fnTag: "F4", symbol: "rectangle.split.2x1"),
+        .fnKey("f5",    action: .undo,            fnHid: 0x3e, fnTag: "F5", symbol: "arrow.uturn.backward"),
+        .fnKey("f6",    action: .redo,            fnHid: 0x3f, fnTag: "F6", symbol: "arrow.uturn.forward"),
+        .fnKey("f7",    action: .showDesktop,     fnHid: 0x40, fnTag: "F7", symbol: "menubar.dock.rectangle"),
+        .fnKey("f8",    action: .shortcutsMenu,   fnHid: 0x41, fnTag: "F8", symbol: "keyboard.badge.ellipsis"),
+        .fnKey("f9",    action: .quickSettings,   fnHid: 0x42, fnTag: "F9", symbol: "switch.2"),
+        .fnKey("f10",   action: .explorer,        fnHid: 0x43, fnTag: "F10", symbol: "folder"),
+        .fnKey("f11",   action: .keyboardToggle,  fnHid: 0x44, fnTag: "F11", symbol: "keyboard"),
         .fnKey("f12",   action: .openStudioMode,  fnHid: 0x45, fnTag: "F12", symbol: "arrow.up.left.and.arrow.down.right"),
         .fnKey("del",   action: .forwardDelete,   text: "Del", w: 1.15),
     ]
 
-    // Rows 1–5: Authentic Surface Laptop ANSI Layout with Stacked Up/Down Inverted-T Arrows
+    // Rows 1–5: ANSI layout with inverted-T arrows (stacked Up/Down)
     private static let mainRows: [[LaptopKeySpec]] = [
         // Row 1: Number row
         [
@@ -400,7 +405,7 @@ struct LaptopDeckView: View {
             .key("'", shifted: "\"", hid: 0x34),
             .key("Enter", hid: 0x28, w: 1.90),
         ],
-        // Row 4: Full dual-Shift row (clean Surface ANSI symmetry)
+        // Row 4: Shift row (both Shifts)
         [
             .mod("lshift", label: "Shift", hid: 0xe1, w: 2.22),
             .key("z", shifted: "Z", hid: 0x1d),
@@ -415,7 +420,7 @@ struct LaptopDeckView: View {
             .key("/", shifted: "?", hid: 0x38),
             .mod("rshift", label: "Shift", hid: 0xe5, w: 2.42),
         ],
-        // Row 5: Bottom modifier row + wide Spacebar + Surface Inverted-T Stacked Arrows
+        // Row 5: modifiers, a wide spacebar and the inverted-T arrows
         [
             .mod("lctrl", label: "Ctrl", hid: 0xe0, w: 1.25),
             LaptopKeySpec(id: "fn", widthWeight: 1.10, role: .fnToggle),
@@ -434,20 +439,15 @@ struct LaptopDeckView: View {
             let w = geo.size.width
             let h = geo.size.height
             let bottomLip: CGFloat = max(6.0, geo.safeAreaInsets.bottom * 0.45)
+            let bodyH = max(140.0, h - 6.0 - bottomLip)
 
-            ZStack(alignment: .bottom) {
-                // Midnight-Sapphire Anodized CNC Aluminum Unibody Deck
-                midnightAluminumDeckBackground
+            ZStack(alignment: .top) {
+                deckBackground
 
                 VStack(spacing: 0) {
-                    // 1. Sleek Cylindrical Surface Hinge Seam (zero toolbar clutter!)
-                    surfaceHingeSeam(width: w)
-                        .frame(height: 9)
-
-                    let bodyH = max(140.0, h - 9.0 - bottomLip)
-
                     switch vm.deckLayout {
                     case .split:
+                        // Keyboard (action row on top), then the trackpad with its round buttons.
                         let kbdH = max(142.0, bodyH * 0.625)
                         let padH = max(64.0, bodyH - kbdH - 12.0)
                         VStack(spacing: 8) {
@@ -455,53 +455,34 @@ struct LaptopDeckView: View {
                                 .frame(height: kbdH)
                                 .padding(.horizontal, 10)
 
-                            flushSurfaceHapticTouchpad(width: w, height: padH, expanded: false)
+                            trackpadRow(width: w, height: padH, expanded: false)
                                 .frame(height: padH)
                         }
-                        .padding(.top, 4)
 
                     case .trackpad:
-                        ZStack(alignment: .topTrailing) {
-                            flushSurfaceHapticTouchpad(width: w, height: bodyH - 12.0, expanded: true)
-                                .frame(height: bodyH - 12.0)
-                                .padding(.top, 6)
+                        // Keyboard off: the action row stays, the trackpad takes the rest.
+                        let rowH: CGFloat = 30
+                        VStack(spacing: 8) {
+                            keyboardRowView(row: Self.functionRow, rowHeight: rowH - 8, isFunctionStrip: true)
+                                .frame(height: rowH - 8)
+                                .padding(.horizontal, 5.5)
+                                .padding(.vertical, 4)
+                                .background(DeckPalette.well, in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+                                .padding(.horizontal, 10)
 
-                            // Discreet corner return pill when full-deck trackpad is active
-                            Button {
-                                keyDownHaptic.impactOccurred(intensity: 0.5)
-                                withAnimation(.snappy(duration: 0.2)) {
-                                    vm.deckLayout = .split
-                                }
-                            } label: {
-                                HStack(spacing: 4) {
-                                    Image(systemName: "keyboard")
-                                        .font(.system(size: 10, weight: .medium))
-                                    Text("Split")
-                                        .font(.system(size: 10, weight: .medium))
-                                }
-                                .foregroundStyle(.white.opacity(0.72))
-                                .padding(.horizontal, 9)
-                                .padding(.vertical, 5)
-                                .background(Color.black.opacity(0.45), in: Capsule())
-                                .overlay(Capsule().strokeBorder(Color.white.opacity(0.14), lineWidth: 0.5))
-                            }
-                            .buttonStyle(.plain)
-                            .padding(.top, 12)
-                            .padding(.trailing, 18)
+                            trackpadRow(width: w, height: bodyH - rowH - 14.0, expanded: true)
+                                .frame(height: bodyH - rowH - 14.0)
                         }
 
                     case .keyboard:
                         recessedSurfaceKeyboardWell(height: bodyH - 10.0)
                             .frame(height: bodyH - 10.0)
                             .padding(.horizontal, 10)
-                            .padding(.top, 5)
                     }
 
                     Spacer(minLength: 0)
                 }
-
-                // Machined CNC Front-Lip Thumb Notch along bottom edge (signature Surface Laptop detail!)
-                machinedFrontLipNotch(width: w)
+                .padding(.top, 6)
             }
             .frame(width: w, height: h)
         }
@@ -518,121 +499,68 @@ struct LaptopDeckView: View {
         }
     }
 
-    // MARK: - Midnight-Sapphire Anodized Aluminum Unibody Surface
+    // MARK: - Deck background
 
-    private var midnightAluminumDeckBackground: some View {
-        ZStack {
-            LinearGradient(
-                colors: [
-                    Color(red: 0.098, green: 0.125, blue: 0.192), // #192031 top studio key-light
-                    Color(red: 0.072, green: 0.092, blue: 0.145), // #121725 mid palmrest
-                    Color(red: 0.048, green: 0.062, blue: 0.102), // #0C101A front chamfer
-                ],
-                startPoint: .top,
-                endPoint: .bottom
-            )
-
-            // Soft overhead anodized metallic sheen across center deck
-            RadialGradient(
-                colors: [
-                    Color(red: 0.24, green: 0.31, blue: 0.46).opacity(0.20),
-                    Color.clear,
-                ],
-                center: .init(x: 0.5, y: 0.08),
-                startRadius: 12,
-                endRadius: 340
-            )
-
-            // Subtle diamond-cut outer chassis edge highlight
-            Rectangle()
-                .strokeBorder(
-                    LinearGradient(
-                        colors: [
-                            Color(red: 0.62, green: 0.72, blue: 0.92).opacity(0.18),
-                            Color(red: 0.45, green: 0.55, blue: 0.75).opacity(0.06),
-                        ],
-                        startPoint: .top,
-                        endPoint: .bottom
-                    ),
-                    lineWidth: 0.7
-                )
-        }
-    }
-
-    private func surfaceHingeSeam(width: CGFloat) -> some View {
-        ZStack {
-            LinearGradient(
-                colors: [
-                    Color(red: 0.012, green: 0.015, blue: 0.025),
-                    Color(red: 0.045, green: 0.058, blue: 0.092),
-                    Color(red: 0.12, green: 0.15, blue: 0.22),
-                ],
-                startPoint: .top,
-                endPoint: .bottom
-            )
-            // Razor-thin specular chamfer along front edge of hinge recess
-            VStack {
-                Spacer()
-                Rectangle()
-                    .fill(
-                        LinearGradient(
-                            colors: [
-                                Color.white.opacity(0.04),
-                                Color(red: 0.72, green: 0.82, blue: 1.0).opacity(0.24),
-                                Color.white.opacity(0.04),
-                            ],
-                            startPoint: .leading,
-                            endPoint: .trailing
-                        )
-                    )
-                    .frame(height: 0.6)
-            }
-        }
-    }
-
-    private func machinedFrontLipNotch(width: CGFloat) -> some View {
-        let notchW = min(116.0, width * 0.22)
-        return VStack(spacing: 0) {
-            UnevenRoundedRectangle(
-                topLeadingRadius: 4,
-                bottomLeadingRadius: 0,
-                bottomTrailingRadius: 0,
-                topTrailingRadius: 4,
-                style: .continuous
-            )
-            .fill(
-                LinearGradient(
-                    colors: [
-                        Color.black.opacity(0.55),
-                        Color(red: 0.14, green: 0.18, blue: 0.27).opacity(0.45),
-                    ],
-                    startPoint: .top,
-                    endPoint: .bottom
-                )
-            )
+    private var deckBackground: some View {
+        LinearGradient(colors: [DeckPalette.deckTop, DeckPalette.deckBottom], startPoint: .top, endPoint: .bottom)
             .overlay(alignment: .top) {
-                Capsule()
-                    .fill(Color(red: 0.70, green: 0.80, blue: 0.98).opacity(0.22))
-                    .frame(width: notchW - 10, height: 0.6)
+                // where the fold is: a hairline, nothing more
+                Rectangle().fill(Color.white.opacity(0.06)).frame(height: 0.5)
             }
-            .frame(width: notchW, height: 3.5)
-        }
-        .allowsHitTesting(false)
     }
 
-    // MARK: - 6-Row Recessed CNC Surface Keyboard Well
+    /// The trackpad between its round buttons: Sound and drag lock on the left, Clipboard and More
+    /// on the right (P1-5), so none of them sits on the pad.
+    private func trackpadRow(width: CGFloat, height: CGFloat, expanded: Bool) -> some View {
+        let button = min(44.0, max(32.0, (height - 10) / 2))
+        let side = button + 22
+        return HStack(spacing: 0) {
+            VStack(spacing: 10) {
+                SoundMenu(style: .round(button))
+                Button {
+                    performFunctionAction(.dragLockToggle)
+                } label: {
+                    Image(systemName: dragLocked ? "hand.draw.fill" : "hand.draw")
+                        .font(.system(size: button * 0.38, weight: .medium))
+                        .foregroundStyle(dragLocked ? Color.white : DeckPalette.legend)
+                        .frame(width: button, height: button)
+                        .background(dragLocked ? DeckPalette.keyLatched : DeckPalette.roundButton, in: Circle())
+                        .overlay(Circle().strokeBorder(dragLocked ? DeckPalette.edgeActive : DeckPalette.edge))
+                        .contentShape(Circle())
+                }
+                .buttonStyle(.plain)
+                .accessibilityLabel(L("拖动锁定", "Drag lock"))
+                .accessibilityAddTraits(dragLocked ? .isSelected : [])
+            }
+            .frame(width: side)
+
+            flushSurfaceHapticTouchpad(width: width - side * 2, height: height, expanded: expanded)
+
+            VStack(spacing: 10) {
+                ClipboardMenu(style: .round(button))
+                SessionMoreMenu(vm: vm, chrome: ChromeModel.shared, deckExtras: true, showPower: showPower,
+                                rightClickArmed: $vm.rightClickArmed,
+                                dragLocked: Binding(get: { dragLocked },
+                                                    set: { if $0 != dragLocked { performFunctionAction(.dragLockToggle) } }),
+                                style: .round(button))
+            }
+            .frame(width: side)
+        }
+    }
+
+    // MARK: - Keyboard well
 
     private func recessedSurfaceKeyboardWell(height: CGFloat) -> some View {
         let spacingV: CGFloat = 3.2
         let padV: CGFloat = 5.0
         let availRowsH = max(110.0, height - padV * 2 - spacingV * 5)
-        // Row 0 is 0.68x height (authentic low-profile Surface function key strip); Rows 1..5 are 1.0x
+        // Row 0 (the action row) is 0.68x height; rows 1..5 are 1.0x
         let unitH = availRowsH / 5.68
         let fnRowH = max(16.5, unitH * 0.68)
         let stdRowH = max(21.0, unitH)
 
         return VStack(spacing: spacingV) {
-            // Row 0: Surface Function Row
+            // Row 0: the action row
             keyboardRowView(row: Self.functionRow, rowHeight: fnRowH, isFunctionStrip: true)
                 .frame(height: fnRowH)
 
@@ -644,24 +572,7 @@ struct LaptopDeckView: View {
         }
         .padding(.horizontal, 5.5)
         .padding(.vertical, padV)
-        .background(
-            RoundedRectangle(cornerRadius: 8, style: .continuous)
-                .fill(Color(red: 0.028, green: 0.035, blue: 0.056)) // Deep CNC keyboard well recess
-                .overlay(
-                    RoundedRectangle(cornerRadius: 8, style: .continuous)
-                        .strokeBorder(
-                            LinearGradient(
-                                colors: [
-                                    Color.black.opacity(0.85),
-                                    Color(red: 0.58, green: 0.68, blue: 0.88).opacity(0.16),
-                                ],
-                                startPoint: .top,
-                                endPoint: .bottom
-                            ),
-                            lineWidth: 0.75
-                        )
-                )
-        )
+        .background(DeckPalette.well, in: RoundedRectangle(cornerRadius: 8, style: .continuous))
     }
 
     private func keyboardRowView(row: [LaptopKeySpec], rowHeight: CGFloat, isFunctionStrip: Bool) -> some View {
@@ -683,6 +594,10 @@ struct LaptopDeckView: View {
                             }
                         )
                         .frame(width: kw, height: rowHeight)
+                    } else if isShortcutsKey(spec) && !fnActive {
+                        // a menu, not a key: the Shortcuts palette (with Fn it is F8 again)
+                        ShortcutsMenu(vm: vm, style: .key)
+                            .frame(width: kw, height: rowHeight)
                     } else {
                         SurfaceKeycapView(
                             spec: spec,
@@ -719,11 +634,17 @@ struct LaptopDeckView: View {
             case .rightClickArm: return vm.rightClickArmed
             case .dragLockToggle: return dragLocked
             case .cycleDeckLayout: return vm.deckLayout != .split
+            case .keyboardToggle: return vm.deckLayout == .trackpad
             default: return false
             }
         case .regular, .upDownStack:
             return false
         }
+    }
+
+    private func isShortcutsKey(_ spec: LaptopKeySpec) -> Bool {
+        if case .functionKey(.shortcutsMenu, _, _, _, _) = spec.role { return true }
+        return false
     }
 
     /// On Arch Linux the keys that run something inside Windows are plain F keys, and say so.
@@ -836,6 +757,22 @@ struct LaptopDeckView: View {
             WinIOSBridge.shared.pressPowerButton()
         case .forwardDelete:
             WinIOSBridge.shared.tapKeyHid(0x4c)
+        case .taskView:
+            WinKeys.taskView()
+        case .snapLayouts:
+            WinKeys.snap()
+        case .undo:
+            WinKeys.undo()
+        case .redo:
+            WinKeys.redo()
+        case .quickSettings:
+            WinKeys.quickSettings()
+        case .shortcutsMenu:
+            break // drawn as a menu (keyboardRowView)
+        case .keyboardToggle:
+            withAnimation(.snappy(duration: 0.2)) {
+                vm.deckLayout = vm.deckLayout == .trackpad ? .split : .trackpad
+            }
         }
     }
 
@@ -855,60 +792,39 @@ struct LaptopDeckView: View {
         }
     }
 
-    // MARK: - Seamless Flush Midnight-Sapphire Precision Haptic Glass Touchpad
+    // MARK: - Trackpad
 
+    /// `width` is the room between the round buttons.
     private func flushSurfaceHapticTouchpad(width: CGFloat, height: CGFloat, expanded: Bool) -> some View {
         let padW = expanded
-            ? max(240.0, width - 36.0)
-            : min(max(246.0, width * 0.56), width - 64.0)
+            ? max(160.0, width - 8.0)
+            : min(max(160.0, width - 8.0), max(240.0, width * 0.78))
         let activeGlow = padTouching || cornerClickState != 0 || dragLocked
 
         return HStack(spacing: 0) {
             Spacer(minLength: 0)
 
             ZStack(alignment: .bottom) {
-                // Flush matte-sapphire precision glass slab
-                RoundedRectangle(cornerRadius: 8.5, style: .continuous)
-                    .fill(
-                        LinearGradient(
-                            colors: [
-                                Color(red: 0.062, green: 0.080, blue: 0.128), // #101421
-                                Color(red: 0.050, green: 0.065, blue: 0.106), // #0D101B
-                            ],
-                            startPoint: .top,
-                            endPoint: .bottom
-                        )
-                    )
+                RoundedRectangle(cornerRadius: 12, style: .continuous)
+                    .fill(DeckPalette.pad)
 
-                // Subtle diamond-chamfer recessed seam
-                RoundedRectangle(cornerRadius: 8.5, style: .continuous)
-                    .strokeBorder(
-                        LinearGradient(
-                            colors: [
-                                Color.black.opacity(0.75),
-                                activeGlow
-                                    ? Color(red: 0.74, green: 0.85, blue: 1.0).opacity(0.42)
-                                    : Color(red: 0.58, green: 0.70, blue: 0.92).opacity(0.16),
-                            ],
-                            startPoint: .top,
-                            endPoint: .bottom
-                        ),
-                        lineWidth: activeGlow ? 0.9 : 0.65
-                    )
+                RoundedRectangle(cornerRadius: 12, style: .continuous)
+                    .strokeBorder(activeGlow ? DeckPalette.edgeActive : DeckPalette.edge,
+                                  lineWidth: activeGlow ? 1.0 : 0.6)
 
-                // Hairline tactile corner feedback glow when left/right bottom haptic zone or drag-lock is engaged
+                // which corner is held (left or right click), or the drag lock
                 if cornerClickState != 0 || dragLocked {
                     HStack {
                         if cornerClickState == 1 || dragLocked {
                             Capsule()
-                                .fill(Color(red: 0.82, green: 0.90, blue: 1.0).opacity(0.65))
-                                .frame(width: 34, height: 1.8)
+                                .fill(Color.accentColor)
+                                .frame(width: 34, height: 2)
                         }
                         Spacer()
                         if cornerClickState == 2 {
                             Capsule()
-                                .fill(Color(red: 0.82, green: 0.90, blue: 1.0).opacity(0.65))
-                                .frame(width: 34, height: 1.8)
+                                .fill(Color.accentColor)
+                                .frame(width: 34, height: 2)
                         }
                     }
                     .padding(.horizontal, 14)
@@ -929,7 +845,7 @@ struct LaptopDeckView: View {
     }
 }
 
-// MARK: - Surface Stacked Up / Down Half-Height Arrow Pair
+// MARK: - Stacked Up / Down half-height arrow pair
 
 private struct SurfaceStackedArrowView: View {
     let isFnActive: Bool
@@ -961,11 +877,7 @@ private struct SurfaceStackedArrowView: View {
                 topTrailingRadius: cornerTop,
                 style: .continuous
             )
-            .fill(
-                pressed.wrappedValue
-                    ? Color(red: 0.24, green: 0.30, blue: 0.42)
-                    : Color(red: 0.052, green: 0.064, blue: 0.098)
-            )
+            .fill(pressed.wrappedValue ? DeckPalette.keyPressed : DeckPalette.key)
             .overlay(
                 UnevenRoundedRectangle(
                     topLeadingRadius: cornerTop,
@@ -974,7 +886,7 @@ private struct SurfaceStackedArrowView: View {
                     topTrailingRadius: cornerTop,
                     style: .continuous
                 )
-                .strokeBorder(Color(red: 0.76, green: 0.84, blue: 1.0).opacity(0.15), lineWidth: 0.5)
+                .strokeBorder(DeckPalette.edge, lineWidth: 0.5)
             )
 
             Image(systemName: isUp ? "chevron.up" : "chevron.down")
@@ -996,7 +908,7 @@ private struct SurfaceStackedArrowView: View {
     }
 }
 
-// MARK: - Matte Obsidian-Midnight Surface Chiclet Keycap
+// MARK: - Keycap
 
 private struct SurfaceKeycapView: View {
     let spec: LaptopKeySpec
@@ -1014,59 +926,15 @@ private struct SurfaceKeycapView: View {
         let radius: CGFloat = isFunctionStrip ? 3.8 : 4.6
 
         ZStack {
-            // Matte obsidian Surface keycap with subtle ice-white backlit rim
+            // A charcoal key; latched keys (modifiers, Caps, Fn) take the accent colour.
             RoundedRectangle(cornerRadius: radius, style: .continuous)
-                .fill(
-                    isPressed
-                        ? LinearGradient(
-                            colors: [
-                                Color(red: 0.22, green: 0.27, blue: 0.39),
-                                Color(red: 0.16, green: 0.20, blue: 0.30),
-                            ],
-                            startPoint: .top,
-                            endPoint: .bottom
-                        )
-                        : LinearGradient(
-                            colors: [
-                                isLatchedOrLED
-                                    ? Color(red: 0.14, green: 0.18, blue: 0.28)
-                                    : Color(red: 0.056, green: 0.068, blue: 0.104), // #0E111B matte black-midnight
-                                isLatchedOrLED
-                                    ? Color(red: 0.10, green: 0.13, blue: 0.21)
-                                    : Color(red: 0.038, green: 0.047, blue: 0.074), // #0A0C13
-                            ],
-                            startPoint: .top,
-                            endPoint: .bottom
-                        )
-                )
+                .fill(isPressed ? DeckPalette.keyPressed : (isLatchedOrLED ? DeckPalette.keyLatched : DeckPalette.key))
                 .overlay(
                     RoundedRectangle(cornerRadius: radius, style: .continuous)
-                        .strokeBorder(
-                            isPressed || isLatchedOrLED
-                                ? Color(red: 0.84, green: 0.91, blue: 1.0).opacity(0.48)
-                                : Color(red: 0.76, green: 0.85, blue: 1.0).opacity(0.13),
-                            lineWidth: 0.55
-                        )
+                        .strokeBorder(isLatchedOrLED ? DeckPalette.edgeActive : DeckPalette.edge, lineWidth: 0.55)
                 )
-                .shadow(color: .black.opacity(isPressed ? 0.12 : 0.50), radius: isPressed ? 0.3 : 0.9, x: 0, y: isPressed ? 0 : 0.8)
 
             keycapLegend
-
-            // Authentic Surface warm-white micro-LED pinhole indicator in top-left corner when active!
-            if showsPinLED && isLatchedOrLED {
-                VStack {
-                    HStack {
-                        Circle()
-                            .fill(Color.white)
-                            .frame(width: 3.4, height: 3.4)
-                            .shadow(color: .white.opacity(0.85), radius: 2.0)
-                        Spacer()
-                    }
-                    Spacer()
-                }
-                .padding(3.5)
-                .allowsHitTesting(false)
-            }
         }
         .scaleEffect(isPressed ? 0.96 : 1.0)
         .gesture(
@@ -1095,30 +963,17 @@ private struct SurfaceKeycapView: View {
         }
     }
 
-    private var showsPinLED: Bool {
-        switch spec.role {
-        case .capsLock, .fnToggle, .modifier:
-            return true
-        case .functionKey(let action, _, _, _, _):
-            return action == .rightClickArm || action == .dragLockToggle || action == .cycleDeckLayout
-        default:
-            return false
-        }
-    }
-
     @ViewBuilder
     private var keycapLegend: some View {
-        let fg = Color(red: 0.94, green: 0.96, blue: 1.0)
-        let subFg = Color(red: 0.66, green: 0.73, blue: 0.86).opacity(0.62)
+        let fg = DeckPalette.legend
+        let subFg = DeckPalette.legendDim
 
         switch spec.role {
-        case .functionKey(let action, _, let fnTag, let symbol, let text):
+        case .functionKey(_, _, let fnTag, let symbol, let text):
             if isFnActive, let fnTag {
                 Text(fnTag)
                     .font(.system(size: 9.0, weight: .semibold))
                     .foregroundStyle(fg)
-            } else if action == .startMenu {
-                WindowsLogoMark(size: 8.8, color: fg.opacity(0.92))
             } else if let text {
                 Text(text)
                     .font(.system(size: 8.8, weight: .medium))
@@ -1139,14 +994,11 @@ private struct SurfaceKeycapView: View {
                 .font(.system(size: 9.8, weight: .medium))
                 .foregroundStyle(fg.opacity(0.90))
 
-        case .modifier(_, let label, let isWindowsKey):
-            if isWindowsKey {
-                WindowsLogoMark(size: 10.5, color: fg.opacity(0.92))
-            } else {
-                Text(label)
-                    .font(.system(size: 9.8, weight: .medium))
-                    .foregroundStyle(fg.opacity(0.90))
-            }
+        case .modifier(_, let label, _):
+            // the Windows key says "Win": no logo marks in our chrome
+            Text(label)
+                .font(.system(size: 9.8, weight: .medium))
+                .foregroundStyle(fg.opacity(0.90))
 
         case .regular(_, let primary, let shifted, _, let fnLabel, let homing):
             if isFnActive, let fnLabel {
@@ -1154,7 +1006,7 @@ private struct SurfaceKeycapView: View {
                     .font(.system(size: 9.2, weight: .semibold))
                     .foregroundStyle(fg)
             } else if primary == "Space" {
-                EmptyView() // Clean unadorned matte Surface spacebar!
+                EmptyView() // a plain spacebar
             } else if primary == "Backspace" {
                 Image(systemName: "delete.left")
                     .font(.system(size: 10.5, weight: .regular))

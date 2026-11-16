@@ -98,7 +98,9 @@ final class VMViewModel: ObservableObject {
         didSet { UserDefaults.standard.set(postureMode.rawValue, forKey: "winios.posture") }
     }
     @Published var deckLayout: DeckLayout = .split
-    @Published var controlBarVisible: Bool = true
+    // chrome (feat/chrome): the session controls are standard toolbar items now, shown or hidden by
+    // immersive mode per surface (ChromeModel in SessionChrome.swift), so controlBarVisible and
+    // autoHideControlBar (winios.autoHideBar) are gone.
     @Published var trackpadMode: Bool = false
     @Published var rightClickArmed: Bool = false
     @Published var systemKeyboardVisible: Bool = false
@@ -116,11 +118,6 @@ final class VMViewModel: ObservableObject {
         didSet { UserDefaults.standard.set(directTouch, forKey: "winios.directTouch") }
     }
     @Published var showSettings: Bool = false
-    /// The toolbar hides by itself once Windows is used again (a tap, a drag, a click on the screen).
-    /// On by default on a foldable, where the screen is small and the toolbar covers part of it.
-    @Published var autoHideControlBar: Bool = (UserDefaults.standard.object(forKey: "winios.autoHideBar") as? Bool) ?? VMViewModel.isKnownFoldable {
-        didSet { UserDefaults.standard.set(autoHideControlBar, forKey: "winios.autoHideBar") }
-    }
     /// Advanced: JIT code cache in MiB (0 = default, the largest) and the most guest RAM in MiB (0 = automatic).
     /// Both are fixed when JIT is acquired, so a change applies after the app is closed and opened again.
     /// Refresh rate of the machine's screen (all machines): 30, 60 (default) or 120 where the screen can.

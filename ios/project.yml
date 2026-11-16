@@ -34,9 +34,11 @@ targets:
         UILaunchScreen: {}
         UIFileSharingEnabled: true
         LSSupportsOpeningDocumentsInPlace: true
-        UIStatusBarHidden: true
+        # chrome: the status bar is shown (on the iPhone Duo in its vertical bar) except in immersive
+        # mode, which hides it from the view controller (SwiftUI .statusBarHidden).
+        UIStatusBarHidden: false
         CADisableMinimumFrameDurationOnPhone: true
-        UIViewControllerBasedStatusBarAppearance: false
+        UIViewControllerBasedStatusBarAppearance: true
         NSMicrophoneUsageDescription: "Windows uses the microphone for voice input and audio recording."
         # Port forwards open to the local network (Settings > Port forwarding, PortForwardingView.swift). The
         # Bonjour type is only browsed to learn whether Local Network access was granted; nothing is advertised.

@@ -136,13 +136,18 @@ enum SceneOrientationController {
     }
 }
 
+/// An invisible controller in the session view: it reports the hinge, and hands the window, its root
+/// controller and the iOS 27.1 vertical bar's edge to the session chrome (ChromeModel).
 final class HingeObserverViewController: UIViewController {
     var onHingeUpdate: ((Int, Double?) -> Void)?
     private var didInstallHinge = false
+    private var didRegisterTraits = false
 
-    override var prefersStatusBarHidden: Bool { true }
-    override var preferredScreenEdgesDeferringSystemGestures: UIRectEdge { .all }
-    override var prefersHomeIndicatorAutoHidden: Bool { true }
+    // The status bar, home indicator and edge gestures follow immersive mode (SwiftUI sets them on
+    // the root controller; these answer the same in case a container asks its children).
+    override var prefersStatusBarHidden: Bool { ChromeModel.shared.hidesSystemUI }
+    override var preferredScreenEdgesDeferringSystemGestures: UIRectEdge { ChromeModel.shared.hidesSystemUI ? .all : [] }
+    override var prefersHomeIndicatorAutoHidden: Bool { ChromeModel.shared.hidesSystemUI }
 
     override func viewDidLoad() {
         super.viewDidLoad()
@@ -158,6 +163,21 @@ final class HingeObserverViewController: UIViewController {
         parent?.setNeedsUpdateOfScreenEdgesDeferringSystemGestures()
         parent?.setNeedsUpdateOfHomeIndicatorAutoHidden()
         installHingeObserverIfAvailable()
+        attachChrome()
+    }
+
+    /// The window-wide gestures, the root controller's hooks and the vertical bar's edge.
+    private func attachChrome() {
+        guard let window = view.window else { return }
+        ChromeModel.shared.attach(window: window)
+        ChromeModel.shared.traitsChanged(window.traitCollection)
+        guard !didRegisterTraits else { return }
+        didRegisterTraits = true
+        var traits: [UITrait] = [UITraitHorizontalSizeClass.self, UITraitVerticalSizeClass.self]
+        if #available(iOS 27.1, *) { traits += UITraitCollection.systemTraitsAffectingVerticalBarEdge }
+        registerForTraitChanges(traits) { (vc: HingeObserverViewController, _: UITraitCollection) in
+            ChromeModel.shared.traitsChanged(vc.view.window?.traitCollection ?? vc.traitCollection)
+        }
     }
 
     /// UIHingeInteraction (iOS 27.1+) reports the fold of a foldable device. Elsewhere (older iOS, or a
