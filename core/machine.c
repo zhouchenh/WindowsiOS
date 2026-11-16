@@ -73,7 +73,7 @@ static int init_rest(HvMachine *m) {
     hv_knob[HV_K_RECHECK] = getenv("HV_RECHECK") ? atoi(getenv("HV_RECHECK")) : 1;
     /* Henge a47f5e1: chaining rewrites one B as another B and drops just that instruction-cache line, without waiting
        for every CPU; a placed block's hot and cold parts share one wait (host/jit_region.c). */
-    knob_env(HV_K_FASTICACHE, 0);
+    knob_env(HV_K_FASTICACHE, 1); /* on unless its variable says 0 */
     /* Henge 94ca6a9 (its first part): a process's id in the branch cache (asid_cid) also goes with the table base its
        ASID had, so an ASID back with another TTBR0 base, with no TLBI by ASID in between, starts with no cached targets. */
     knob_env(HV_K_IJCTTBKEY, 0);
