@@ -33,6 +33,8 @@ typedef uintptr_t SOCKET;
 #define SO_SNDTIMEO          0x1005
 #define SO_RCVTIMEO          0x1006
 #define SD_SEND              1
+#define SD_BOTH              2
+#define INFINITE             0xFFFFFFFFU
 #define CP_UTF8              65001U
 #define CREATE_NO_WINDOW     0x08000000U
 #define FILE_APPEND_DATA     0x0004U
@@ -564,11 +566,21 @@ static DWORD relay_client_thread(void *arg) {
     PumpCtx c2u = { client, upstream, &is_oauth, &done_signal, 1 };
     PumpCtx u2c = { upstream, client, &is_oauth, &done_signal, 0 };
 
+    /* The pumps use c2u/u2c, is_oauth and done_signal on this stack and both sockets, so this
+     * thread must not return or close the sockets until both have ended. They end on their own
+     * (peer shutdown, or 30 s without data through SO_RCVTIMEO), so wait without a timeout. If
+     * only one could be started, shut both sockets down so it stops, then wait for it. */
     HANDLE th[2];
     th[0] = CreateThread(NULL, 0, pump_stream_thread, &c2u, 0, NULL);
     th[1] = CreateThread(NULL, 0, pump_stream_thread, &u2c, 0, NULL);
     if (th[0] && th[1]) {
-        WaitForMultipleObjects(2, th, 1, 60000);
+        WaitForMultipleObjects(2, th, 1, INFINITE);
+    } else {
+        shutdown(client, SD_BOTH);
+        shutdown(upstream, SD_BOTH);
+        for (int i = 0; i < 2; i++) {
+            if (th[i]) WaitForMultipleObjects(1, &th[i], 1, INFINITE);
+        }
     }
     if (th[0]) CloseHandle(th[0]);
     if (th[1]) CloseHandle(th[1]);
