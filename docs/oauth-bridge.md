@@ -87,9 +87,11 @@ In detail:
 - **Port forward.** `PUT /.henge/expose-port` makes `host/net_slirp.c` add a libslirp host forward
   `127.0.0.1:<port> → 10.0.2.15:<port>`, plus an IPv6 bridge for `[::1]:<port>`. Safari's redirect
   to `localhost:<port>` on the iPhone therefore reaches the relay.
-- **Done.** The relay watches the first request line for `/auth`, `/oauth`, `callback` or `code=`.
-  When the app answers it with 200, 301 or 302, the relay sends `PUT /.henge/oauth-done`. The app
-  closes the Safari sheet with a success haptic (`VMViewModel.startOAuthPoller`).
+- **Done.** The relay watches the first request line of each connection for an OAuth callback:
+  a `code` or `error` query parameter, together with `state` or a path containing `callback`,
+  `redirect` or `oauth` (so `/api/auth/session` or `?zipcode=` on a local site does not count).
+  When the app answers it with 200, 301 or 302, the relay sends `PUT /.henge/oauth-done`, at most
+  once. The app closes the Safari sheet with a success haptic (`VMViewModel.startOAuthPoller`).
 - **Log.** `%TEMP%\winios_browser.log` in Windows lists every call, the ports it found and the
   open-url status.
 
@@ -151,5 +153,5 @@ It should be `IMAGE_FILE_MACHINE_ARM64` with subsystem `WINDOWS_GUI` and import 
 - **A firewall prompt for WinIOS Browser**: the rule is missing. Run `SAFARI-SIGNIN.bat` again, or
   allow it in the prompt for private and public networks.
 - **The sheet stays open after the sign-in**: close it by hand. The app may have answered the
-  callback with something other than 200, 301 or 302, or the request line did not contain one of
-  the callback markers. The sign-in itself has still finished.
+  callback with something other than 200, 301 or 302, or the callback had no `code`/`error` with
+  `state` (and no `callback`/`redirect`/`oauth` in its path). The sign-in itself has still finished.

@@ -164,6 +164,8 @@ static size_t str_len(const char *s) {
 static volatile uint64_t g_relay_finish_at = 0;
 /* Relay client threads still running; the relay process waits for them before it exits. */
 static volatile int32_t g_relay_active_clients = 0;
+/* Set once this relay has sent /.henge/oauth-done. */
+static volatile int32_t g_oauth_done_sent = 0;
 
 static char to_lower_c(char c) {
     return (c >= 'A' && c <= 'Z') ? (char)(c + 32) : c;
@@ -459,6 +461,45 @@ static DWORD oauth_done_notify_thread(void *arg) {
     return 0;
 }
 
+/* Is `name` a parameter of the query string q[0..qlen) (`name=` at the start or after `&`/`;`)? */
+static int query_has_param(const char *q, size_t qlen, const char *name) {
+    size_t nlen = str_len(name);
+    size_t i = 0;
+    while (i < qlen) {
+        size_t j = 0;
+        while (j < nlen && i + j < qlen && to_lower_c(q[i + j]) == name[j]) j++;
+        if (j == nlen && i + j < qlen && q[i + j] == '=') return 1;
+        while (i < qlen && q[i] != '&' && q[i] != ';') i++;
+        i++;
+    }
+    return 0;
+}
+
+/*
+ * Does this HTTP request line ("GET /path?query HTTP/1.1") look like an OAuth redirect_uri
+ * callback? The query must carry `code` or `error` as a parameter (RFC 6749 4.1.2), and either
+ * `state` too or a path naming a callback/redirect. Ordinary localhost traffic such as
+ * `/api/auth/session` or `?zipcode=` does not count, so it does not close the Safari sheet.
+ */
+static int is_oauth_callback_request_line(const char *line, size_t len) {
+    size_t t = 0;
+    while (t < len && line[t] != ' ') t++;
+    while (t < len && line[t] == ' ') t++;
+    size_t end = t;
+    while (end < len && line[end] != ' ') end++;
+    size_t q = t;
+    while (q < end && line[q] != '?') q++;
+    if (q >= end) return 0;
+    const char *query = line + q + 1;
+    size_t qlen = end - q - 1;
+    if (!query_has_param(query, qlen, "code") && !query_has_param(query, qlen, "error")) return 0;
+    if (query_has_param(query, qlen, "state")) return 1;
+    const char *path = line + t;
+    size_t plen = q - t;
+    return mem_contains_ci(path, plen, "callback") || mem_contains_ci(path, plen, "redirect") ||
+           mem_contains_ci(path, plen, "oauth");
+}
+
 static DWORD pump_stream_thread(void *arg) {
     PumpCtx *ctx = (PumpCtx *)arg;
     char *buf = (char *)HeapAlloc(GetProcessHeap(), 0, 16384);
@@ -471,14 +512,11 @@ static DWORD pump_stream_thread(void *arg) {
         if (first) {
             first = 0;
             size_t line_len = 0;
-            while (line_len < (size_t)n && line_len < 1024 && buf[line_len] != '\r' && buf[line_len] != '\n') {
+            while (line_len < (size_t)n && line_len < 8192 && buf[line_len] != '\r' && buf[line_len] != '\n') {
                 line_len++;
             }
             if (ctx->inspect_request) {
-                if (mem_contains_ci(buf, line_len, "/auth") ||
-                    mem_contains_ci(buf, line_len, "/oauth") ||
-                    mem_contains_ci(buf, line_len, "callback") ||
-                    mem_contains_ci(buf, line_len, "code=")) {
+                if (is_oauth_callback_request_line(buf, line_len)) {
                     *(ctx->is_oauth) = 1;
                 }
             } else if (*(ctx->is_oauth)) {
@@ -588,7 +626,8 @@ static DWORD relay_client_thread(void *arg) {
     closesocket(upstream);
     closesocket(client);
 
-    if (done_signal) {
+    /* Signal the host at most once per relay. */
+    if (done_signal && !__atomic_exchange_n(&g_oauth_done_sent, 1, __ATOMIC_SEQ_CST)) {
         log_line("oauth_callback_done_signaling_host", "");
         g_relay_finish_at = GetTickCount64() + 4000ULL;
         HANDLE nt = CreateThread(NULL, 0, oauth_done_notify_thread, NULL, 0, NULL);
