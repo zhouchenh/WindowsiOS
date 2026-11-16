@@ -38,6 +38,9 @@ bool winios_jit_is_traced(void);
 /* A debugger still attached a few seconds after the JIT region was held and the debugger that gave it
    was told to let go: a second StikDebug session, say. While one is attached every trap stops the app
    until it answers. Asks it to detach (the JIT script answers that brk), at most three times per launch.
+   Only while such a session is the likely one: within 30 s of the helper being told to let go and
+   while a debugger has stayed attached since; a debugger that attaches after the process was seen
+   untraced is left alone (it would stop on a brk it does not handle at every continue).
    Cheap when there is nothing to do; returns true when a detach request was sent. Main thread only.
    Adapted from Henge's JITBootstrap.releaseLingeringDebugger (Leviidev/Henge ca44144). */
 bool winios_jit_release_lingering_debugger(void);
