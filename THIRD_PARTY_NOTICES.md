@@ -11,9 +11,11 @@ This project stands on the shoulders of extraordinary open-source systems engine
 | Component | Upstream Project / Authors | License | How Used in `WindowsiOS` |
 | :--- | :--- | :--- | :--- |
 | **Henge** (`HengeVM`) | [`Leviidev/Henge`](https://github.com/Leviidev/Henge) & [`Leviidev/Henge#7`](https://github.com/Leviidev/Henge/pull/7) (Levii & contributors) | `GPL-2.0-or-later` | Foundational ARM64-to-ARM64 dynamic binary translator, stage-1 software MMU foundation, block/IJC/return caches (`core/`, `host/enter.S`, `host/jit_region.c`), `/.henge` WebDAV share server (`host/share.c`), and iOS 26/27 TXM dual-mapped JIT substrate (`ios/Sources/Native/winios_jit.c`, `winios_brk.S`, `henge-jit.js`) |
-| **Husk** | [`Leviidev/Husk`](https://github.com/Leviidev/Husk) (Levii & contributors) | `GPL-2.0-or-later` | ARM64 JIT architecture & translation insights, iOS `libslirp` cross-build patches, and on-device JIT helper integration (`scripts/build_ios_deps.sh`) |
+| **Husk** | [`Leviidev/Husk`](https://github.com/Leviidev/Husk) (Levii & contributors) | `GPL-2.0-or-later` | ARM64 JIT architecture & translation insights, iOS `libslirp` cross-build patches, Built-in JIT design, and the on-device pairing wrapper `src/rppairing-ios` at `29abb51`, built into the app as `libhusk_rppairing.a` (`scripts/build_jit_deps.sh`, `ios/Sources/Native/HuskRPPairing.h`) |
 | **LinuxRunner** | [`mxhm11cr/LinuxRunner`](https://github.com/mxhm11cr/LinuxRunner) (derived from `ish-app/ish` & `rcarmo/ios-linuxkit`) | `GPL-2.0` / `GPL-3.0` | Architectural inspiration and early ARM64 guest OS bring-up & iOS runtime discipline patterns (no GPL-3.0-only source files linked) |
-| **StikDebug / StikJIT** | [`StephenDev0/StikDebug`](https://github.com/StephenDev0/StikDebug) / `StikJIT` (BluDood / StephenDev0 & contributors) + [`jkcoxson/idevice`](https://github.com/jkcoxson/idevice) | `MPL-2.0` / `BSD-3-Clause` / `MIT` | On-device iOS 26/27 TXM debugger & JIT page-blessing protocol (`universal.js` / `ios/Sources/Resources/henge-jit.js`, `BRK #0x69` / `BRK #0xF00D` dual-mapped RX/RW regions, and `CS_DEBUGGED` ledger-exempt memory setup) |
+| **StikDebug** | [`StephenDev0/StikDebug`](https://github.com/StephenDev0/StikDebug) (StephenDev0 & contributors) | `AGPL-3.0` | A separate app the user may install; Apple VM only opens it through `stikjit://` links. **Not bundled, no code taken.** |
+| **StikJIT** | [`StikDebug/StikJIT`](https://github.com/StikDebug/StikJIT) 1.9.0 (`32287268`) | `MPL-2.0` | The debugger inside Built-in JIT's app extension (`Frameworks/StikJIT.framework`, used by `PlugIns/WinJITHelper.appex`), **with our patch** `ios/patches/stikjit-high-address.patch` (from Henge); the TXM JIT page-blessing protocol (`universal.js`, `BRK #0x69` / `BRK #0xF00D`) that `henge-jit.js` follows |
+| **idevice** | [`jkcoxson/idevice`](https://github.com/jkcoxson/idevice) (Jackson Coxson & contributors) | `MIT` | Inside StikJIT (its prebuilt `libidevice_ffi.a`) and, at 0.1.68, inside the on-device pairing library; with its Rust dependencies (`MIT` / `Apache-2.0` / `BSD` / `ISC` and others, listed in `ios/Sources/Resources/legal/LICENSES-rppairing-crates.txt`) |
 | **libslirp** | [`gitlab.freedesktop.org/slirp/libslirp`](https://gitlab.freedesktop.org/slirp/libslirp) / [`utmapp/libslirp`](https://github.com/utmapp/libslirp) (Danny Gasparovski, Fabrice Bellard, QEMU & libslirp contributors) | `BSD-3-Clause` | User-mode TCP/IP + DHCP + DNS NAT stack (`10.0.2.0/24`) linked via `host/net_slirp.c` (fetched & cross-compiled at build time by `scripts/build_ios_deps.sh`) |
 | **GLib / libintl / libffi / PCRE2** | GNOME GLib (`2.83.0`), `proxy-libintl`, `libffi` (`3.5.0`), `PCRE2` | `LGPL-2.1-or-later` / `MIT` / `BSD-3-Clause` | Transitive build-time static libraries required by `libslirp` on `arm64-apple-ios` (`scripts/build_ios_deps.sh`, staged into ignored `ios/deps/`) |
 | **TianoCore EDK2 (`ArmVirtQemu`)** | [`tianocore/edk2`](https://github.com/tianocore/edk2) (TianoCore / Intel / Linaro / Arm contributors) | `BSD-2-Clause-Patent` | `AARCH64` UEFI firmware image (`QEMU_EFI.fd` -> `work/code.fd` + `work/vars.fd`). **Not bundled in this repository**; fetched at provisioning time |
@@ -51,6 +53,8 @@ GNU General Public License for more details.
 
 `Leviidev/Husk` pioneered practical ARM64 translation, iOS `libslirp` build patches, and on-device StikJIT integration patterns on modern non-jailbroken iOS devices. Portions of the iOS JIT/dependency build flow (`scripts/build_ios_deps.sh`) draw directly from Husk's open-source architecture under `GPL-2.0-or-later`.
 
+Built-in JIT (`docs/builtin-jit.md`) links Husk's on-device pairing wrapper, `src/rppairing-ios` at commit `29abb512d81bf8cc08babcbe7f7007cb557208ef` (`GPL-2.0-or-later`; a thin Rust layer over idevice's `PairableHost`), built from source by `scripts/build_jit_deps.sh` into `libhusk_rppairing.a`, with its C header `ios/Sources/Native/HuskRPPairing.h`. The Swift code of Built-in JIT (`ios/WinJITHelper/`, `ios/Sources/BuiltInJIT*.swift`, parts of `ios/Sources/JITSetup.swift`) is ported from Henge `7b55730` (`ios/HengeJITHelper/`, `ios/Henge/JIT/`), which took it from Husk; both `GPL-2.0-or-later`.
+
 ---
 
 ## 3. mxhm11cr/LinuxRunner (`GPL-2.0` / `GPL-3.0` Inspiration)
@@ -62,16 +66,17 @@ Credited with gratitude for demonstrating early guest OS bring-up workflows, iOS
 
 ---
 
-## 4. StikDebug / StikJIT (`MPL-2.0` / `BSD-3-Clause` / `MIT`)
+## 4. StikDebug (`AGPL-3.0`), StikJIT (`MPL-2.0`) and idevice (`MIT`)
 
-- **Repositories:** <https://github.com/StephenDev0/StikDebug>, `StikJIT`, and <https://github.com/jkcoxson/idevice>
-- **Authors:** StephenDev0 (BluDood), Jackson Coxson (`idevice`), and contributors
-- **Licenses:** Mozilla Public License 2.0 (`MPL-2.0`), `BSD-3-Clause` (debugger script conventions), and `MIT` (`idevice`)
+- **Repositories:** <https://github.com/StephenDev0/StikDebug>, <https://github.com/StikDebug/StikJIT>, and <https://github.com/jkcoxson/idevice>
+- **Authors:** StephenDev0, Jackson Coxson (`idevice`), and contributors
+- **Licenses:** StikDebug: GNU Affero General Public License v3.0 (`AGPL-3.0`; not bundled, Apple VM only opens it by URL). StikJIT: Mozilla Public License 2.0 (`MPL-2.0`). idevice: `MIT`.
 
 On iOS 26 and iOS 27 devices equipped with Apple's Trusted Execution Monitor (**TXM**), hardware enforcement blocks ordinary `MAP_JIT` execution without debugger page-blessing. `WindowsiOS` uses the `BRK #0x69` / `BRK #0xF00D` protocol (`ios/Sources/Native/winios_brk.S`, `ios/Sources/Resources/henge-jit.js`, and `scripts/_lldb_txm_jit.py`) pioneered by `StikDebug` / `StikJIT` and adapted by `Leviidev/Henge` to allocate and bless dual-mapped RX/RW JIT regions (`_M<size>,rx` + `vm_remap`) and pre-allocate ledger-exempt guest RAM while `CS_DEBUGGED` is active prior to debugger detach.
 
-- `StikJIT` framework components (when optionally staged via `scripts/build_ios_deps.sh`) are governed by the **Mozilla Public License Version 2.0** (`MPL-2.0`, compatible with `GPL-2.0-or-later` Larger Works under MPL-2.0 Section 3.3). Full MPL-2.0 text: <https://www.mozilla.org/MPL/2.0/>.
-- `idevice` (Copyright (c) Jackson Coxson) is licensed under the **MIT License**.
+- **StikJIT** 1.9.0 (tag at commit `32287268fa5824f9edce4cb359f5833ce0cf7b00`) is shipped in the app as `Frameworks/StikJIT.framework` for Built-in JIT (`PlugIns/WinJITHelper.appex`, `docs/builtin-jit.md`), under the **Mozilla Public License Version 2.0** (`MPL-2.0`; a Larger Work with `GPL-2.0-or-later` code under MPL-2.0 Section 3.3). **We modify it** with `ios/patches/stikjit-high-address.patch` (taken from Henge's `ci/stikjit-high-address.patch`: `ScriptRunner.swift` writes 16 hex digits of the page address in its `$M` packets instead of 9). The modified source is StikJIT's at the commit above plus that patch; `scripts/build_jit_deps.sh` rebuilds the framework from them. The MPL-2.0 text and the patch travel inside the app in `legal/` (`ios/Sources/Resources/legal/LICENSE-StikJIT-MPL-2.0.txt`, `stikjit-high-address.patch`).
+- `idevice` (Copyright (c) Jackson Coxson) is licensed under the **MIT License** (`ios/Sources/Resources/legal/LICENSE-idevice-MIT.txt`). StikJIT links it as the prebuilt `idevice/libidevice_ffi.a` in its repository; the on-device pairing library builds idevice 0.1.68 from crates.io. The licences of all Rust crates in that library are in `ios/Sources/Resources/legal/LICENSES-rppairing-crates.txt`, generated from its `Cargo.lock` by Husk's `notices.py`.
+- No StikDebug code is in Apple VM.
 
 ---
 

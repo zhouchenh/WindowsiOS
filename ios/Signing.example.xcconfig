@@ -10,6 +10,10 @@
 DEVELOPMENT_TEAM = XXXXXXXXXX
 
 // Any reverse-DNS id of your own. An id registered by another team cannot be used.
+// Built-in JIT's helper extension (PlugIns/WinJITHelper.appex) gets this id plus ".JITHelper"
+// (here com.example.applevm.duo.JITHelper; see WinJITHelper.xcconfig) and the same team and
+// signing style. That is a second App ID: a free personal team can register 10 per 7 days, and
+// Automatic signing registers both. Do not set the helper's id yourself.
 PRODUCT_BUNDLE_IDENTIFIER = com.example.applevm.duo
 
 // Let Xcode register the App ID and make the provisioning profile.

@@ -28,6 +28,9 @@ The app still has its upstream name in the source tree: the Xcode target, scheme
    brew install xcodegen meson ninja mtools libslirp pkgconf python
    ```
 
+   Built-in JIT's pairing library is Rust: also install [rustup](https://rustup.rs) (or
+   `brew install rustup`); `scripts/build_jit_deps.sh` adds the iOS target itself.
+
    `scripts/build_ios_deps.sh` runs meson with `/opt/homebrew/bin/python3`. For the freestanding
    Windows guest helpers in `tools/` you also need `brew install llvm lld` (not needed for the app).
 
@@ -43,13 +46,17 @@ cd AppleVM-Duo
 ```sh
 make -j8 all && make test-core      # macOS runner build/winvm, build/hvsparse, core JIT/MMU tests
 make test-dns test-net              # guest DNS proxy (sanitizers, fuzz) and guest network, IPv4 + IPv6
-scripts/build_ios_deps.sh           # once: libffi + glib + libslirp for iOS into ios/deps/
+scripts/build_ios_deps.sh           # once: libffi + glib + libslirp for iOS into ios/deps/,
+                                    # then scripts/build_jit_deps.sh (Built-in JIT)
 make -j8 ios-lib                    # build/ios/libwinvm.a (the engine for the app)
 ```
 
 `build_ios_deps.sh` downloads libffi 3.5.0, glib 2.83.0 and libslirp 4.9.1, cross-compiles them for
 arm64 iOS 17.0 and takes a few minutes. It only needs to run again when the script changes; its
-logs are in `work/ios_deps_build/*.log`.
+logs are in `work/ios_deps_build/*.log`. At the end it runs `scripts/build_jit_deps.sh`, which builds
+Built-in JIT's StikJIT.xcframework (StikJIT 1.9.0 with `ios/patches/stikjit-high-address.patch`) and
+`libhusk_rppairing.a` (Rust) from pinned commits; run that one alone when only it changed
+(logs in `work/jit_deps/`). See [builtin-jit.md](builtin-jit.md).
 
 ## 4a. Unsigned IPA (for SideStore, AltStore, Sideloadly, LiveContainer)
 
@@ -59,15 +66,19 @@ scripts/package_ipa.sh              # add --tipa for a .tipa copy as well
 
 This regenerates the Xcode project, builds the Release configuration without signing, and writes
 `dist/AppleVM-Duo-unsigned.ipa`. It then checks the archive (a single `Payload/WindowsiOS.app`,
-an arm64 executable, the JIT script, the signature) and prints its size and SHA-256.
+an arm64 executable, the JIT script, Built-in JIT's `PlugIns/WinJITHelper.appex` and
+`Frameworks/StikJIT.framework`, the signature) and prints its size and SHA-256.
 
 "Unsigned" means no developer certificate: the app is ad-hoc signed with
 `ios/WindowsiOS.entitlements`, so that the tool that signs it for your device sees and keeps
 `get-task-allow`, which JIT needs. Use `--entitlements ios/WindowsiOS-IncreasedMemory.entitlements`
-if you will re-sign with an account that has the Increased Memory Limit capability.
+if you will re-sign with an account that has the Increased Memory Limit capability. The JIT helper
+extension and StikJIT.framework are ad-hoc signed without entitlements; the signing tool must keep
+app extensions for Built-in JIT.
 
 The IPA's bundle id is `com.applevm.duo`, the one in `repo.json`, even if your
 `ios/Signing.local.xcconfig` (section 4b) sets another; pass `--bundle-id ID` for a different one.
+The JIT helper's id is that id plus `.JITHelper`.
 
 ### 3D graphics (optional)
 
@@ -105,6 +116,8 @@ summary says which it embedded: `dist/WinKit/drivers.img` (the WinKit disk, see 
    - `DEVELOPMENT_TEAM`: your 10-character team id (Xcode > Settings > Accounts; a free
      "Personal Team" works).
    - `PRODUCT_BUNDLE_IDENTIFIER`: an id of your own, for example `com.yourname.applevm.duo`.
+     Built-in JIT's helper extension gets this id plus `.JITHelper` (`ios/WinJITHelper.xcconfig`)
+     and the same team: a second App ID, which Xcode registers too.
    - Paid Apple Developer Program members can uncomment
      `CODE_SIGN_ENTITLEMENTS = WindowsiOS-IncreasedMemory.entitlements`, which adds
      `increased-memory-limit` and `extended-virtual-addressing` (more guest RAM, larger address
@@ -148,11 +161,14 @@ summary says which it embedded: `dist/WinKit/drivers.img` (the WinKit disk, see 
    xcrun devicectl device install app --device <DEVICE_UDID> "$APP"
    ```
 
-Free accounts: the app expires after 7 days and a free team can register only a few App IDs a week.
+Free accounts: the app expires after 7 days and a free team can register only a few App IDs a week
+(10 per 7 days); the app and its JIT helper take two.
 
 ## 5. JIT on the device
 
-The emulator needs JIT, enabled by a debugger on every launch: with
+The emulator needs JIT, enabled by a debugger on every launch: with the debugger built into the
+app (Built-in JIT, iOS 26+: Developer Mode, one pairing and LocalDevVPN; see
+[builtin-jit.md](builtin-jit.md)), with
 [StikDebug](https://github.com/StephenDev0/StikDebug) on the device (the app asks it through a
 `stikjit://` link, passing its own bundle id and the JIT script), or from
 the Mac with `scripts/launch_on_duo.sh <DEVICE_UDID> [bundle id]` (the bundle id defaults to
@@ -170,7 +186,8 @@ embedded (section 4a). You need your own Windows 11 license.
 
 `.github/workflows/build.yml` runs on every push and pull request on GitHub's `xcode-27` runner
 (macOS 27, Xcode 27): `make all` and `make test-core`, `scripts/build_ios_deps.sh` (cached by the
-script's hash), `make ios-lib`, `xcodegen`, then `scripts/package_ipa.sh`. The unsigned IPA (2D
+script's hash), `scripts/build_jit_deps.sh` (cached by the script, the patch and the pairing
+header), `make ios-lib`, `xcodegen`, then `scripts/package_ipa.sh`. The unsigned IPA (2D
 only: CI does not fetch UTM) is uploaded as the run's artifact `AppleVM-Duo-unsigned-<commit>`.
 
 ## AltStore / SideStore source
@@ -183,6 +200,8 @@ only: CI does not fetch UTM) is uploaded as the run's artifact `AppleVM-Duo-unsi
 ## Troubleshooting
 
 - `ios/deps is missing`: run `scripts/build_ios_deps.sh` (step 3).
+- `deps/StikJIT.xcframework ... is missing` or `library 'husk_rppairing' not found`: run
+  `scripts/build_jit_deps.sh` (needs rustup).
 - `pkg-config` or `slirp` errors in `make all`: `brew install libslirp pkgconf`.
 - `Signing for "WindowsiOS" requires a development team`: create `ios/Signing.local.xcconfig`
   (step 4b), or build unsigned with `scripts/package_ipa.sh`.
