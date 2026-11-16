@@ -23,7 +23,7 @@ MAC_FRAMEWORKS = -framework Cocoa -framework Foundation -framework QuartzCore -f
                  -framework AudioToolbox
 
 CORE_TESTS = $(B)/test_classify $(B)/test_jit_region $(B)/test_operands $(B)/test_jit $(B)/test_mem \
-             $(B)/test_mmu $(B)/test_exc $(B)/test_share_clip
+             $(B)/test_mmu $(B)/test_exc $(B)/test_share_clip $(B)/test_share_focus
 
 all: $(CORE_TESTS) $(B)/hvsparse $(B)/winvm
 
@@ -60,6 +60,10 @@ $(B)/test_mmu: tests/test_mmu.c $(ENGINE)
 # share.c's /.henge/forwards calls the port-forward engine: stubbed (tests/share_net_fwd_stub.c).
 $(B)/test_share_clip: tests/test_share_clip.c host/share.c host/share.h tests/share_net_fwd_stub.c | $(B)
 	$(CC) $(CFLAGS) -fsanitize=address,undefined -fno-sanitize-recover=all tests/test_share_clip.c host/share.c \
+		tests/share_net_fwd_stub.c -o $@
+# /.henge/focus (the WinKit focus agent's endpoint) over the same socket.
+$(B)/test_share_focus: tests/test_share_focus.c host/share.c host/share.h tests/share_net_fwd_stub.c | $(B)
+	$(CC) $(CFLAGS) -fsanitize=address,undefined -fno-sanitize-recover=all tests/test_share_focus.c host/share.c \
 		tests/share_net_fwd_stub.c -o $@
 
 # Guest DNS proxy against a stand-in resolver (no network needed).
