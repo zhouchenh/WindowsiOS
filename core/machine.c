@@ -95,7 +95,7 @@ static int init_rest(HvMachine *m) {
        enough from it (hv_walks_elsewhere) instead of counting every walk meanwhile as a race to wait for. */
     knob_env(HV_K_WALKLOG, 1); /* on unless its variable says 0 */
     /* Henge 061b250 (its second part): a CPU waiting for TLBI acknowledgements sleeps on a ulock instead of yielding. */
-    knob_env(HV_K_SYNCWAIT, 0);
+    knob_env(HV_K_SYNCWAIT, 1); /* on unless its variable says 0 */
     /* As many blocks as the region holds (a block is at least ~160 bytes of
        code), so the region filling, not this table, is what flushes; two
        chainable exits each at most. Untouched entries cost nothing. */
