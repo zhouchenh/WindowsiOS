@@ -34,9 +34,11 @@ targets:
         UILaunchScreen: {}
         UIFileSharingEnabled: true
         LSSupportsOpeningDocumentsInPlace: true
-        UIStatusBarHidden: true
+        # chrome: the status bar is shown (on the iPhone Duo in its vertical bar) except in immersive
+        # mode, which hides it from the view controller (SwiftUI .statusBarHidden).
+        UIStatusBarHidden: false
         CADisableMinimumFrameDurationOnPhone: true
-        UIViewControllerBasedStatusBarAppearance: false
+        UIViewControllerBasedStatusBarAppearance: true
         NSMicrophoneUsageDescription: "Windows uses the microphone for voice input and audio recording."
         # applevm:// brings the app back from LocalDevVPN (localdevvpn://enable?scheme=applevm);
         # applevm://enable-jit asks StikDebug for JIT (JITSetup.swift)

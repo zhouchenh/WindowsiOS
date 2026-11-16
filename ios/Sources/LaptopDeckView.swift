@@ -315,6 +315,8 @@ private struct LaptopKeySpec: Identifiable {
 
 struct LaptopDeckView: View {
     @ObservedObject var vm: VMViewModel
+    /// More > Power… (the session view asks first).
+    var showPower: () -> Void = {}
 
     @State private var shiftLatched: Bool = false
     @State private var ctrlLatched: Bool = false
