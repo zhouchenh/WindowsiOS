@@ -95,6 +95,7 @@ Reg 'HKCU:\Software\Microsoft\Windows\CurrentVersion\BackgroundAccessApplication
 powercfg -setactive SCHEME_MIN | Out-Null
 powercfg -h off | Out-Null
 powercfg -setacvalueindex scheme_current sub_processor CPMINCORES 100 | Out-Null
+powercfg -setdcvalueindex scheme_current sub_processor CPMINCORES 100 | Out-Null
 powercfg -setactive scheme_current | Out-Null
 fsutil behavior set disablelastaccess 1 | Out-Null
 fsutil 8dot3name set 1 | Out-Null

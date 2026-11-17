@@ -11,7 +11,7 @@ CORE = $(B)/classify.o $(B)/operands.o $(B)/translate.o $(B)/dispatch.o $(B)/mmu
 HOST = $(B)/jit_region.o $(B)/enter.o $(B)/disk.o
 ENGINE = $(CORE) $(HOST)
 
-DEV = $(B)/acpi.o $(B)/fb_display.o $(B)/fb_metal.o $(B)/fdt.o $(B)/fw_cfg.o $(B)/gicv3.o $(B)/hda.o \
+DEV = $(B)/acpi.o $(B)/acpi_battery.o $(B)/fb_display.o $(B)/fb_metal.o $(B)/fdt.o $(B)/fw_cfg.o $(B)/gicv3.o $(B)/hda.o \
       $(B)/nvme.o $(B)/pcie.o $(B)/pflash.o $(B)/pl011.o $(B)/pl031.o $(B)/pl061.o $(B)/timer.o \
       $(B)/virtio.o $(B)/virtio_blk.o $(B)/virtio_input.o $(B)/virtio_net.o $(B)/virtio_snd.o $(B)/virtio_gpu.o $(B)/virtio_gpu3d.o \
       $(B)/winvirt.o $(B)/xhci.o
@@ -23,7 +23,8 @@ MAC_FRAMEWORKS = -framework Cocoa -framework Foundation -framework QuartzCore -f
                  -framework AudioToolbox
 
 CORE_TESTS = $(B)/test_classify $(B)/test_jit_region $(B)/test_operands $(B)/test_jit $(B)/test_mem \
-             $(B)/test_mmu $(B)/test_exc $(B)/test_share_clip $(B)/test_share_focus $(B)/test_pl031
+             $(B)/test_mmu $(B)/test_exc $(B)/test_share_clip $(B)/test_share_focus $(B)/test_pl031 \
+             $(B)/test_acpi
 
 all: $(CORE_TESTS) $(B)/hvsparse $(B)/winvm
 
@@ -68,6 +69,12 @@ $(B)/test_share_focus: tests/test_share_focus.c host/share.c host/share.h tests/
 # The PL031 RTC alone (UTC, HV_RTC=localtime, guest writes, the alarm), with a stand-in machine and GIC.
 $(B)/test_pl031: tests/test_pl031.c devices/pl031.c devices/pl031.h | $(B)
 	$(CC) $(CFLAGS) -fsanitize=address,undefined -fno-sanitize-recover=all tests/test_pl031.c devices/pl031.c -o $@
+# The DSDT with and without the battery (structure, AML bytes, the GED's _EVT) and the battery registers;
+# fw_cfg is a stand-in that keeps the files. Under the address and UB sanitizers.
+$(B)/test_acpi: tests/test_acpi.c tests/fw_cfg_capture_stub.c tests/fw_cfg_capture_stub.h devices/acpi.c \
+                devices/acpi_battery.c devices/*.h | $(B)
+	$(CC) $(CFLAGS) -Itests -fsanitize=address,undefined -fno-sanitize-recover=all tests/test_acpi.c \
+		tests/fw_cfg_capture_stub.c devices/acpi.c devices/acpi_battery.c -o $@
 
 # Guest DNS proxy against a stand-in resolver (no network needed).
 $(B)/test_dns_lifecycle: tests/test_dns_lifecycle.c $(B)/dns_proxy.o

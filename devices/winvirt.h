@@ -6,6 +6,7 @@
 #include <stdint.h>
 
 #include "acpi.h"
+#include "acpi_battery.h"
 #include "disk.h"
 #include "fb_display.h"
 #include "fdt.h"
@@ -51,6 +52,10 @@
 #define WINVIRT_INTID_PCIE    (32 + 3) /* SPIs 3..6 -> INTIDs 35..38 */
 #define WINVIRT_INTID_GPIO    (32 + 7)
 #define WINVIRT_INTID_GED     (32 + 9) /* GSI 41 */
+/* GED page: +0x000 event bits (read clears), +0x100..0x10F battery registers (acpi_battery.h) */
+#define WINVIRT_GED_BAT_OFF   0x100
+#define WINVIRT_GED_EV_POWERBTN 0x2U /* Notify (PWRB, 0x80) */
+#define WINVIRT_GED_EV_BATTERY  0x4U /* Notify (BAT0, 0x80), Notify (ADP0, 0x80) */
 #define WINVIRT_MSI_BASE      80       /* INTIDs 80..143 (64 MSI-X vectors) */
 #define WINVIRT_MSI_COUNT     64
 
@@ -83,14 +88,19 @@ typedef struct HvWinVirt {
     HvVirtioGpu *gpu;
 
     uint32_t ged_events;
+    int battery;    /* the DSDT has BAT0/ADP0: hv_winvirt_set_battery reaches the guest */
+    HvBattery bat;
     void (*poll)(void);
 } HvWinVirt;
 
 uint8_t *hv_alloc_no_footprint(uint64_t size);
 int hv_winvirt_create(HvWinVirt *b, HvMachine *m, HvCpu *cpu, int ncpus, uint64_t ram_size,
                       void *prealloc_ram, const char *code_fd_path, const char *vars_fd_path,
-                      HvDisk *disk0, HvDisk *disk1, const uint8_t mac[6], int enable_sound);
+                      HvDisk *disk0, HvDisk *disk1, const uint8_t mac[6], int enable_sound, int battery);
 void hv_winvirt_reset_cpu(HvWinVirt *b);
 void hv_winvirt_power_button(HvWinVirt *b);
+/* The host's battery (level 0..1 or negative, state HV_BATTERY_*): raises the GED event when it changed.
+   Any thread; no-op unless the board was created with the battery. */
+void hv_winvirt_set_battery(HvWinVirt *b, double level, int state);
 
 #endif

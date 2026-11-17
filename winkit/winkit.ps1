@@ -6,6 +6,8 @@
 #   clipboard helper (clipboard_setup.ps1). Running it again updates all of them.
 #   The clock (clock_setup.ps1): Windows reads the app's RTC as UTC, Windows Time syncs, and the time zone
 #   follows the iPhone's (kept matched by the display helper).
+#   Power settings (power.ps1, also on its own as POWER.bat): the app shows the iPhone's battery in Windows,
+#   and Windows must never sleep, hibernate, turn the screen off or shut down on a low battery by itself.
 #   Optional, on their own: SSH-SETUP.bat (OpenSSH server), REMOTE-DESKTOP.bat (Remote Desktop host).
 # Run through START.bat. -Finish is what the logon task runs after the restart.
 param([switch]$Finish)
@@ -79,6 +81,11 @@ if ($is3dOk) {
     & (Join-Path $home3d 'setres.ps1')
     Unregister-ScheduledTask -TaskName 'WinKit Finish' -Confirm:$false -ErrorAction SilentlyContinue
 }
+
+Say 'Power: Windows never sleeps, hibernates or acts on the battery by itself'
+# The app shows the iPhone's battery in Windows; on battery, Windows' defaults would turn the screen off, warn
+# and shut down at a low charge. Every power plan, plugged in and on battery; safe to run again.
+try { & (Join-Path $home3d 'power.ps1') } catch { Write-Host "  power settings skipped: $($_.Exception.Message)" -ForegroundColor Yellow }
 
 Say '[4/5] Optional clean-up'
 Write-Host '  Stops search indexing, telemetry and automatic updates, removes widgets and inbox apps.'

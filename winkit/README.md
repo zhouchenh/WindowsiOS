@@ -111,6 +111,23 @@ Windows 里拷贝的文字会自动出现在 iPhone 的剪贴板上；iPhone 上
 - **卸载**：在命令提示符里运行 `CLIPBOARD.bat remove`，或右键 `C:\WinKit\uninstall_clipboard.ps1` → 使用 PowerShell 运行，删除计划任务、程序和日志。
 - **排查**：Windows 里的 `%LOCALAPPDATA%\WinKit\clipboard.log`。工作原理见 [剪贴板说明（英文）](../docs/clipboard.md)。
 
+## 电池和电源设置
+
+App 会把 iPhone 的电池交给 Windows：Windows 右下角显示 iPhone 的电量；插着电源时是“已接通电源”，拔掉后是“使用电池”，充电时显示正在充电。
+App 的“设置 → 系统 → 电池”可以关掉（只对 Windows，Arch Linux 没有），改动在下次启动 Windows 时生效。
+
+使用电池时，Windows 默认会关屏幕、调暗、提示电量低、打开节电模式，电量很低时还会自己关机。`START.bat` 会运行 `power.ps1` 把这些都关掉；
+以前跑过旧版 WinKit 的，双击 WINKIT 盘（或 `C:\WinKit`）里的 `POWER.bat`，权限提示点“是”。它对**每一个**电源计划、接通电源和使用电池两种情况都设置：
+
+- 使用电池时的每一项都和接通电源时一样（处理器、PCIe、USB 等），然后：
+- 睡眠、休眠、关闭显示器、调暗显示器、锁屏后关闭显示器、关闭硬盘：从不；混合睡眠：关；休眠功能关闭（`powercfg /h off`）
+- 电量低和电量严重不足时的操作：不采取任何操作；电量低、严重不足、保留电量的级别：允许的最低值；电量低提醒：关
+- 节电模式：不会自己打开（阈值 0）
+- 合上盖子、睡眠按钮：不采取任何操作。**电源按钮保持“关机”**，因为 App 的“关机（通知 Windows）”就是按它；
+  想让它也什么都不做，管理员运行 `C:\WinKit\power.ps1 -PowerButtonDoesNothing`（之后 App 的关机按钮就没有作用了）。
+
+只用 powercfg，不用组策略：这些设置在 Windows 里仍然可以改。可以重复运行，只改不一样的地方，并逐条列出改了什么；结果也会写到 App 文件夹的 `Shared/power.txt`。
+
 ## 用 StikDebug 开 JIT
 
 1. 安装 StikDebug，按它的说明做一次性配置，打开它的 VPN。

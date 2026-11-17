@@ -71,7 +71,10 @@ static void *prefault_thread(void *arg) {
     return NULL;
 }
 
-/* ACPI0013 Generic Event Device (GED) at 0x09080000: read clears latched event bits. */
+_Static_assert(WINVIRT_GED_PA + WINVIRT_GED_BAT_OFF == HV_ACPI_GED_BATTERY_PA, "DSDT BREG address");
+
+/* ACPI0013 Generic Event Device (GED) at 0x09080000: read clears latched event bits.
+   0x100..0x10F: the battery registers that BAT0's _BST and ADP0's _PSR read. */
 static uint64_t ged_read(void *opaque, uint64_t off, unsigned size) {
     (void)size;
     HvWinVirt *b = opaque;
@@ -79,6 +82,8 @@ static uint64_t ged_read(void *opaque, uint64_t off, unsigned size) {
         uint32_t ev = __atomic_exchange_n(&b->ged_events, 0, __ATOMIC_ACQ_REL);
         return ev;
     }
+    if (off >= WINVIRT_GED_BAT_OFF && off < WINVIRT_GED_BAT_OFF + 0x10)
+        return hv_battery_read(&b->bat, off - WINVIRT_GED_BAT_OFF);
     return 0;
 }
 
@@ -117,7 +122,7 @@ static void uart_stdout_cb(void *opaque, uint8_t c) {
 
 int hv_winvirt_create(HvWinVirt *b, HvMachine *m, HvCpu *cpu, int ncpus, uint64_t ram_size,
                       void *prealloc_ram, const char *code_fd_path, const char *vars_fd_path,
-                      HvDisk *disk0, HvDisk *disk1, const uint8_t mac[6], int enable_sound) {
+                      HvDisk *disk0, HvDisk *disk1, const uint8_t mac[6], int enable_sound, int battery) {
     memset(b, 0, sizeof *b);
     b->m = m;
     b->cpu = cpu;
@@ -192,7 +197,10 @@ int hv_winvirt_create(HvWinVirt *b, HvMachine *m, HvCpu *cpu, int ncpus, uint64_
 
     b->fw_cfg = hv_fw_cfg_create(m, WINVIRT_FW_CFG_PA, (uint16_t)ncpus);
     b->fb = hv_fb_display_create(m, b->fw_cfg);
-    hv_acpi_build_and_register(b->fw_cfg, b->ncpus, ram_size, 0, 0);
+    /* The host's battery as an ACPI battery and AC adapter; HV_NO_BATTERY=1 leaves them out. */
+    b->battery = battery && !getenv("HV_NO_BATTERY");
+    hv_battery_init(&b->bat);
+    hv_acpi_build_and_register(b->fw_cfg, b->ncpus, ram_size, 0, 0, b->battery);
 
     /* 7. PCIe Root Complex (GPEX):
      *    Slot 0: Host Bridge (1b36:0008)
@@ -248,6 +256,13 @@ void hv_winvirt_reset_cpu(HvWinVirt *b) {
 
 void hv_winvirt_power_button(HvWinVirt *b) {
     if (!b || !b->gic) return;
-    __atomic_fetch_or(&b->ged_events, 0x2U, __ATOMIC_ACQ_REL);
+    __atomic_fetch_or(&b->ged_events, WINVIRT_GED_EV_POWERBTN, __ATOMIC_ACQ_REL);
+    hv_gicv3_pend(b->gic, WINVIRT_INTID_GED);
+}
+
+void hv_winvirt_set_battery(HvWinVirt *b, double level, int state) {
+    if (!b || !b->gic || !b->battery) return;
+    if (!hv_battery_set(&b->bat, level, state)) return;
+    __atomic_fetch_or(&b->ged_events, WINVIRT_GED_EV_BATTERY, __ATOMIC_ACQ_REL);
     hv_gicv3_pend(b->gic, WINVIRT_INTID_GED);
 }

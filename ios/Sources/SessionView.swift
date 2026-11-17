@@ -664,6 +664,7 @@ private struct SettingsSheet: View {
     @ObservedObject private var display = DisplaySettings.shared
     @AppStorage("winios.keyboard.autoShow") private var keyboardAutoShow = true
     @AppStorage("winios.keyboard.follow") private var keyboardFollow = true
+    @AppStorage("winios.battery") private var batteryPassthrough = true // read by the bridge at start
     @Environment(\.dismiss) private var dismiss
     @Environment(\.horizontalSizeClass) private var horizontalSizeClass
     @State private var page: SettingsPage? = nil
@@ -864,6 +865,17 @@ private struct SettingsSheet: View {
                 if !vm.isLinux {
                     Text(L("CPU 名称是 Windows 里显示的处理器名字，下次启动生效。留空时用设备的芯片名（例如 Apple A20 Pro），不认识的设备显示 Apple Silicon。",
                            "The CPU name is what Windows shows for the processor; applies at the next start. Left empty, it is the device's chip (e.g. Apple A20 Pro), or Apple Silicon on a device the app does not know."))
+                }
+            }
+
+            if !vm.isLinux {
+                Section {
+                    Toggle(L("在 Windows 里显示 iPhone 电池", "Show the iPhone battery in Windows"), isOn: $batteryPassthrough)
+                } header: {
+                    Text(L("电池", "Battery"))
+                } footer: {
+                    Text(L("Windows 看到 iPhone 的电量和是否在充电：插着电源时是“已接通电源”，拔掉后是“使用电池”。下次启动 Windows 时生效。为免 Windows 在电量低时自己调暗屏幕、睡眠、休眠或关机，在 Windows 里运行一次 WINKIT 盘上的 POWER.bat（START.bat 也会运行它）。",
+                           "Windows sees the iPhone's charge and whether it is charging: plugged in, Windows is on AC power; unplugged, it is on battery. Applies the next time Windows starts. So that Windows never dims, sleeps, hibernates or shuts down by itself on a low battery, run POWER.bat from the WINKIT drive once in Windows (START.bat runs it too)."))
                 }
             }
 

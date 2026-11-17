@@ -22,6 +22,7 @@ typedef struct HvWinVmConfig {
     void *prealloc_ram;       /* Optional pre-allocated Guest RAM (ledger-exempt on iOS) */
     int no_net;
     int enable_sound;
+    int battery;              /* ACPI battery + AC adapter fed by hv_winvm_set_battery (DSDT fixed per run) */
     int log;
     int stats_interval;
 } HvWinVmConfig;
@@ -31,6 +32,9 @@ void hv_winvm_start(int spawn_cpu0, void (*on_exit)(int reason));
 int hv_winvm_run_cpu0(void);
 void hv_winvm_stop(void);
 void hv_winvm_power_button(void);
+/* The host's battery: level 0..1 (negative = unknown), state 0 unknown, 1 unplugged, 2 charging, 3 full
+   (UIDeviceBatteryState). The guest is notified when it changed. No-op unless cfg.battery was set. Any thread. */
+void hv_winvm_set_battery(double level, int state);
 void hv_winvm_flush_disks(void);
 /* Stops every guest CPU where it is (1) or lets them go on (0). Devices keep running: what the
    guest already queued is finished. */
