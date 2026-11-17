@@ -158,6 +158,26 @@ void hv_winvm_gpu_mode(int *capable, int *offered3d, int *negotiated3d, int *dri
     if (resets) *resets = m.resets;
 }
 
+void hv_winvm_gpu_set_background(int on) {
+    hv_virtio_gpu_set_background(board.gpu, on);
+}
+
+uint8_t *hv_winvm_display_snapshot(int allow_gpu, uint32_t *w, uint32_t *h) {
+    HvFbDisplay *fb = atomic_load_explicit(&display_fb, memory_order_acquire);
+    return fb ? hv_fb_metal_snapshot(fb, allow_gpu, w, h) : NULL;
+}
+
+uint64_t hv_winvm_display_serial(int *is_texture) {
+    HvFbDisplay *fb = atomic_load_explicit(&display_fb, memory_order_acquire);
+    if (is_texture) *is_texture = 0;
+    return fb ? hv_fb_metal_screen_serial(fb, is_texture) : 0;
+}
+
+void hv_winvm_display_set_paused(int paused) {
+    HvFbDisplay *fb = atomic_load_explicit(&display_fb, memory_order_acquire);
+    hv_fb_metal_set_paused(fb, paused);
+}
+
 int hv_winvm_gpu_status(char *buf, unsigned len) {
     return hv_virtio_gpu_describe(board.gpu, buf, len);
 }

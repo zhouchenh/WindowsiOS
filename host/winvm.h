@@ -57,6 +57,16 @@ int hv_winvm_gpu_status(char *buf, unsigned len);
 int hv_winvm_gpu_set_3d(int on);
 /* The mode: capable, offered3d, negotiated3d, driver_ok, resets (all 0 without virtio-gpu). */
 void hv_winvm_gpu_mode(int *capable, int *offered3d, int *negotiated3d, int *driver_ok, uint32_t *resets);
+/* The app is in the background (1) or back in front (0): the 3D renderer's background drain (virtio_gpu3d.h). */
+void hv_winvm_gpu_set_background(int on);
+/* The screen as shown now, the cursor blended in: BGRA, opaque, rows of w*4 bytes, malloc'd (free it). allow_gpu 0
+   never touches the GPU (NULL while the screen is a 3D texture); 1 reads a 3D texture with one blit (only while the
+   app may use the GPU: in front or inactive, never in the background). NULL when there is no picture. */
+uint8_t *hv_winvm_display_snapshot(int allow_gpu, uint32_t *w, uint32_t *h);
+/* Changes whenever the picture does (sampled, cheap); 0 when there is none. *is_texture: a 3D texture is shown. */
+uint64_t hv_winvm_display_serial(int *is_texture);
+/* The presenter stops drawing (its display link pauses) while the app is in the background, and starts again. */
+void hv_winvm_display_set_paused(int paused);
 
 /* Input hooks (any thread) */
 void hv_winvm_key_hid(uint8_t usage, int down);

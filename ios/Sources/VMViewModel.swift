@@ -574,6 +574,8 @@ function ai {
     private var oauthPollTimer: Timer? = nil
 
     init() {
+        // first: its lifecycle observers run before the bridge's and Picture in Picture's (BackgroundTest.swift)
+        _ = BackgroundTest.shared
         // before anything can acquire JIT: the sizes it will use
         winios_jit_configure(UInt32(max(0, UserDefaults.standard.integer(forKey: "winios.jitMB"))),
                              UInt32(max(0, UserDefaults.standard.integer(forKey: "winios.ramMB"))))

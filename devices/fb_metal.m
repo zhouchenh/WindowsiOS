@@ -10,6 +10,7 @@
 #include <os/lock.h>
 #include <stdatomic.h>
 #include <time.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -25,6 +26,9 @@ void hv_fb_metal_set_fps(int fps) {
 }
 
 int hv_fb_metal_fps(void) { return atomic_load(&g_target_fps); }
+
+/* The app is in the background (hv_fb_metal_set_paused): nothing is presented. */
+static _Atomic int g_paused;
 
 /* ---- presentation engine state (one presenter per process) ---- */
 
@@ -351,7 +355,7 @@ static NSString *const kFbShaderSource =
             linkThread.qualityOfService = NSQualityOfServiceUserInteractive;
             [linkThread start];
         }
-        if (link) link.paused = NO;
+        if (link) link.paused = atomic_load(&g_paused) != 0;
 #else
         if (!timer) {
             dispatch_queue_t q = dispatch_queue_create("me.ammaar.windowsios.fbmetal", DISPATCH_QUEUE_SERIAL);
@@ -382,7 +386,7 @@ static NSString *const kFbShaderSource =
         [l addToRunLoop:[NSRunLoop currentRunLoop] forMode:NSDefaultRunLoopMode];
         os_unfair_lock_lock(&lock);
         link = l;
-        l.paused = (layer == nil);
+        l.paused = (layer == nil) || atomic_load(&g_paused);
         os_unfair_lock_unlock(&lock);
         for (;;) {
             @autoreleasepool {
@@ -411,6 +415,7 @@ static int fb_idle_allowed(void) {
 }
 
 - (void)onLink:(CADisplayLink *)l {
+    if (atomic_load(&g_paused)) return; /* in the background: the link is being paused */
     /* a changed setting: the link follows it here, on its own thread */
     int fps = atomic_load(&g_target_fps);
     fb_hold_expire();
@@ -547,6 +552,7 @@ static uint64_t quick_frame_hash(const uint8_t *px, uint32_t w, uint32_t h, uint
 }
 
 - (void)tick {
+    if (atomic_load(&g_paused)) return;
     uint64_t cpu0 = clock_gettime_nsec_np(CLOCK_THREAD_CPUTIME_ID);
     BOOL presented = NO;
     @autoreleasepool {
@@ -715,43 +721,101 @@ static uint8_t *copy_texture_pixels(HvFbDisplay *fb, uint32_t *ow, uint32_t *oh)
     return px;
 }
 
-int hv_fb_save_png(HvFbDisplay *fb, const char *path) {
-    if (!fb || !path) return -1;
+/* The hardware cursor blended over px (w x h, rows of stride bytes), as the screen shows it. */
+static void blend_cursor(HvFbDisplay *fb, uint8_t *px, uint32_t w, uint32_t h, uint32_t stride) {
+    uint32_t *cpx = malloc(64 * 64 * 4);
+    if (!cpx) return;
+    uint64_t none = ~0ull;
+    uint32_t cw = 0, ch = 0;
+    int32_t cx = 0, cy = 0;
+    if (hv_fb_display_cursor_get(fb, cpx, &none, &cw, &ch, &cx, &cy, NULL))
+        for (uint32_t r = 0; r < ch; r++)
+            for (uint32_t c = 0; c < cw; c++) {
+                int64_t X = (int64_t)cx + c, Y = (int64_t)cy + r;
+                if (X < 0 || Y < 0 || X >= w || Y >= h) continue;
+                const uint8_t *sp = (const uint8_t *)&cpx[r * cw + c];
+                uint8_t *dp = px + (size_t)Y * stride + (size_t)X * 4;
+                for (int k = 0; k < 3; k++) dp[k] = (uint8_t)(sp[k] + dp[k] * (255 - sp[3]) / 255);
+            }
+    free(cpx);
+}
+
+uint8_t *hv_fb_metal_snapshot(HvFbDisplay *fb, int allow_gpu, uint32_t *ow, uint32_t *oh) {
+    if (!fb) return NULL;
+    uint32_t w = 0, h = 0;
+    uint8_t *copy = NULL;
+    void *tref = NULL;
+    uint32_t tw, th, rx, ry, rw, rh;
+    int texture = hv_fb_display_get_texture(fb, &tref, &tw, &th, &rx, &ry, &rw, &rh) == 0;
+    if (texture) CFRelease(tref);
+    if (texture) {
+        if (!allow_gpu) return NULL; /* a 3D frame lives on the GPU */
+        @autoreleasepool {
+            copy = copy_texture_pixels(fb, &w, &h);
+        }
+        if (!copy && allow_gpu < 2) return NULL;
+    }
+    if (!copy) {
+        const uint8_t *px = NULL;
+        uint32_t stride = 0;
+        if (hv_fb_display_get_frame(fb, &px, &w, &h, &stride) != 0 || !w || !h) return NULL;
+        copy = malloc((size_t)w * h * 4);
+        if (!copy) return NULL;
+        for (uint32_t y = 0; y < h; y++) memcpy(copy + (size_t)y * w * 4, px + (size_t)y * stride, (size_t)w * 4);
+    }
+    blend_cursor(fb, copy, w, h, w * 4);
+    /* opaque (XRGB8888 leaves X = 0x00) */
+    for (size_t i = 0; i < (size_t)w * h; i++) copy[i * 4 + 3] = 0xff;
+    *ow = w;
+    *oh = h;
+    return copy;
+}
+
+uint64_t hv_fb_metal_screen_serial(HvFbDisplay *fb, int *is_texture) {
+    if (is_texture) *is_texture = 0;
+    if (!fb) return 0;
+    uint64_t serial = __atomic_load_n(&fb->ovr_serial, __ATOMIC_RELAXED) * 0xff51afd7ed558ccdull;
+    void *tref = NULL;
+    uint32_t tw, th, rx, ry, rw, rh;
+    if (hv_fb_display_get_texture(fb, &tref, &tw, &th, &rx, &ry, &rw, &rh) == 0) {
+        uint64_t v = serial ^ (uint64_t)(uintptr_t)tref ^ 0x5bd1e995 ^ cursor_hash(fb) ^ ((uint64_t)rw << 32 | rh);
+        CFRelease(tref);
+        if (is_texture) *is_texture = 1;
+        return v ? v : 1;
+    }
     const uint8_t *px = NULL;
     uint32_t w = 0, h = 0, stride = 0;
-    uint8_t *texpx = NULL;
-    @autoreleasepool {
-        texpx = copy_texture_pixels(fb, &w, &h);
+    if (hv_fb_display_get_frame(fb, &px, &w, &h, &stride) != 0 || !w || !h) return 0;
+    uint64_t v = quick_frame_hash(px, w, h, stride) ^ serial ^ cursor_hash(fb);
+    return v ? v : 1;
+}
+
+void hv_fb_metal_set_paused(HvFbDisplay *fb, int paused) {
+    paused = paused != 0;
+    if (atomic_exchange(&g_paused, paused) == paused) return;
+    HvFbMetalPresenter *p = fb ? (__bridge HvFbMetalPresenter *)fb->metal : nil;
+    if (p) {
+        os_unfair_lock_lock(&p->lock);
+#if TARGET_OS_IPHONE
+        if (p->link) p->link.paused = paused || !p->layer;
+#endif
+        if (!paused) {
+            p->lastHash = 0; /* draw the current frame at once */
+            p->lastDrawableSize = CGSizeZero;
+        }
+        os_unfair_lock_unlock(&p->lock);
     }
-    if (texpx) stride = w * 4;
-    else if (hv_fb_display_get_frame(fb, &px, &w, &h, &stride) != 0) return -1;
+    fprintf(stderr, "winvm: presenter %s\n", paused ? "paused (app in the background)" : "running again");
+}
 
+int hv_fb_save_png(HvFbDisplay *fb, const char *path) {
+    if (!fb || !path) return -1;
+    uint32_t w = 0, h = 0;
+    uint8_t *copy = hv_fb_metal_snapshot(fb, 2, &w, &h);
+    if (!copy) return -1;
     @autoreleasepool {
+        uint32_t stride = w * 4;
         size_t total = (size_t)stride * h;
-        uint8_t *copy = texpx ? texpx : malloc(total);
-        if (!copy) return -1;
-        if (!texpx) memcpy(copy, px, total);
-        { /* the hardware cursor, as the screen shows it */
-            static uint32_t cpx[64 * 64];
-            uint64_t none = ~0ull;
-            uint32_t cw = 0, ch = 0;
-            int32_t cx = 0, cy = 0;
-            if (hv_fb_display_cursor_get(fb, cpx, &none, &cw, &ch, &cx, &cy, NULL))
-                for (uint32_t r = 0; r < ch; r++)
-                    for (uint32_t c = 0; c < cw; c++) {
-                        int64_t X = (int64_t)cx + c, Y = (int64_t)cy + r;
-                        if (X < 0 || Y < 0 || X >= w || Y >= h) continue;
-                        const uint8_t *sp = (const uint8_t *)&cpx[r * cw + c];
-                        uint8_t *dp = copy + (size_t)Y * stride + (size_t)X * 4;
-                        for (int k = 0; k < 3; k++) dp[k] = (uint8_t)(sp[k] + dp[k] * (255 - sp[3]) / 255);
-                    }
-        }
-        /* Ensure alpha byte is 0xff (XRGB8888 leaves X=0x00) */
-        for (uint32_t y = 0; y < h; y++) {
-            uint8_t *row = copy + (size_t)y * stride;
-            for (uint32_t x = 0; x < w; x++) row[x * 4 + 3] = 0xff;
-        }
-
         CGColorSpaceRef cs = CGColorSpaceCreateDeviceRGB();
         CGDataProviderRef prov = CGDataProviderCreateWithData(NULL, copy, total, NULL);
         CGBitmapInfo bmi = kCGBitmapByteOrder32Little | (CGBitmapInfo)kCGImageAlphaNoneSkipFirst;

@@ -265,6 +265,42 @@ typedef struct WinIOSGraphicsMode {
 - (BOOL)requestWindowsRestart;
 /// What WinKit's graphics task last reported (Shared/gpu_mode_applied.txt: key=value lines), nil if nothing.
 - (nullable NSString *)graphicsSwitchReport;
+
+/* ---- Auto-2D when leaving the app (ServerMode.swift: "Switch to 2D when leaving the app") ----
+   When the app goes to the background (didEnterBackground, never on merely becoming inactive: the Face ID and passkey
+   sheets do that) and Windows was started with host 3D: Windows is not paused; the presenter stops; the 3D device
+   answers fences itself after a grace period (background drain, virtio_gpu3d.h), since iOS refuses the GPU work that
+   would signal them; 2D is offered and WinKit's graphics task asked to restart the display adapter; the silent audio
+   output keeps the app running. A switch that has not finished after 60 s of Windows running pauses Windows until
+   the app is back (the 3D driver cannot draw in the background). Back in front (didBecomeActive): drain off, the
+   presenter on. Not for Linux, nor with a debugger attached. */
+
+/// Saved by the Swift side. Also keeps a Windows already on 2D running in the background without server mode.
+@property (nonatomic) BOOL autoSwitch2D;
+/// The request number of the switch auto-2D started on the last trip to the background (0: none yet).
+@property (nonatomic, readonly) int64_t autoSwitchSeq;
+/// The app is in the background with an auto-2D switch under way or done (drain on).
+@property (nonatomic, readonly) BOOL autoSwitchAway;
+/// Auto-2D would switch if the app left now (Windows started with 3D, 3D in use, not Linux, no debugger, and WinKit's
+/// graphics task seen: graphicsTaskPresent). Otherwise Windows on 3D is paused in the background as before.
+@property (nonatomic, readonly) BOOL autoSwitchPossible;
+/// Evidence of WinKit's graphics task: Shared/gpu_mode_applied.txt exists, or the WinKit helper reported within 40 s.
+@property (nonatomic, readonly) BOOL graphicsTaskPresent;
+/// The last return to the app found that Windows never answered auto-2D's request: the 3D offer was put back.
+@property (nonatomic, readonly) BOOL autoSwitchRestored3D;
+/// The virtio-gpu status line (hv_winvm_gpu_status: the 3D renderer's counters and drain), nil when not running.
+- (nullable NSString *)gpuStatusLine;
+
+/* ---- Picture in Picture (winios_pip.m) and the audio session ---- */
+/// PiP is armed (the layer is in the window and may start by itself when the app leaves).
+@property (nonatomic) BOOL pipArmed;
+/// A test of what automatic PiP needs (Settings > Display > Background test): the audio session while PiP is armed.
+/// 0 the app's own (PlayAndRecord, mixes with other apps, the default), 1 Playback that mixes, 2 Playback alone
+/// (stops other apps' audio). Both Playback modes have no input: Windows' microphone is off (capture stopped) while
+/// one is in use, and starts again with PlayAndRecord. Never saved: back to 0 at every launch.
+@property (nonatomic) NSInteger pipAudioCategory;
+/// The audio session's category now, for the logs ("PlayAndRecord+mix" and so on).
+@property (nonatomic, readonly) NSString *audioCategoryName;
 @end
 
 /// Posted on the main thread for each report of the WinKit focus agent; userInfo[@"report"] is the

@@ -113,5 +113,17 @@ typedef struct HvFbMetalStats {
 } HvFbMetalStats;
 void hv_fb_metal_get_stats(HvFbMetalStats *out);
 int hv_fb_save_png(HvFbDisplay *fb, const char *path);
+/* A copy of the screen as it is shown now, the hardware cursor blended in: BGRA, opaque, rows of *w * 4 bytes,
+   malloc'd (the caller frees it). allow_gpu 0 never touches the GPU: NULL while the screen is a 3D (Metal) texture.
+   1 reads a 3D texture with one blit, which only works while the app may use the GPU (in front, or merely inactive:
+   never in the background); NULL when that fails. 2 is 1, falling back to the 2D pixels when the blit fails (the
+   screenshot). Any thread; NULL when there is no picture. */
+uint8_t *hv_fb_metal_snapshot(HvFbDisplay *fb, int allow_gpu, uint32_t *w, uint32_t *h);
+/* A value that changes whenever the picture does (a 3D frame, a 2D flush or ramfb change, the cursor): sampled, cheap.
+   0: no picture. *is_texture (may be NULL): the screen is a 3D texture now. */
+uint64_t hv_fb_metal_screen_serial(HvFbDisplay *fb, int *is_texture);
+/* Paused, nothing is presented (the display link stops): the app in the background, where iOS refuses GPU work.
+   Resumed, the next tick draws the current frame again. NULL fb: only the global flag. Any thread. */
+void hv_fb_metal_set_paused(HvFbDisplay *fb, int paused);
 
 #endif

@@ -74,5 +74,8 @@ void hv_virtio_gpu_reset(HvVirtioGpu *g);
    Any thread. */
 int hv_virtio_gpu_set_3d(HvVirtioGpu *g, int on);
 void hv_virtio_gpu_mode(HvVirtioGpu *g, HvVgpuMode *out);
+/* The app is in the background (1) or back in front (0): the 3D renderer answers parked fences itself after a grace
+   period while in the background (hv_vgpu3d_set_background). No-op without the renderer. Any thread. */
+void hv_virtio_gpu_set_background(HvVirtioGpu *g, int on);
 
 #endif

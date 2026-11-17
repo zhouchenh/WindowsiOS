@@ -163,6 +163,9 @@ final class MetalCanvasUIView: UIView, UITextInput {
         updateDrawableScale()
         if window != nil {
             WinIOSBridge.shared.bindMetalLayer(metalLayer)
+            WinIOSPictureInPicture.shared.attach(to: self) // the PiP layer, empty (transparent) while in front
+        } else {
+            WinIOSPictureInPicture.shared.detach(from: self)
         }
     }
 
@@ -170,6 +173,7 @@ final class MetalCanvasUIView: UIView, UITextInput {
         super.layoutSubviews()
         updateDrawableScale()
         inputLayoutChanged()
+        WinIOSPictureInPicture.shared.viewDidLayout(self)
     }
 
     // MARK: drawable size, scale and sampling (display engine; see DisplaySettings.swift)

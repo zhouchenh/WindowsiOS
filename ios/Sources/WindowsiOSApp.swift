@@ -3,6 +3,9 @@ import SwiftUI
 
 @main
 struct WindowsiOSApp: App {
+    // the background test's lifecycle observers must be registered before anything else's (the bridge, made by
+    // VMViewModel's stored properties, and Picture in Picture): NotificationCenter calls them in that order
+    init() { _ = BackgroundTest.shared }
     @StateObject private var viewModel = VMViewModel()
     @Environment(\.scenePhase) private var scenePhase
 
