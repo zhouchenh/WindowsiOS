@@ -135,6 +135,15 @@ test-fb-capture: $(B)/test_fb_capture
 test-dxmt-shared-init:
 	python3 tests/test_dxmt_shared_init.py
 
+$(B)/test_winios_va_census: tests/test_winios_va_census.c ios/Sources/Native/winios_va_census.h | $(B)
+	$(CC) $(CFLAGS) -Werror -fsanitize=address,undefined -fno-sanitize-recover=all $< -o $@
+$(B)/test_winios_va_mach: tests/test_winios_va_mach.c ios/Sources/Native/winios_va_census*.h | $(B)
+	$(CC) $(CFLAGS) -Werror -fsanitize=address,undefined -fno-sanitize-recover=all $< -o $@
+test-va-census: $(B)/test_winios_va_census $(B)/test_winios_va_mach
+	$(B)/test_winios_va_census
+	$(B)/test_winios_va_mach
+.PHONY: test-va-census
+
 $(B)/hvsparse: tools/hvsparse_main.c host/hvsparse.c host/hvsparse.h | $(B)
 	$(CC) $(CFLAGS) tools/hvsparse_main.c host/hvsparse.c -o $@
 
