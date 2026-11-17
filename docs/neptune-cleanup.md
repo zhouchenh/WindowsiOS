@@ -62,8 +62,14 @@ A newly rejected recovery buffer is not evidence that preceding work retired.
 The factory may block at the queue's buffer limit, so the native helper checks
 foreground permission again after it returns and before committing. If permission
 was revoked, it releases the uncommitted buffer and retries after foreground return.
-Successful recovery proof survives a later lifecycle pause for that same public-zero
-epoch; the final reference-count check still excludes a resurrected producer.
+Every ticket records the initializer goal covered by its submission. A successful
+proof remains valid only while the newly sampled initializer goal does not exceed
+that recorded goal. A newer public-zero job can run before an older job in backoff
+and consume its own pin, so private counts alone cannot identify the older proof's
+generation. When the goal rises, cleanup releases any old ticket and clears its
+completed proof and stall window. A fresh stall and barrier must cover the newer
+uploads. Before destruction it samples the counters again under the lifetime lock
+and rechecks both retirement evidence and reference counts.
 
 The watchdog reports a native call stalled beyond five seconds of allowed time.
 A passive event/status read returning later is rechecked rather than permanently
@@ -100,6 +106,12 @@ and elapsed allowed time rather than cancelling the thread or freeing objects
 that call may still use. Device counter waits have no permanent expiry. Leftover
 batch timeout/queue overflow retains remaining registrations. Quarantine is a
 safe fallback, not proof of successful reclamation.
+Before publishing a failed device job to quarantine, its worker releases any
+retained empty-buffer ticket outside the lifetime mutex. Releasing the ticket
+does not consume any remaining device pin. Ticket ownership is cleared from the
+job before entering native release, so a blocked release or concurrent watchdog
+cannot release it twice.
+The watchdog never performs this cleanup on behalf of the worker.
 
 ## Guarded interception
 
@@ -140,28 +152,52 @@ GPU work. The iOS bridge sets it to zero on `UIApplicationDidEnterBackground`
 and back to one on `UIApplicationDidBecomeActive`. Merely inactive states such
 as Control Center remain allowed. `WillEnterForeground` is too early.
 
-While disallowed, queued cleanup and new backend reads wait. The watchdog clock
-pauses. A call already entered in DXMT cannot be cancelled; its references stay
-owned. These callbacks apply to every trip, including plain background trips
-that only pause guest CPUs. Presenter pause and background drain remain separate
-permissions for the optional shared-initialization mitigation.
-This conservative gate also delays already-quiescent device destruction while
-away. An auto-2D trip therefore need not immediately reclaim all DXMT memory in
-the background; pending retirement resumes when permission returns.
+While disallowed, device snapshots and passive event/status reads continue with
+10 ms to one-second monotonic retry deadlines. The separate watchdog and initializer
+stall clocks count foreground time only. A device whose queues are sampled as
+retired returns to the queue with `paused_ready=1`, allowing other devices to be
+polled. New barrier creation/commit, final device destruction, and arbitrary
+leftover-registration `Release` calls wait for foreground permission.
+
+Keeping final destruction gated is deliberate: a device's COM private data can
+release another device's swapchain, whose destructor calls `WaitUntilGPUIdle` and
+may commit work. That destructor call chain was confirmed in the shipped binary;
+its reachability from this guest has not been demonstrated. Direct queue retirement
+does not prove the entire recursively released COM graph is submission-free.
+Bare empty-buffer ticket release does not execute that DXMT graph.
+
+A call already entered in DXMT cannot be cancelled; its references stay owned,
+and an entered finalizer can span a later background transition. The lifecycle
+callbacks apply to every trip, including plain background trips that only pause
+guest CPUs. Presenter pause and background drain remain separate permissions for
+the optional shared-initialization mitigation.
+
+This conservative gate delays already-quiescent device destruction while away.
+An auto-2D trip therefore need not immediately reclaim all DXMT memory in the
+background. `paused_ready` counts last-sampled ready retirement jobs, including a
+current job just marked ready; it is not an instantaneous claim after a new public
+resurrection. Passive sampling clears readiness when counters advance beyond the
+available proof. Final destruction resumes when permission returns.
 
 ## Verification on the phone
 
 The host tests validate reference accounting, guards and cleanup control flow.
 Run `make test-neptune` for synthetic Mach-O guard checks, native interposition
 rollback tests, compiler stop/join tests and fake-COM retirement scenarios.
-The 31 cleanup scenarios include an initializer goal of 5 whose event remains 4
+The 40 cleanup scenarios include an initializer goal of 5 whose event remains 4
 after a simulated hour, recovery through a successful same-queue buffer, rejected
 and nil recovery buffers, one retained pending ticket, exponential polling backoff,
 background transitions, public-reference resurrection, and a passive getter that
 returns ready after a six-second stall with the lifecycle gate unwired. Native
 callback tests cover queue-offset validation, statuses 0 through 5, ticket retain/
 release balance, and a factory that returns after background entry without a new
-commit. A host Metal smoke test also held an earlier command buffer on an event:
+commit. They also force a newer epoch to consume its private pin before an older
+pending or completed goal-5 barrier is revisited at goal 7; neither proof permits
+early deletion. Quarantine tests cover event-read failure, invalid snapshots and
+counts, plus a native ticket release blocked while the main thread acquires the
+lifetime mutex and invokes the watchdog. Background tests show two devices making
+passive progress without new barriers, finalizers, or leftover COM releases.
+A host Metal smoke test also held an earlier command buffer on an event:
 the later empty buffer remained pending until that event was signaled, after which
 both completed. These are host results, not a phone reclamation measurement.
 They do not establish Metal retirement or memory recovery on the phone. The lead
@@ -185,11 +221,15 @@ not change the guest or its drivers.
    five allowed seconds; `barriers` counts successful recovery proofs, and
    `slow_calls`/`stalled_call` identify returned/current native-call stalls. A
    retirement line with `barrier=1` may legitimately show a stale initializer
-   event below its goal. Save these fields and the surrounding census lines.
+   event below its goal, but `barrier_goal` must cover that initializer goal.
+   `paused_ready` reports last-sampled ready jobs waiting for foreground destruction.
+   Save these fields and the surrounding census lines.
 5. Repeat a normal background and
    foreground trip while cleanup is pending. The app must remain responsive;
-   cleanup must wait while backgrounded. This test does not require a graphics
-   mode or display-topology change inside Windows.
+   new barrier submissions, finalizers and leftover COM releases must wait for
+   foreground, while passive retirement reads continue. An already-entered
+   finalizer may still finish after the background transition. This test does
+   not require a graphics mode or display-topology change inside Windows.
 6. For comparison, repeat in a fresh app process with
    `HV_NPT_DEFER_RELEASE=0`. Remove that override and restart afterward.
 
