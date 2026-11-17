@@ -46,6 +46,16 @@ typedef struct WinIOSPresenterStats {
     uint32_t srcWidth, srcHeight, dstWidth, dstHeight, scaleX100;
 } WinIOSPresenterStats;
 
+/// One finger on the Windows touch screen (the xHCI's port 3): x, y in 0..1 across the Windows screen.
+/// contactId stays the same while the finger is down (0..15). A finger lifting is sent once more with tip 0;
+/// confidence 0 with it cancels the touch (Windows does not take it as a tap or the end of a gesture).
+typedef struct WinIOSTouchContact {
+    uint8_t contactId;
+    uint8_t tip;
+    uint8_t confidence;
+    double x, y;
+} WinIOSTouchContact;
+
 /// Posted (main thread) when the display plan, the reshape state or the helper's report changes.
 extern NSNotificationName const WinIOSDisplayStateDidChangeNotification;
 /// Posted (main thread) when the view takes a new shape that will re-mode Windows: in-flight touches
@@ -69,6 +79,8 @@ extern NSNotificationName const WinIOSDisplayWillReshapeNotification;
 @property (nonatomic, readonly) uint64_t availableMemoryMB;
 @property (nonatomic, readonly) BOOL usbKeyboardReady;
 @property (nonatomic, readonly) BOOL usbTabletReady;
+/// Windows reads the touch screen (its HID touch driver runs): multi-touch can go to it. Cheap to read.
+@property (nonatomic, readonly) BOOL usbTouchReady;
 @property (nonatomic, readonly) uint64_t usbEventsDelivered;
 @property (nonatomic, assign) BOOL useSafariForGuestLinks;
 @property (nonatomic, copy, nullable) WinIOSStateCallback onStateChanged;
@@ -125,6 +137,12 @@ extern NSNotificationName const WinIOSDisplayWillReshapeNotification;
 - (void)updateHingeStatus:(NSInteger)status angleDegrees:(double)angleDegrees;
 
 - (void)sendTabletNormalizedX:(double)x y:(double)y buttons:(uint8_t)buttons wheel:(int8_t)wheel;
+/// One touch screen frame: every finger on the screen, plus those lifting (tip 0), at most 10. Main thread.
+/// A lift for a finger Windows does not have down (already lifted) is left out.
+- (void)sendTouchContacts:(const WinIOSTouchContact *)contacts count:(NSInteger)count;
+/// Every finger still down in Windows is cancelled (tip 0, confidence 0). Also done by the bridge itself on
+/// a reshape (releaseAllInputForReshape) and when the app goes to the background. Main thread.
+- (void)cancelAllTouchContacts;
 - (void)sendKeyHid:(uint8_t)usage down:(BOOL)down;
 /* Key-ups sent only after every key tap already queued is up again (see winios_bridge.m). */
 - (void)releaseKeysAfterQueuedTaps:(NSArray<NSNumber *> *)usages;

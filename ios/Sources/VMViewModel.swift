@@ -68,6 +68,12 @@ enum DeckLayout: String, CaseIterable {
     }
 }
 
+/// What a finger on the Windows screen does: moves the pointer like a trackpad, clicks where it touches (a
+/// mouse), or is a touch in Windows (its touch screen; a mouse until Windows reads the touch screen).
+enum TouchMode: Hashable {
+    case trackpad, direct, multiTouch
+}
+
 @MainActor
 final class VMViewModel: ObservableObject {
     @Published var isJITLive: Bool = false
@@ -84,6 +90,8 @@ final class VMViewModel: ObservableObject {
 
     @Published var usbKeyboardReady: Bool = false
     @Published var usbTabletReady: Bool = false
+    /// Windows reads the USB touch screen (its touch driver runs): multi-touch is live.
+    @Published var usbTouchReady: Bool = false
     @Published var usbEventsDelivered: UInt64 = 0
 
     // iOS 27.1 UIHinge state (0 = unknown, 1 = closed, 2 = partiallyOpen, 3 = fullyOpen)
@@ -116,6 +124,18 @@ final class VMViewModel: ObservableObject {
     /// false: the screen works like a trackpad. true: taps land where the finger is.
     @Published var directTouch: Bool = UserDefaults.standard.bool(forKey: "winios.directTouch") {
         didSet { UserDefaults.standard.set(directTouch, forKey: "winios.directTouch") }
+    }
+    /// With direct touch: fingers go to Windows as touches (its touch screen) instead of as a mouse. Off by default.
+    @Published var multiTouch: Bool = UserDefaults.standard.bool(forKey: "winios.multiTouch") {
+        didSet { UserDefaults.standard.set(multiTouch, forKey: "winios.multiTouch") }
+    }
+    /// Settings' three touch modes over the two stored switches (both kept as they were saved before).
+    var touchMode: TouchMode {
+        get { !directTouch ? .trackpad : multiTouch ? .multiTouch : .direct }
+        set {
+            directTouch = newValue != .trackpad
+            if newValue != .trackpad { multiTouch = newValue == .multiTouch }
+        }
     }
     @Published var showSettings: Bool = false
     /// Advanced: JIT code cache in MiB (0 = default, the largest) and the most guest RAM in MiB (0 = automatic).
@@ -757,6 +777,7 @@ function ai {
         availableMemoryMB = b.availableMemoryMB
         usbKeyboardReady = b.usbKeyboardReady
         usbTabletReady = b.usbTabletReady
+        usbTouchReady = b.usbTouchReady
         usbEventsDelivered = b.usbEventsDelivered
     }
 

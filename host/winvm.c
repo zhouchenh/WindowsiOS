@@ -411,6 +411,30 @@ void hv_winvm_tablet(double x_norm, double y_norm, uint8_t buttons, int8_t wheel
     hv_xhci_tablet(board.usb, ax, ay, buttons, wheel);
 }
 
+static uint16_t touch_axis(double v) {
+    if (!(v > 0.0)) v = 0.0; /* NaN too */
+    if (v > 1.0) v = 1.0;
+    return (uint16_t)(v * 32767.0 + 0.5);
+}
+
+void hv_winvm_touch(const HvWinvmTouch *contacts, int n) {
+    if (!board.usb || !contacts || n < 0) return;
+    if (n > HV_TOUCH_MAX_CONTACTS) n = HV_TOUCH_MAX_CONTACTS;
+    HvTouchContact c[HV_TOUCH_MAX_CONTACTS];
+    for (int i = 0; i < n; i++) {
+        c[i].id = contacts[i].id;
+        c[i].tip = contacts[i].tip ? 1 : 0;
+        c[i].confidence = contacts[i].confidence ? 1 : 0;
+        c[i].x = touch_axis(contacts[i].x_norm);
+        c[i].y = touch_axis(contacts[i].y_norm);
+    }
+    hv_xhci_touch(board.usb, c, n);
+}
+
+int hv_winvm_touch_ready(void) {
+    return board.usb ? hv_xhci_touch_ready(board.usb) : 0;
+}
+
 void hv_winvm_send_ctrl_alt_del(void) {
     if (!board.usb) return;
     /* Left Ctrl (0xe0), Left Alt (0xe2), Delete (0x4c) */

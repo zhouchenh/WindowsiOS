@@ -10,13 +10,23 @@ import UIKit
 /// In direct mode a tap clicks where the finger is, as on a touch-screen PC.
 /// A pinch zooms in the Windows app (Ctrl + wheel); a three-finger double-tap zooms the picture itself
 /// (then a pinch sets that zoom, three fingers drag it, and a map of the screen shows where you are).
+/// Multi-touch (direct touch with multiTouch, once Windows reads its touch screen): every finger goes to
+/// Windows as a touch (TouchscreenInput.swift), except the four-finger tap, the immersive edge swipes and
+/// three fingers on the zoomed picture, which stay the app's.
 /// Typing: see TextInputBridge.swift (text, focus) and WindowsKeyBar.swift (the keys above the keyboard).
 final class MetalCanvasUIView: UIView, UITextInput {
     override class var layerClass: AnyClass { CAMetalLayer.self }
 
     var metalLayer: CAMetalLayer { layer as! CAMetalLayer }
     /// false: trackpad (relative pointer). true: direct touch (absolute).
-    var directTouch: Bool = false
+    var directTouch: Bool = false {
+        didSet { if oldValue != directTouch { touchModeChanged() } }
+    }
+    /// With direct touch: fingers go to Windows' touch screen (multi-touch) instead of being a mouse. Until
+    /// Windows reads the touch screen (firmware, early boot, no driver), direct touch is a mouse as before.
+    var multiTouch: Bool = false {
+        didSet { if oldValue != multiTouch { touchModeChanged() } }
+    }
     var onThreeFingerTap: (() -> Void)?
     var onKeyboardDismissed: (() -> Void)?
     /// The laptop deck's F8: the next one-finger tap is a right click.
@@ -90,6 +100,18 @@ final class MetalCanvasUIView: UIView, UITextInput {
     // three fingers: tap = toolbar, double-tap = viewport zoom, drag = pan the zoomed picture
     private var lastThreeTapAt: CFTimeInterval = 0
     private var pendingThreeTap: DispatchWorkItem?
+    // multi-touch: Windows' touch screen
+    private lazy var touchscreen: TouchscreenTracker = {
+        let t = TouchscreenTracker()
+        t.map = { [unowned self] p in self.touchscreenPoint(for: p) }
+        return t
+    }()
+    /// This gesture's fingers go to the touch screen: decided when its first finger lands, kept until the
+    /// last one lifts (a readiness change in between does not split it between touch and mouse).
+    private var touchGesture = false
+    /// The app took this touch gesture back (four fingers, three on the zoomed picture, a reshape, a mode
+    /// change): Windows had its fingers cancelled and gets nothing more of it.
+    private var touchTakenBack = false
 
     // UITextInput
     weak var inputDelegate: UITextInputDelegate?
@@ -201,6 +223,21 @@ final class MetalCanvasUIView: UIView, UITextInput {
     }
 
     private func normalizedPoint(for screenPt: CGPoint) -> (Double, Double) {
+        let (nx, ny, _) = unclampedPoint(for: screenPt)
+        return (min(1.0, max(0.0, nx)), min(1.0, max(0.0, ny)))
+    }
+
+    /// Multi-touch: the point on Windows' screen, clamped, and how far outside the picture it is (screen points).
+    private func touchscreenPoint(for screenPt: CGPoint) -> TouchscreenTracker.Mapped {
+        let (nx, ny, rect) = unclampedPoint(for: screenPt)
+        let dx = max(0, -nx, nx - 1) * Double(rect.width)
+        let dy = max(0, -ny, ny - 1) * Double(rect.height)
+        return TouchscreenTracker.Mapped(x: min(1.0, max(0.0, nx)), y: min(1.0, max(0.0, ny)),
+                                         outside: CGFloat(hypot(dx, dy)) * viewport.zoom)
+    }
+
+    /// The point on Windows' screen (0...1 inside the picture, beyond it outside) and the fitted picture.
+    private func unclampedPoint(for screenPt: CGPoint) -> (Double, Double, CGRect) {
         let pt = viewport.unproject(screenPt) // the picture may be panned or zoomed
         let bw = max(1.0, bounds.width)
         let bh = max(1.0, bounds.height)
@@ -219,9 +256,9 @@ final class MetalCanvasUIView: UIView, UITextInput {
                 rect = CGRect(x: 0, y: (bh - fittedH) * 0.5, width: bw, height: fittedH)
             }
         }
-        let nx = min(1.0, max(0.0, Double((pt.x - rect.minX) / max(1.0, rect.width))))
-        let ny = min(1.0, max(0.0, Double((pt.y - rect.minY) / max(1.0, rect.height))))
-        return (nx, ny)
+        let nx = Double((pt.x - rect.minX) / max(1.0, rect.width))
+        let ny = Double((pt.y - rect.minY) / max(1.0, rect.height))
+        return (nx, ny, rect)
     }
 
     // MARK: - Touches
@@ -253,6 +290,16 @@ final class MetalCanvasUIView: UIView, UITextInput {
         let now = CACurrentMediaTime()
         lastTouchAt = now
         checkFramebufferSize()
+        if fingers.isEmpty {
+            // multi-touch for the whole gesture, or none of it; the deck's F8 right click is a mouse click
+            touchGesture = directTouch && multiTouch && !rightClickArmed && WinIOSBridge.shared.usbTouchReady
+            touchTakenBack = false
+            if touchGesture { touchscreen.beginGesture() }
+        }
+        if touchGesture {
+            touchscreenBegan(newFingers, now: now)
+            return
+        }
         if fingers.isEmpty {
             gestureStart = now
             maxFingers = 0
@@ -359,6 +406,15 @@ final class MetalCanvasUIView: UIView, UITextInput {
         let dy = c.y - lastCentroid.y
         lastCentroid = c
         travelled += hypot(dx, dy)
+        if touchGesture {
+            if !touchTakenBack {
+                touchscreen.moved(touches, in: self)
+            } else if fingers.count == 3 && viewport.isZoomed && travelled > tapSlop {
+                consumed = true // three fingers drag the zoomed picture
+                viewport.pan(by: CGPoint(x: dx, y: dy))
+            }
+            return
+        }
         if travelled > tapSlop { cancelLongPress() }
         if fingers.count == 2 && twoMode != .scroll {
             pinchMoved(centroid: c, delta: CGPoint(x: dx, y: dy))
@@ -412,6 +468,10 @@ final class MetalCanvasUIView: UIView, UITextInput {
         if touches.contains(where: { $0.type == .indirectPointer }) && pointerButtons != 0 {
             pointerButtons = 0
             PointerController.shared.moveAbsolute(x: PointerController.shared.cursorX, y: PointerController.shared.cursorY)
+        }
+        if touchGesture {
+            touchscreenFinished(touches, cancelled: cancelled)
+            return
         }
         let before = fingers.count
         fingers.removeAll { touches.contains($0) }
@@ -469,25 +529,95 @@ final class MetalCanvasUIView: UIView, UITextInput {
                 PointerController.shared.clickAtCurrent(buttonMask: 2)
             }
         case 3:
-            lightHaptic.impactOccurred()
-            if now - lastThreeTapAt < 0.4 {
-                // three-finger double-tap: zoom the picture around the fingers (or back out)
-                lastThreeTapAt = 0
-                pendingThreeTap?.cancel()
-                pendingThreeTap = nil
-                toggleViewportZoom(anchor: lastCentroid)
-            } else {
-                lastThreeTapAt = now
-                let work = DispatchWorkItem { [weak self] in
-                    self?.pendingThreeTap = nil
-                    self?.onThreeFingerTap?()
-                }
-                pendingThreeTap = work
-                DispatchQueue.main.asyncAfter(deadline: .now() + 0.3, execute: work)
-            }
+            threeFingerTap(now: now)
         default:
             break
         }
+    }
+
+    /// Three-finger tap: the controls (after a moment, in case a second tap follows); a double-tap zooms the
+    /// picture around the fingers (or back out).
+    private func threeFingerTap(now: CFTimeInterval) {
+        lightHaptic.impactOccurred()
+        if now - lastThreeTapAt < 0.4 {
+            lastThreeTapAt = 0
+            pendingThreeTap?.cancel()
+            pendingThreeTap = nil
+            toggleViewportZoom(anchor: lastCentroid)
+        } else {
+            lastThreeTapAt = now
+            let work = DispatchWorkItem { [weak self] in
+                self?.pendingThreeTap = nil
+                self?.onThreeFingerTap?()
+            }
+            pendingThreeTap = work
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.3, execute: work)
+        }
+    }
+
+    // MARK: - Multi-touch (Windows' touch screen)
+
+    /// Fingers land in a touch gesture. Four fingers are the app's (the controls' four-finger tap), and so are
+    /// three on the zoomed picture (drag it, tap for the controls, double-tap to zoom out): Windows has the
+    /// fingers it had cancelled. Other fingers go to the tracker, which holds each back for a moment.
+    private func touchscreenBegan(_ newFingers: Set<UITouch>, now: CFTimeInterval) {
+        if fingers.isEmpty {
+            gestureStart = now
+            maxFingers = 0
+            travelled = 0
+            consumed = false
+            dragging = false
+            twoMode = .undecided
+            firstPoint = newFingers.first!.location(in: self)
+        }
+        fingers.append(contentsOf: newFingers)
+        maxFingers = max(maxFingers, fingers.count)
+        lastCentroid = centroid()
+        guard !touchTakenBack else { return }
+        if fingers.count >= 4 || (fingers.count == 3 && viewport.isZoomed) {
+            takeTouchGestureBack()
+            return
+        }
+        touchscreen.began(Array(newFingers), in: self, edgeSwipes: ChromeWindowGestures.edgeSwipeActive)
+    }
+
+    /// Fingers lift (or iOS cancelled them: Windows has them cancelled too, not tapped). The keyboard still
+    /// comes up after a one-finger tap into a text box, as in the other modes.
+    private func touchscreenFinished(_ touches: Set<UITouch>, cancelled: Bool) {
+        let before = fingers.count
+        fingers.removeAll { touches.contains($0) }
+        touchscreen.ended(touches, cancelled: cancelled)
+        guard before > 0, fingers.isEmpty else {
+            if !fingers.isEmpty { lastCentroid = centroid() }
+            return
+        }
+        touchscreen.endGesture()
+        touchGesture = false
+        let now = CACurrentMediaTime()
+        lastTouchAt = now
+        let wasTap = !cancelled && travelled <= tapSlop && (now - gestureStart) <= tapMaxDuration
+        if maxFingers < 3 && !cancelled && !touchTakenBack { onUserInteraction?() }
+        guard wasTap, !consumed else { return }
+        if maxFingers == 1 && !touchTakenBack {
+            lastTapPicturePoint = viewport.unproject(firstPoint)
+            tappedForKeyboard(at: now)
+            lightHaptic.impactOccurred(intensity: 0.5)
+        } else if maxFingers == 3 && touchTakenBack && viewport.isZoomed {
+            threeFingerTap(now: now)
+        }
+    }
+
+    /// The rest of this touch gesture is the app's: Windows has every finger it had down cancelled.
+    private func takeTouchGestureBack() {
+        guard touchGesture, !touchTakenBack else { return }
+        touchTakenBack = true
+        touchscreen.cancelAll()
+    }
+
+    /// Direct touch or multi-touch switched (the toolbar, Settings): a touch gesture in progress ends in Windows.
+    private func touchModeChanged() {
+        takeTouchGestureBack()
+        WinIOSBridge.shared.cancelAllTouchContacts()
     }
 
     private func scheduleLongPress() {
@@ -522,6 +652,7 @@ final class MetalCanvasUIView: UIView, UITextInput {
     @objc private func displayWillReshape() {
         cancelLongPress()
         endPinch()
+        takeTouchGestureBack() // multi-touch: the fingers down are cancelled in Windows
         if dragging {
             dragging = false
             PointerController.shared.setHeldButton(1, down: false)
@@ -797,10 +928,13 @@ final class MetalCanvasUIView: UIView, UITextInput {
     }
 
     /// Keys still held when the app loses focus (Cmd-Tab away, a sheet opens) would stay down in Windows.
+    /// So would touch screen fingers: they are cancelled.
     @objc func releaseAllKeys() {
         for k in keysDown { WinIOSBridge.shared.sendKeyHid(k, down: false) }
         keysDown.removeAll()
         endPinch()
+        takeTouchGestureBack()
+        WinIOSBridge.shared.cancelAllTouchContacts()
         keys.releaseAll(keepLatches: UIApplication.shared.applicationState == .active)
     }
 
@@ -842,6 +976,8 @@ extension MetalCanvasUIView: UIPointerInteractionDelegate {
 /// as before). One view in both postures (no if/else), so the canvas keeps its identity and focus.
 struct MetalDisplayView: View {
     @Binding var directTouch: Bool
+    /// With direct touch: fingers go to Windows' touch screen.
+    var multiTouch: Bool = false
     @Binding var keyboardVisible: Bool
     var hardwareKeyboard: Bool
     var focusAllowed: Bool
@@ -851,7 +987,7 @@ struct MetalDisplayView: View {
     var onUserInteraction: (() -> Void)? = nil
 
     var body: some View {
-        MetalCanvasRepresentable(directTouch: $directTouch, keyboardVisible: $keyboardVisible,
+        MetalCanvasRepresentable(directTouch: $directTouch, multiTouch: multiTouch, keyboardVisible: $keyboardVisible,
                                  hardwareKeyboard: hardwareKeyboard, focusAllowed: focusAllowed,
                                  onThreeFingerTap: onThreeFingerTap, rightClickArmed: rightClickArmed,
                                  keyboardResizesView: keyboardResizesView, onUserInteraction: onUserInteraction)
@@ -861,6 +997,7 @@ struct MetalDisplayView: View {
 
 struct MetalCanvasRepresentable: UIViewRepresentable {
     @Binding var directTouch: Bool
+    var multiTouch: Bool = false
     @Binding var keyboardVisible: Bool
     /// A hardware keyboard is attached: keep the keyboard focus on Windows by itself.
     var hardwareKeyboard: Bool
@@ -888,6 +1025,7 @@ struct MetalCanvasRepresentable: UIViewRepresentable {
 
     func updateUIView(_ uiView: MetalCanvasUIView, context: Context) {
         uiView.directTouch = directTouch
+        uiView.multiTouch = multiTouch
         uiView.hardwareKeyboard = hardwareKeyboard
         uiView.onThreeFingerTap = onThreeFingerTap
         uiView.onUserInteraction = onUserInteraction

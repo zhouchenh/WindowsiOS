@@ -124,6 +124,8 @@ static const uint8_t tab_config_desc[34] = {
     7, 5, 0x81, 3, 8, 0, 1,                                       /* EP1 IN, 8 bytes max, 1 ms */
 };
 
+/* Port 3 (USB HID multi-touch Touch Screen, 0627:0003): its descriptors are in usb_touch.c. */
+
 static const char *const strings[] = {
     NULL,
     "WindowsiOS",
@@ -131,7 +133,35 @@ static const char *const strings[] = {
     "KBD01",
     "WindowsiOS USB Tablet",
     "TAB01",
+    "WindowsiOS USB Touchscreen",
+    "TCH01",
 };
+
+/* The descriptors of the device on each port (1 keyboard, 2 tablet, 3 touch screen). */
+typedef struct PortDesc {
+    const uint8_t *dev, *cfg, *rep;
+    int cfg_len, rep_len;
+} PortDesc;
+
+static PortDesc port_desc(int port) {
+    switch (port) {
+    case 2:
+        return (PortDesc){tab_device_desc, tab_config_desc, tab_report_desc, (int)sizeof tab_config_desc,
+                          (int)sizeof tab_report_desc};
+    case 3:
+        return (PortDesc){hv_usb_touch_device_desc, hv_usb_touch_config_desc, hv_usb_touch_report_desc,
+                          (int)sizeof hv_usb_touch_config_desc, (int)hv_usb_touch_report_desc_len};
+    default:
+        return (PortDesc){kbd_device_desc, kbd_config_desc, kbd_report_desc, (int)sizeof kbd_config_desc,
+                          (int)sizeof kbd_report_desc};
+    }
+}
+
+static uint64_t now_ns(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
+}
 
 static int xlog(void) {
     static int on = -1;
@@ -262,10 +292,10 @@ static void set_ep_state(HvXhci *x, int slot, int dci, uint32_t state) {
     wr(x, ctx, &dw0, 4);
 }
 
-/* ---- control requests for Port 1 (Keyboard) and Port 2 (Tablet) ---- */
+/* ---- control requests for Port 1 (Keyboard), Port 2 (Tablet) and Port 3 (Touch Screen) ---- */
 
 static int control(HvXhci *x, HvXhciSlot *sl, const uint8_t setup[8], uint8_t *out, int max) {
-    int is_tab = sl->port == 2;
+    int is_tab = sl->port == 2, is_touch = sl->port == 3;
     uint8_t type = setup[0], req = setup[1];
     uint16_t value = (uint16_t)(setup[2] | setup[3] << 8);
     if (xlog()) fprintf(stderr, "xhci port %d: request %02x %02x value %04x len %u\n", sl->port, type, req, value, setup[6] | setup[7] << 8);
@@ -274,15 +304,13 @@ static int control(HvXhci *x, HvXhciSlot *sl, const uint8_t setup[8], uint8_t *o
     int len = 0;
     uint8_t tmp[128];
 
-    const uint8_t *dev_d = is_tab ? tab_device_desc : kbd_device_desc;
-    const uint8_t *cfg_d = is_tab ? tab_config_desc : kbd_config_desc;
-    const uint8_t *rep_d = is_tab ? tab_report_desc : kbd_report_desc;
-    int rep_d_len = is_tab ? (int)sizeof(tab_report_desc) : (int)sizeof(kbd_report_desc);
+    PortDesc pd = port_desc(sl->port);
+    const uint8_t *cfg_d = pd.cfg;
 
     if (type == 0x80 && req == 6) { /* GET_DESCRIPTOR (device) */
         uint8_t dt = value >> 8, idx = value & 0xff;
-        if (dt == 1) src = dev_d, len = 18;
-        else if (dt == 2) src = cfg_d, len = 34;
+        if (dt == 1) src = pd.dev, len = 18;
+        else if (dt == 2) src = cfg_d, len = pd.cfg_len;
         else if (dt == 3) {
             if (idx == 0) {
                 tmp[0] = 4, tmp[1] = 3, tmp[2] = 0x09, tmp[3] = 0x04;
@@ -296,7 +324,7 @@ static int control(HvXhci *x, HvXhciSlot *sl, const uint8_t setup[8], uint8_t *o
             } else return -1;
         } else return -1;
     } else if (type == 0x81 && req == 6) { /* GET_DESCRIPTOR (interface): HID, report */
-        if ((value >> 8) == 0x22) src = rep_d, len = rep_d_len;
+        if ((value >> 8) == 0x22) src = pd.rep, len = pd.rep_len;
         else if ((value >> 8) == 0x21) src = cfg_d + 18, len = 9;
         else return -1;
     } else if ((type == 0x80 || type == 0x81 || type == 0x82) && req == 0) { /* GET_STATUS */
@@ -311,6 +339,20 @@ static int control(HvXhci *x, HvXhciSlot *sl, const uint8_t setup[8], uint8_t *o
     } else if (type == 0x81 && req == 10) { /* GET_INTERFACE */
         tmp[0] = 0;
         src = tmp, len = 1;
+    } else if (type == 0xa1 && req == 1 && is_touch) { /* GET_REPORT: wValue = type << 8 | report ID */
+        uint8_t rtype = value >> 8, rid = value & 0xff;
+        if (rtype == 1 && rid == HV_TOUCH_REPORT_ID) {
+            pthread_mutex_lock(&x->mu);
+            memcpy(tmp, x->touch_state, HV_TOUCH_REPORT_LEN);
+            pthread_mutex_unlock(&x->mu);
+            src = tmp, len = HV_TOUCH_REPORT_LEN;
+        } else if (rtype == 3) {
+            len = hv_usb_touch_feature(rid, x->touch_dev_mode, x->touch_dev_id, tmp, (int)sizeof tmp);
+            if (len < 0) return -1;
+            src = tmp;
+        } else {
+            return -1;
+        }
     } else if (type == 0xa1 && req == 1) { /* GET_REPORT */
         if (is_tab) src = x->tab_state, len = 6;
         else src = x->state, len = 8;
@@ -337,6 +379,19 @@ static int control(HvXhci *x, HvXhciSlot *sl, const uint8_t setup[8], uint8_t *o
     return len;
 }
 
+/* The data stage of a class OUT request: the touch screen keeps the Device Mode and Device Identifier the
+   host sets (SET_REPORT, feature 3) to give them back on GET_REPORT. Everything else is dropped. */
+static void control_out(HvXhci *x, HvXhciSlot *sl, const uint8_t setup[8], uint64_t buf, uint32_t len) {
+    uint16_t value = (uint16_t)(setup[2] | setup[3] << 8);
+    if (sl->port != 3 || setup[0] != 0x21 || setup[1] != 9 || value != (3u << 8 | HV_TOUCH_FEATURE_MODE_ID) || len < 3)
+        return;
+    uint8_t d[3];
+    rd(x, buf, d, 3);
+    if (d[0] != HV_TOUCH_FEATURE_MODE_ID) return;
+    x->touch_dev_mode = d[1];
+    x->touch_dev_id = d[2];
+}
+
 /* A halted endpoint's context names the TRB it stopped at, as hardware does: Linux reads it back to
    find the stalled TD and move the ring past it (Set TR Dequeue). Left stale, the next transfer
    on the endpoint never ran (USB devices failed to enumerate under Linux). */
@@ -350,7 +405,7 @@ static void run_ep0(HvXhci *x, int slot) {
     HvXhciRing *r = &sl->ep[1];
     uint32_t trb[4];
     uint64_t at;
-    uint8_t setup[8], reply[256];
+    uint8_t setup[8] = {0}, reply[1024]; /* the touch screen's report descriptor is 780 bytes */
     int reply_len = 0, reply_off = 0, stalled = 0, td_short = 0;
     uint32_t edtla = 0;
     while (ring_peek(x, r, trb, &at)) {
@@ -389,6 +444,7 @@ static void run_ep0(HvXhci *x, int slot) {
                 reply_off += (int)n;
             } else {
                 n = want;
+                control_out(x, sl, setup, buf, want);
             }
             edtla += n;
             if (n < want) td_short = 1;
@@ -507,6 +563,31 @@ static void run_ep_in(HvXhci *x) {
                 fprintf(stderr, "xhci: delivered tab report #%llu (btn=%02x)\n", (unsigned long long)x->delivered, rep[0]);
         }
     }
+    /* Port 3: Touch Screen */
+    if (x->touch_slot && x->slots[x->touch_slot].ep_running[HID_DCI_IN]) {
+        int slot = x->touch_slot;
+        while (x->chead != x->ctail) {
+            const uint8_t *rep = x->touch_reports[x->chead % HV_XHCI_REPORTS];
+            if (!deliver_hid_in(x, slot, rep, HV_TOUCH_REPORT_LEN)) break;
+            x->chead++;
+            x->delivered++;
+            x->touch_seen_ns = now_ns();
+            if (xlog() && x->delivered <= 24)
+                fprintf(stderr, "xhci: delivered touch report #%llu (contacts=%u)\n", (unsigned long long)x->delivered, rep[63]);
+        }
+    }
+    pthread_mutex_unlock(&x->mu);
+}
+
+/* Touch frames queued for a device that is gone or new (a reset, the slot disabled, the device addressed
+   again) are dropped, never replayed: they would be taps at old places. */
+static void touch_flush(HvXhci *x) {
+    pthread_mutex_lock(&x->mu);
+    x->chead = x->ctail = 0;
+    memset(x->touch_state, 0, sizeof x->touch_state);
+    x->touch_state[0] = HV_TOUCH_REPORT_ID;
+    x->touch_seen_ns = 0;
+    __atomic_store_n(&x->touch_ready, 0, __ATOMIC_RELEASE);
     pthread_mutex_unlock(&x->mu);
 }
 
@@ -527,7 +608,7 @@ static int address_device(HvXhci *x, int slot, uint64_t input, int bsr) {
     uint8_t slot_ctx[32], ep0[32];
     rd(x, input + 32, slot_ctx, 32);
     rd(x, input + 64, ep0, 32);
-    int port = slot_ctx[6]; /* root hub port number (1 or 2) */
+    int port = slot_ctx[6]; /* root hub port number (1..3) */
     if (port < 1 || port > HV_XHCI_PORTS) return CC_TRB_ERROR;
 
     uint32_t dw3 = (uint32_t)(bsr ? 1 : 2) << 27 | (uint32_t)(bsr ? 0 : slot);
@@ -544,6 +625,11 @@ static int address_device(HvXhci *x, int slot, uint64_t input, int bsr) {
     x->slots[slot].idle = 0;
     if (port == 1) x->kbd_slot = slot;
     else if (port == 2) x->tab_slot = slot;
+    else if (port == 3) {
+        x->touch_slot = slot;
+        x->touch_dev_mode = x->touch_dev_id = 0;
+        touch_flush(x);
+    }
     init_ring_from_ctx(x, slot, 1);
     return CC_SUCCESS;
 }
@@ -613,6 +699,10 @@ static void run_commands(HvXhci *x) {
             if (slot >= 1 && slot <= HV_XHCI_SLOTS) {
                 if (slot == x->kbd_slot) x->kbd_slot = 0;
                 if (slot == x->tab_slot) x->tab_slot = 0;
+                if (slot == x->touch_slot) {
+                    x->touch_slot = 0;
+                    touch_flush(x);
+                }
                 memset(&x->slots[slot], 0, sizeof x->slots[slot]);
             }
             break;
@@ -679,6 +769,7 @@ static void run_commands(HvXhci *x) {
                 x->slots[slot].configured = 0;
                 x->slots[slot].protocol = 1;
                 x->slots[slot].idle = 0;
+                if (slot == x->touch_slot) touch_flush(x);
             }
             break;
         }
@@ -737,6 +828,9 @@ static void reset(HvXhci *x) {
     memset(x->slots, 0, sizeof x->slots);
     x->kbd_slot = 0;
     x->tab_slot = 0;
+    x->touch_slot = 0;
+    x->touch_dev_mode = x->touch_dev_id = 0;
+    touch_flush(x);
     ports_connect_init(x);
     update_irq(x);
 }
@@ -984,8 +1078,64 @@ void hv_xhci_key_linux(HvXhci *x, uint16_t code, int down) {
     if (code < 256) hv_xhci_key(x, linux_to_hid[code], down);
 }
 
+/* One touch screen frame. A frame that only moves the contacts of the last one queued replaces that one
+   while the guest has not taken it; a frame that puts a contact down or lifts one is never merged, and
+   the last 32 places in the queue are kept for those, so a lift is not lost to a burst of moves. */
+void hv_xhci_touch(HvXhci *x, const HvTouchContact *c, int n) {
+    if (!x) return;
+    uint8_t rep[HV_TOUCH_REPORT_LEN];
+    uint64_t ns = now_ns();
+    hv_usb_touch_pack(rep, c, n, (uint16_t)(ns / 100000ull)); /* Scan Time: 100 us units, wrapping */
+
+    pthread_mutex_lock(&x->mu);
+    int motion = hv_usb_touch_is_motion(x->touch_state, rep);
+    uint32_t queued = x->ctail - x->chead;
+    if (motion && queued && x->touch_motion[(x->ctail - 1) % HV_XHCI_REPORTS]) {
+        memcpy(x->touch_reports[(x->ctail - 1) % HV_XHCI_REPORTS], rep, sizeof rep);
+        memcpy(x->touch_state, rep, sizeof rep);
+    } else if (queued < (motion ? HV_XHCI_REPORTS - 32u : (uint32_t)HV_XHCI_REPORTS)) {
+        memcpy(x->touch_reports[x->ctail % HV_XHCI_REPORTS], rep, sizeof rep);
+        x->touch_motion[x->ctail % HV_XHCI_REPORTS] = (uint8_t)motion;
+        x->ctail++;
+        memcpy(x->touch_state, rep, sizeof rep);
+    } else {
+        x->touch_dropped++;
+    }
+    pthread_mutex_unlock(&x->mu);
+    hv_machine_wake(x->m);
+}
+
+int hv_xhci_touch_ready(HvXhci *x) {
+    return x ? __atomic_load_n(&x->touch_ready, __ATOMIC_ACQUIRE) : 0;
+}
+
+/* Every 10 ms: the touch screen counts as in use while its endpoint runs and the guest had a read queued
+   on it (or took a report) in the last 2 s. Windows' hidusb keeps reads queued all the time; UEFI
+   configures the endpoint (SET_CONFIGURATION) but never reads, and neither does a guest without a HID
+   driver, so touch frames would go nowhere there and the app sends the tablet instead. */
+static void touch_check(HvXhci *x) {
+    uint64_t now = now_ns();
+    if (now - x->touch_check_ns < 10000000ull) return;
+    x->touch_check_ns = now;
+    pthread_mutex_lock(&x->mu);
+    int ready = 0, s = x->touch_slot;
+    if (s >= 1 && s <= HV_XHCI_SLOTS && x->slots[s].ep_running[HID_DCI_IN]) {
+        HvXhciRing r = x->slots[s].ep[HID_DCI_IN]; /* a copy: only looking */
+        uint32_t trb[4];
+        uint64_t at;
+        if (ring_peek(x, &r, trb, &at) && ((trb[3] >> 10) & 0x3f) == TRB_NORMAL) x->touch_seen_ns = now;
+        ready = x->touch_seen_ns && now - x->touch_seen_ns < 2000000000ull;
+    }
+    if (ready != __atomic_load_n(&x->touch_ready, __ATOMIC_RELAXED) && xlog())
+        fprintf(stderr, "xhci: touch screen %s\n", ready ? "in use" : "not read");
+    __atomic_store_n(&x->touch_ready, ready, __ATOMIC_RELEASE);
+    pthread_mutex_unlock(&x->mu);
+}
+
 void hv_xhci_poll(HvXhci *x) {
-    if (!x || (x->rhead == x->rtail && x->thead == x->ttail)) return;
+    if (!x) return;
+    touch_check(x);
+    if (x->rhead == x->rtail && x->thead == x->ttail && x->chead == x->ctail) return;
     run_ep_in(x);
 }
 

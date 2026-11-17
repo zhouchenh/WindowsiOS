@@ -14,7 +14,7 @@ ENGINE = $(CORE) $(HOST)
 DEV = $(B)/acpi.o $(B)/acpi_battery.o $(B)/fb_display.o $(B)/fb_metal.o $(B)/fdt.o $(B)/fw_cfg.o $(B)/gicv3.o $(B)/hda.o \
       $(B)/nvme.o $(B)/pcie.o $(B)/pflash.o $(B)/pl011.o $(B)/pl031.o $(B)/pl061.o $(B)/timer.o \
       $(B)/virtio.o $(B)/virtio_blk.o $(B)/virtio_input.o $(B)/virtio_net.o $(B)/virtio_snd.o $(B)/virtio_gpu.o $(B)/virtio_gpu3d.o \
-      $(B)/winvirt.o $(B)/xhci.o
+      $(B)/usb_touch.o $(B)/winvirt.o $(B)/xhci.o
 
 VM_HOST = $(B)/winvm.o $(B)/net_slirp.o $(B)/dns_proxy.o $(B)/share.o $(B)/audio_mac.o $(B)/hvsparse.o
 
@@ -24,7 +24,7 @@ MAC_FRAMEWORKS = -framework Cocoa -framework Foundation -framework QuartzCore -f
 
 CORE_TESTS = $(B)/test_classify $(B)/test_jit_region $(B)/test_operands $(B)/test_jit $(B)/test_mem \
              $(B)/test_mmu $(B)/test_exc $(B)/test_share_clip $(B)/test_share_focus $(B)/test_pl031 \
-             $(B)/test_acpi
+             $(B)/test_acpi $(B)/test_usb_touch
 
 all: $(CORE_TESTS) $(B)/hvsparse $(B)/winvm
 
@@ -75,6 +75,11 @@ $(B)/test_acpi: tests/test_acpi.c tests/fw_cfg_capture_stub.c tests/fw_cfg_captu
                 devices/acpi_battery.c devices/*.h | $(B)
 	$(CC) $(CFLAGS) -Itests -fsanitize=address,undefined -fno-sanitize-recover=all tests/test_acpi.c \
 		tests/fw_cfg_capture_stub.c devices/acpi.c devices/acpi_battery.c -o $@
+# The USB touch screen (xHCI port 3): descriptors, report packing, enumeration of all three ports, the touch
+# queue and its delivery, driven through the controller's registers over stand-in guest memory.
+$(B)/test_usb_touch: tests/test_usb_touch.c devices/xhci.c devices/usb_touch.c devices/*.h core/*.h | $(B)
+	$(CC) $(CFLAGS) -fsanitize=address,undefined -fno-sanitize-recover=all tests/test_usb_touch.c devices/xhci.c \
+		devices/usb_touch.c -o $@
 
 # Guest DNS proxy against a stand-in resolver (no network needed).
 $(B)/test_dns_lifecycle: tests/test_dns_lifecycle.c $(B)/dns_proxy.o

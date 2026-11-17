@@ -76,6 +76,9 @@ NSNotificationName const WinIOSDisplayWillReshapeNotification = @"WinIOSDisplayW
     double _tabletX, _tabletY;
     uint8_t _tabletButtons;
     uint8_t _keysDown[32];
+    /* touch screen contacts Windows has down (bit = contact id), and where they last were (main thread) */
+    uint16_t _touchDown;
+    double _touchX[16], _touchY[16];
     CFAbsoluteTime _keyTapFreeAt; /* main thread: when the last queued key tap is up again (reserveKeyTap) */
     /* battery passthrough (main thread): the running machine has BAT0/ADP0, the observers are in,
        the last level (percent) and state handed to it */
@@ -304,6 +307,7 @@ static void winios_log_memory_census(void) {
 
 - (void)onAppBackground:(NSNotification *)note {
     (void)note;
+    [self cancelAllTouchContacts]; /* no finger stays down in Windows while the app is away */
     if (_vmRunning && !getenv("WINIOS_RUN_IN_BACKGROUND")) {
         hv_winvm_set_paused(1);
         _pausedInBackground = YES;
@@ -904,6 +908,7 @@ static BOOL winios_plans_equal(WinIOSDisplayPlan a, WinIOSDisplayPlan b) {
    not leave a button held) and whenever the UI asks. Modifiers are always lifted. Main thread. */
 - (void)releaseAllInputForReshape {
     if (!_vmRunning) return;
+    [self cancelAllTouchContacts];
     if (_tabletButtons) {
         _tabletButtons = 0;
         hv_winvm_tablet(_tabletX, _tabletY, 0, 0);
@@ -1027,6 +1032,11 @@ static BOOL winios_plans_equal(WinIOSDisplayPlan a, WinIOSDisplayPlan b) {
     int tr = 0;
     hv_winvm_usb_stats(NULL, &tr, NULL);
     return tr != 0;
+}
+
+/* An atomic the CPU thread keeps (hv_xhci_poll): no lock, fine to read on every touch. */
+- (BOOL)usbTouchReady {
+    return _vmRunning && hv_winvm_touch_ready() != 0;
 }
 
 - (uint64_t)usbEventsDelivered {
@@ -1525,6 +1535,7 @@ static NSString *winios_unpack_resource(NSString *name, NSString *dst) {
     }
 
     _vmRunning = YES;
+    _touchDown = 0;
     _bootStartTime = CFAbsoluteTimeGetCurrent();
     _diagTickCount = 0;
     _lastMachTicks = mach_absolute_time();
@@ -1662,6 +1673,33 @@ static void winios_type_run(NSString *text) {
                 }
             });
         }
+        /* Documents/touch.request (testing over USB): one touch screen frame per line, 16 ms apart; each
+           frame is "id,x,y,tip[,confidence]" per contact, separated by ";" (x, y 0..1 across the screen).
+           A finger lifts with a contact at tip 0 in one frame and none in the next. */
+        NSString *touchReq = [[self documentsPath] stringByAppendingPathComponent:@"touch.request"];
+        NSString *touch = [NSString stringWithContentsOfFile:touchReq encoding:NSUTF8StringEncoding error:nil];
+        if (touch.length) {
+            unlink(touchReq.fileSystemRepresentation);
+            dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+                for (NSString *line in [touch componentsSeparatedByCharactersInSet:NSCharacterSet.newlineCharacterSet]) {
+                    NSString *frame = [line stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceCharacterSet];
+                    if (!frame.length) continue;
+                    HvWinvmTouch c[10];
+                    int n = 0;
+                    for (NSString *part in [frame componentsSeparatedByString:@";"]) {
+                        NSArray<NSString *> *f = [[part stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceCharacterSet]
+                            componentsSeparatedByString:@","];
+                        if (f.count < 4 || n >= 10) continue;
+                        uint8_t tip = (uint8_t)(f[3].intValue != 0);
+                        c[n++] = (HvWinvmTouch){.id = (uint8_t)(f[0].intValue & 15), .tip = tip,
+                                                .confidence = f.count > 4 ? (uint8_t)(f[4].intValue != 0) : 1,
+                                                .x_norm = f[1].doubleValue, .y_norm = f[2].doubleValue};
+                    }
+                    if (n) hv_winvm_touch(c, n);
+                    usleep(16000);
+                }
+            });
+        }
     }
     [self writeDiagnosticsSnapshot];
     if (_vmRunning) dispatch_async(dispatch_get_main_queue(), ^{ [self refreshAppliedDisplay]; }); /* display hook */
@@ -1743,6 +1781,7 @@ static void winios_type_run(NSString *text) {
         @"frames_presented: %llu\n"
         @"usb_kbd_ready: %d\n"
         @"usb_tab_ready: %d\n"
+        @"usb_touch_ready: %d\n"
         @"usb_delivered: %llu\n"
         @"share_up: %d\n"
         @"oauth_safari: %d\n"
@@ -1767,6 +1806,7 @@ static void winios_type_run(NSString *text) {
         frames,
         kbdReady,
         tabReady,
+        running ? hv_winvm_touch_ready() : 0,
         usbDelivered,
         running ? hv_winvm_share_up() : 0,
         hv_share_url_handler_enabled(),
@@ -1801,6 +1841,7 @@ static void winios_type_run(NSString *text) {
     _vmRunning = NO;
     if (_batteryOn) UIDevice.currentDevice.batteryMonitoringEnabled = NO;
     _batteryOn = NO;
+    _touchDown = 0;
     [self stopDiagTimer];
     [self endReshapeWatch:WinIOSReshapeStateIdle]; /* display hook */
     hv_fb_metal_hold_for_size(0, 0, 0);
@@ -1814,6 +1855,47 @@ static void winios_type_run(NSString *text) {
     if (!_vmRunning) return;
     [self trackTabletX:x y:y buttons:buttons]; /* display hook: reshape release, idle throttling */
     hv_winvm_tablet(x, y, buttons, wheel);
+}
+
+/* What goes down is remembered (for cancelAllTouchContacts); a lift for a contact Windows does not have down
+   (the bridge already cancelled it, e.g. on a reshape) is left out, and a frame left empty is not sent. */
+- (void)sendTouchContacts:(const WinIOSTouchContact *)contacts count:(NSInteger)count {
+    if (!_vmRunning || !contacts || count <= 0) return;
+    HvWinvmTouch c[16];
+    int n = 0;
+    for (NSInteger i = 0; i < count && n < 10; i++) {
+        uint8_t cid = contacts[i].contactId;
+        if (cid >= 16) continue;
+        uint16_t bit = (uint16_t)(1u << cid);
+        if (contacts[i].tip) {
+            _touchDown |= bit;
+            _touchX[cid] = contacts[i].x;
+            _touchY[cid] = contacts[i].y;
+        } else {
+            if (!(_touchDown & bit)) continue;
+            _touchDown &= (uint16_t)~bit;
+        }
+        c[n++] = (HvWinvmTouch){.id = cid, .tip = contacts[i].tip ? 1 : 0, .confidence = contacts[i].confidence ? 1 : 0,
+                                .x_norm = contacts[i].x, .y_norm = contacts[i].y};
+    }
+    if (!n) return;
+    hv_fb_metal_note_input(); /* display hook: idle throttling */
+    hv_winvm_touch(c, n);
+}
+
+- (void)cancelAllTouchContacts {
+    if (!_vmRunning || !_touchDown) {
+        _touchDown = 0;
+        return;
+    }
+    HvWinvmTouch c[16];
+    int n = 0;
+    for (uint8_t cid = 0; cid < 16 && n < 10; cid++) {
+        if (!(_touchDown & (1u << cid))) continue;
+        c[n++] = (HvWinvmTouch){.id = cid, .tip = 0, .confidence = 0, .x_norm = _touchX[cid], .y_norm = _touchY[cid]};
+    }
+    _touchDown = 0;
+    hv_winvm_touch(c, n); /* no empty frame after it: a Contact Count of 0 reads as a continuation */
 }
 
 - (void)sendKeyHid:(uint8_t)usage down:(BOOL)down {
