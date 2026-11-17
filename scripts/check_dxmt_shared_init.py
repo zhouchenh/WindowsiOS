@@ -32,9 +32,6 @@ GUARDS = (
      "ff8301d1f85f02a9f65703a9f44f04a9fd7b05a9fd430191f50305aaf30300aaf70300aaff8e0038a89d00f008613291"
      "1ffc012909410091090000f909e10a9108a10b9109a001a9011400f903100629"
     ),
-    (0xe478,
-     "001440f9080040f9010540f920001fd6"
-    ),
     (0xe6c0,
      "ff8301d1f65703a9f44f04a9fd7b05a9fd430191f30303aaf40302aae80301aaf50300aae1030091e00308aaf1a70094"
      "e1030091e00315aae20314aae30313aafd050094fd7b45a9f44f44a9f65743a9ff830191c0035fd6"
@@ -139,7 +136,7 @@ def header():
            '#ifndef HV_DXMT_SHARED_INIT_LAYOUT_H', '#define HV_DXMT_SHARED_INIT_LAYOUT_H',
            '#include <stddef.h>', '#include <stdint.h>',
            '#define HV_SHARED_VTABLE 0x13c4ca8u', '#define HV_SHARED_FLUSH 0x11a064u',
-           '#define HV_SHARED_EVENT 0xd8e08u', '#define HV_SHARED_ADDREF 0xe478u']
+           '#define HV_SHARED_EVENT 0xd8e08u', '#define HV_SHARED_CONTAINER_VTABLE 0x13c4a58u']
     out.append('static const uint8_t hv_shared_uuid[] = {' + ','.join(f'0x{x:02x}' for x in UUID) + '};')
     out.append('static const uintptr_t hv_shared_slots[] = {0x13c4cd0,0x13c4e58};')
     out.append('static const uintptr_t hv_shared_targets[] = {0xe6c0,0xfef4};')

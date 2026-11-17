@@ -21,12 +21,16 @@ static _Atomic(const char *) shared_status="disabled: HV_DXMT_SHARED_INIT is opt
 static _Atomic bool shared_fatal;
 static bool shared_installed;
 /* Every lifecycle transition changes the token, including off -> on between
- * polls. GPU permission and drain are independent, so clearing one cannot
+ * polls. App permission, presenter pause and drain are independent; one cannot
  * override the other. Redundant setter calls leave the token unchanged.
  * This is a cooperative gate, not a replacement for the host GPU drain barrier. */
 static _Atomic uint64_t gpu_token=1; /* allowed, not draining: initial foreground */
-static _Atomic uint64_t waits, skipped, quarantined, flushes;
-static _Atomic bool foreground_failed;
+static _Atomic uint64_t waits, skipped, failures, flushes;
+static _Atomic uint64_t invalid_skips[2]; /* layout, null event */
+/* Bit 0 disables only extra mitigation work; upper bits identify a renderer
+ * epoch. Reset advances the epoch so old in-flight failures cannot disable a
+ * newly reset renderer. No caller resource/reference is retained or rejected. */
+static _Atomic uint64_t mitigation_state;
 static pthread_mutex_t stage_mutex=PTHREAD_MUTEX_INITIALIZER;
 static uint64_t active_flush, flush_busy_since;
 static _Atomic uint64_t active_poll;
@@ -34,7 +38,6 @@ static struct {
     int32_t (*create[2])(void *, const void *, const void *, void **);
     uint64_t (*flush)(void *);
     int32_t (*event_value)(void *);
-    uint32_t (*addref)(void *);
 } shared_calls; /* Immutable before any data slot is published. */
 
 const char *hv_dxmt_shared_init_status(void)
@@ -44,13 +47,21 @@ static void set_gate_bit(uint64_t bit,int on)
     uint64_t old=atomic_load_explicit(&gpu_token,memory_order_acquire), next;
     do {
         if (!!(old&bit)==!!on) return;
-        next=((old+4)&~UINT64_C(3)) | ((old&3)&~bit) | (on?bit:0);
+        next=((old+8)&~UINT64_C(7)) | ((old&7)&~bit) | (on?bit:0);
     } while (!atomic_compare_exchange_weak_explicit(&gpu_token,&old,next,
         memory_order_acq_rel,memory_order_acquire));
 }
 void hv_dxmt_shared_init_set_gpu_allowed(int allowed) {set_gate_bit(1,allowed);}
 void hv_dxmt_shared_init_set_draining(int draining) {set_gate_bit(2,draining);}
-static bool gate_allowed(uint64_t token) {return (token&3)==1;}
+void hv_dxmt_shared_init_set_presenter_paused(int paused) {set_gate_bit(4,paused);}
+static bool gate_allowed(uint64_t token) {return (token&7)==1;}
+void hv_dxmt_shared_init_reset(void)
+{
+    uint64_t old=atomic_load_explicit(&mitigation_state,memory_order_acquire), next;
+    do {next=(old+2)&~UINT64_C(1);}
+    while (!atomic_compare_exchange_weak_explicit(&mitigation_state,&old,next,
+        memory_order_acq_rel,memory_order_acquire));
+}
 static int reject(const char *reason)
 { atomic_store_explicit(&shared_status,reason,memory_order_release); return 0; }
 static bool shared_region(uintptr_t address, size_t length, vm_prot_t *protection)
@@ -151,24 +162,34 @@ void hv_dxmt_shared_init_describe(char *buffer,size_t length)
     pthread_mutex_unlock(&stage_mutex);
     uint64_t token=atomic_load_explicit(&gpu_token,memory_order_acquire);
     snprintf(buffer,length,
-        "%s; allowed=%u draining=%u flush_active=%llu flush_busy_ms=%llu poll_active=%llu ready=%llu skipped=%llu quarantined=%llu failed=%u",
-        hv_dxmt_shared_init_status(),(unsigned)(token&1),(unsigned)((token>>1)&1),
+        "%s; allowed=%u draining=%u paused=%u flush_active=%llu flush_busy_ms=%llu poll_active=%llu ready=%llu skipped=%llu failures=%llu mitigation_disabled=%u",
+        hv_dxmt_shared_init_status(),(unsigned)(token&1),(unsigned)((token>>1)&1),(unsigned)((token>>2)&1),
         (unsigned long long)active,(unsigned long long)(since && now>=since?(now-since)/1000000:0),
         (unsigned long long)atomic_load_explicit(&active_poll,memory_order_relaxed),
         (unsigned long long)atomic_load_explicit(&waits,memory_order_relaxed),
         (unsigned long long)atomic_load_explicit(&skipped,memory_order_relaxed),
-        (unsigned long long)atomic_load_explicit(&quarantined,memory_order_relaxed),
-        (unsigned)atomic_load_explicit(&foreground_failed,memory_order_acquire));
+        (unsigned long long)atomic_load_explicit(&failures,memory_order_relaxed),
+        (unsigned)(atomic_load_explicit(&mitigation_state,memory_order_acquire)&1));
 }
 static void pause_poll(void)
 { struct timespec ts={0,1000000}; nanosleep(&ts,NULL); }
-static bool gate_matches(uint64_t token)
-{ return gate_allowed(token) && atomic_load_explicit(&gpu_token,memory_order_acquire)==token; }
+static bool gate_matches(uint64_t token,uint64_t mitigation)
+{
+    return gate_allowed(token) && atomic_load_explicit(&gpu_token,memory_order_acquire)==token &&
+        atomic_load_explicit(&mitigation_state,memory_order_acquire)==mitigation;
+}
 static void log_skip(void)
 {
     uint64_t n=atomic_fetch_add_explicit(&skipped,1,memory_order_relaxed)+1;
     if (n<=4 || !(n&(n-1)))
-        fprintf(stderr,"[3d] shared-init: lifecycle skip, original result preserved (count=%llu)\n",(unsigned long long)n);
+        fprintf(stderr,"[3d] shared-init: work gate changed, original result preserved (count=%llu)\n",(unsigned long long)n);
+}
+static void invalid_skip(unsigned which)
+{
+    atomic_fetch_add_explicit(&skipped,1,memory_order_relaxed);
+    if (!atomic_fetch_add_explicit(&invalid_skips[which],1,memory_order_relaxed))
+        fprintf(stderr,"[3d] shared-init: %s; original result preserved, no extra native call\n",
+            which?"missing initializer event":"unexpected device/container/queue layout");
 }
 static bool affected(const void *desc)
 {
@@ -181,90 +202,86 @@ static bool affected(const void *desc)
 static int32_t finish_create(void *device,const void *desc,void **out,int32_t hr)
 {
     if (hr<0 || !out || !*out || !affected(desc)) return hr;
+    uint64_t mitigation=atomic_load_explicit(&mitigation_state,memory_order_acquire);
+    if (mitigation&1) {atomic_fetch_add_explicit(&skipped,1,memory_order_relaxed);return hr;}
     uint64_t token=atomic_load_explicit(&gpu_token,memory_order_acquire);
-    if (!gate_allowed(token)) {log_skip(); return hr;}
+    if (!gate_allowed(token)) {log_skip();return hr;}
     uintptr_t base=atomic_load_explicit(&shared_image,memory_order_acquire);
-    uintptr_t table,container,queue;
+    uintptr_t table=0,container=0,queue=0;
+    if (!base || !shared_readable((uintptr_t)device,0x30)) {invalid_skip(0);return hr;}
     memcpy(&table,device,8);
+    if (table!=base+HV_SHARED_VTABLE) {invalid_skip(0);return hr;}
     memcpy(&container,(const uint8_t *)device+0x28,8);
-    bool valid=base && table==base+HV_SHARED_VTABLE && container;
-    queue=0;
-    if (valid) memcpy(&queue,(const uint8_t *)container+0x40,8);
-    valid=valid && queue && !(queue&7);
-    uint64_t start=now_ns(),goal=0,value=0;
+    if (!container || (container&7) || !shared_readable(container,0x48)) {invalid_skip(0);return hr;}
+    memcpy(&table,(const void *)container,8);
+    if (table!=base+HV_SHARED_CONTAINER_VTABLE) {invalid_skip(0);return hr;}
+    /* Verify the container before reading its queue pointer. An unexpected
+     * layout never authorizes a native call, including AddRef. */
+    memcpy(&queue,(const void *)(container+0x40),8);
+    if (!queue || (queue&7) || queue>UINTPTR_MAX-0x10030 ||
+        !shared_readable(queue+0x10028,8)) {invalid_skip(0);return hr;}
     void *event=NULL;
-    const char *failure="unexpected device layout";
-    if (valid) {
-        memcpy(&event,(const void *)(queue+0x10028),8);
-        if (!gate_matches(token)) {log_skip(); return hr;}
-        /* Only upload/zero initialization. Never commit/wait the main queue:
-         * it may be waiting for this resource on a different device. */
-        uint64_t call=atomic_fetch_add_explicit(&flushes,1,memory_order_relaxed)+1;
-        fprintf(stderr,"[3d] shared-init: initializer flush begin call=%llu\n",(unsigned long long)call);
-        /* Metal commandBuffer allocation inside flush can block. The 2 second
-         * bound below applies only to polling AFTER this call returns. */
-        if (!gate_matches(token)) {log_skip(); return hr;}
-        flush_stage(1);
-        goal=shared_calls.flush((void *)(queue+0x10008));
-        flush_stage(0);
-        uint64_t flush_end=now_ns();
-        fprintf(stderr,"[3d] shared-init: initializer flush returned call=%llu goal=%llu flush_ms=%llu\n",
-            (unsigned long long)call,(unsigned long long)goal,
-            (unsigned long long)(flush_end>=start?(flush_end-start)/1000000:0));
-        start=flush_end;
-        failure="initializer event timeout";
-        if (!goal) return hr;
-        atomic_fetch_add_explicit(&active_poll,1,memory_order_relaxed);
-        for (;;) {
-            if (!gate_matches(token)) {
-                atomic_fetch_sub_explicit(&active_poll,1,memory_order_relaxed);
-                log_skip(); return hr;
-            }
-            struct {void *event; uint64_t value;} args={event,0};
-            if (!event || shared_calls.event_value(&args)) {
-                failure="initializer event unavailable"; break;
-            }
-            value=args.value;
-            if (value>=goal) {
-                atomic_fetch_sub_explicit(&active_poll,1,memory_order_relaxed);
-                uint64_t elapsed=now_ns()-start;
-                uint64_t n=atomic_fetch_add_explicit(&waits,1,memory_order_relaxed)+1;
-                if (n<=4 || elapsed>=UINT64_C(50000000))
-                    fprintf(stderr,"[3d] shared-init: ready goal=%llu value=%llu wait_ms=%llu count=%llu\n",
-                        (unsigned long long)goal,(unsigned long long)value,
-                        (unsigned long long)(elapsed/1000000),(unsigned long long)n);
-                return hr;
-            }
-            uint64_t now=now_ns();
-            if (!start || !now || now-start>=UINT64_C(2000000000)) break;
-            pause_poll();
+    memcpy(&event,(const void *)(queue+0x10028),8);
+    if (!event) {invalid_skip(1);return hr;}
+    if (!gate_matches(token,mitigation)) {log_skip();return hr;}
+    /* Only upload/zero initialization. Never commit/wait the main queue:
+     * it may be waiting for this resource on a different device. */
+    uint64_t start=now_ns(),value=0;
+    uint64_t call=atomic_fetch_add_explicit(&flushes,1,memory_order_relaxed)+1;
+    fprintf(stderr,"[3d] shared-init: initializer flush begin call=%llu\n",(unsigned long long)call);
+    /* Metal commandBuffer allocation inside flush can block. The 2 second
+     * bound below applies only to polling AFTER this call returns. */
+    if (!gate_matches(token,mitigation)) {log_skip();return hr;}
+    flush_stage(1);
+    uint64_t goal=shared_calls.flush((void *)(queue+0x10008));
+    flush_stage(0);
+    uint64_t flush_end=now_ns();
+    fprintf(stderr,"[3d] shared-init: initializer flush returned call=%llu goal=%llu flush_ms=%llu\n",
+        (unsigned long long)call,(unsigned long long)goal,
+        (unsigned long long)(flush_end>=start?(flush_end-start)/1000000:0));
+    start=flush_end;
+    if (!goal) return hr;
+    const char *failure="initializer event timeout";
+    atomic_fetch_add_explicit(&active_poll,1,memory_order_relaxed);
+    for (;;) {
+        if (!gate_matches(token,mitigation)) {
+            atomic_fetch_sub_explicit(&active_poll,1,memory_order_relaxed);
+            log_skip();return hr;
         }
-        atomic_fetch_sub_explicit(&active_poll,1,memory_order_relaxed);
+        struct {void *event; uint64_t value;} args={event,0};
+        if (shared_calls.event_value(&args)) {failure="initializer event unavailable";break;}
+        value=args.value;
+        if (value>=goal) {
+            atomic_fetch_sub_explicit(&active_poll,1,memory_order_relaxed);
+            uint64_t elapsed=now_ns()-start;
+            uint64_t n=atomic_fetch_add_explicit(&waits,1,memory_order_relaxed)+1;
+            if (n<=4 || elapsed>=UINT64_C(50000000))
+                fprintf(stderr,"[3d] shared-init: ready goal=%llu value=%llu wait_ms=%llu count=%llu\n",
+                    (unsigned long long)goal,(unsigned long long)value,
+                    (unsigned long long)(elapsed/1000000),(unsigned long long)n);
+            return hr;
+        }
+        uint64_t now=now_ns();
+        if (!start || !now || now-start>=UINT64_C(2000000000)) break;
+        pause_poll();
     }
-    if (!gate_matches(token)) {log_skip(); return hr;}
-    /* No unfinished mapping or device/initializer may be destroyed on failure.
-     * Keep the creation reference and pin its live caller device permanently.
-     * The caller never receives this resource. This exceptional quarantine is
-     * counted/logged; it is not a successful initialization or recovery. */
-    atomic_store_explicit(&foreground_failed,true,memory_order_release);
-    shared_calls.addref(device);
-    *out=NULL;
-    uint64_t n=atomic_fetch_add_explicit(&quarantined,1,memory_order_relaxed)+1;
-    fprintf(stderr,"[3d] shared-init: %s goal=%llu value=%llu; texture+device quarantined count=%llu\n",
-        failure,(unsigned long long)goal,(unsigned long long)value,(unsigned long long)n);
-    return (int32_t)0x80004005u;
+    atomic_fetch_sub_explicit(&active_poll,1,memory_order_relaxed);
+    if (!gate_matches(token,mitigation)) {log_skip();return hr;}
+    /* Preserve exactly the original successful resource/reference. Disable
+     * additional flush/wait work for this epoch; never fail a guest creation
+     * or add a retained reference because this optional mitigation timed out. */
+    uint64_t expected=mitigation;
+    if (atomic_compare_exchange_strong_explicit(&mitigation_state,&expected,mitigation|1,
+        memory_order_acq_rel,memory_order_acquire)) {
+        uint64_t n=atomic_fetch_add_explicit(&failures,1,memory_order_relaxed)+1;
+        fprintf(stderr,"[3d] shared-init: %s goal=%llu value=%llu; mitigation disabled until reset, original result preserved count=%llu\n",
+            failure,(unsigned long long)goal,(unsigned long long)value,(unsigned long long)n);
+    }
+    return hr;
 }
 static int32_t create_common(size_t which,void *device,const void *desc,const void *data,void **out)
 {
     (void)atomic_load_explicit(&shared_image,memory_order_acquire);
-    /* Following a foreground failure, do not create more unpublished resources.
-     * Calls already in flight may each quarantine once. Background policy still
-     * preserves original behavior and does not attempt any additional flush. */
-    if (gate_allowed(atomic_load_explicit(&gpu_token,memory_order_acquire)) && affected(desc) &&
-        atomic_load_explicit(&foreground_failed,memory_order_acquire)) {
-        if (out) *out=NULL;
-        return (int32_t)0x80004005u;
-    }
     void *local=NULL;
     if (out) *out=NULL;
     int32_t hr=shared_calls.create[which](device,desc,data,out?&local:NULL);
@@ -305,7 +322,6 @@ static int install_shared_image(uintptr_t base)
     for (size_t i=0;i<2;++i) shared_calls.create[i]=(void *)(base+hv_shared_targets[i]);
     shared_calls.flush=(void *)(base+HV_SHARED_FLUSH);
     shared_calls.event_value=(void *)(base+HV_SHARED_EVENT);
-    shared_calls.addref=(void *)(base+HV_SHARED_ADDREF);
     atomic_store_explicit(&shared_image,base,memory_order_release);
     size_t bound=0;
     for (;bound<2;++bound) {

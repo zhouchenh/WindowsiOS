@@ -69,7 +69,10 @@ class Guards(unittest.TestCase):
                             str(ROOT/'tests/test_dxmt_shared_init.c'), str(ROOT/'devices/dxmt_data_lock.c'), '-o', str(exe)], check=True)
             for case in ('guards', 'install', 'interposed', 'protect-fail', 'rollback',
                          'fatal', 'race', 'disabled', 'ready', 'not-shared', 'background',
-                         'gates', 'midwait', 'timeout', 'event-error', 'original-error', 'concurrent'):
+                         'gates', 'midwait', 'timeout', 'event-error', 'original-error', 'concurrent', 'reset-event', 'reset-flush',
+                         'invalid-device', 'invalid-container-null', 'invalid-container-vtable',
+                         'invalid-container-unmapped', 'invalid-queue-null', 'invalid-queue-unaligned',
+                         'invalid-queue-unmapped', 'null-event'):
                 with self.subTest(case=case):
                     subprocess.run([str(exe), case], check=True, capture_output=True, text=True)
 

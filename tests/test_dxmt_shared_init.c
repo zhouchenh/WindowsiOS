@@ -20,7 +20,7 @@ static int test_sleep(const struct timespec *,struct timespec *);
 static int protects,fail_at,fail_again;
 static uintptr_t *race;
 static _Atomic uint64_t ticks;
-static _Atomic unsigned creates,polls,flushed,pinned;
+static _Atomic unsigned creates,polls,flushed;
 static unsigned mode;
 static uint8_t dev[0x30],container[0x48],queue[0x10030];
 static uint32_t desc[12];
@@ -91,7 +91,7 @@ static uint64_t fake_flush(void *p)
     assert(p==queue+0x10008 && caller_output && !*caller_output);
     char status[512];hv_dxmt_shared_init_describe(status,sizeof(status));
     assert(strstr(status,"flush_active=") && !strstr(status,"flush_active=0"));
-    atomic_fetch_add(&flushed,1);return 7;
+    atomic_fetch_add(&flushed,1);if(mode==9)hv_dxmt_shared_init_reset();return 7;
 }
 static int32_t fake_event(void *p)
 {
@@ -105,6 +105,7 @@ static int32_t fake_event(void *p)
         hv_dxmt_shared_init_set_gpu_allowed(1); /* Must detect a complete transition. */
     }
     if(mode==4)return -1;
+    if(mode==8){hv_dxmt_shared_init_reset();return -1;}
     if(mode==7)hv_dxmt_shared_init_set_gpu_allowed(1);
     if(mode==6) {
         pthread_mutex_lock(&event_mutex);++event_arrived;pthread_cond_broadcast(&event_cond);
@@ -113,15 +114,14 @@ static int32_t fake_event(void *p)
     }
     a->value=(mode==3 || mode==2 || n==1)?6:7;return 0;
 }
-static uint32_t fake_addref(void *d)
-{assert(d==dev);atomic_fetch_add(&pinned,1);return 2;}
 static void runtime_setup(void)
 {
     uintptr_t base=0x10000000,table=base+HV_SHARED_VTABLE,p=(uintptr_t)container;
     memcpy(dev,&table,8);memcpy(dev+0x28,&p,8);p=(uintptr_t)queue;memcpy(container+0x40,&p,8);
+    table=base+HV_SHARED_CONTAINER_VTABLE;memcpy(container,&table,8);
     p=99;memcpy(queue+0x10028,&p,8);atomic_store(&shared_image,base);
     shared_calls.create[0]=fake_create;shared_calls.create[1]=fake_create;
-    shared_calls.flush=fake_flush;shared_calls.event_value=fake_event;shared_calls.addref=fake_addref;
+    shared_calls.flush=fake_flush;shared_calls.event_value=fake_event;
     desc[7]=0;desc[10]=2;hv_dxmt_shared_init_set_gpu_allowed(1);
 }
 static void *concurrent_create(void *which)
@@ -169,8 +169,31 @@ int main(int argc,char **argv)
         assert(create_2d(dev,desc,(void *)88,&out)==0 && out==result_marker && !atomic_load(&flushed));
         hv_dxmt_shared_init_set_gpu_allowed(0);hv_dxmt_shared_init_set_draining(0);
         assert(!gate_allowed(atomic_load(&gpu_token)));
+        hv_dxmt_shared_init_set_presenter_paused(1);
+        hv_dxmt_shared_init_set_gpu_allowed(1);assert(!gate_allowed(atomic_load(&gpu_token)));
+        assert(create_2d(dev,desc,(void *)88,&out)==0 && out==result_marker && !atomic_load(&flushed));
+        hv_dxmt_shared_init_set_gpu_allowed(0);hv_dxmt_shared_init_set_presenter_paused(0);
+        assert(!gate_allowed(atomic_load(&gpu_token)));
+        uint64_t gate=atomic_load(&gpu_token);atomic_store(&mitigation_state,1);
+        hv_dxmt_shared_init_reset();assert(atomic_load(&gpu_token)==gate && atomic_load(&mitigation_state)==2);
         hv_dxmt_shared_init_set_gpu_allowed(1);assert(gate_allowed(atomic_load(&gpu_token)));
         mode=7;assert(create_2d1(dev,desc,(void *)88,&out)==0 && atomic_load(&polls)==2);
+        return 0;
+    }
+    if(!strncmp(c,"invalid-",8) || !strcmp(c,"null-event")) {
+        uintptr_t bad=0;unsigned kind=0;
+        if(!strcmp(c,"invalid-device"))memcpy(dev,&bad,8);
+        else if(!strcmp(c,"invalid-container-null"))memcpy(dev+0x28,&bad,8);
+        else if(!strcmp(c,"invalid-container-vtable"))memcpy(container,&bad,8);
+        else if(!strcmp(c,"invalid-container-unmapped")){bad=1;memcpy(dev+0x28,&bad,8);}
+        else if(!strcmp(c,"invalid-queue-null"))memcpy(container+0x40,&bad,8);
+        else if(!strcmp(c,"invalid-queue-unaligned")){bad=1;memcpy(container+0x40,&bad,8);}
+        else if(!strcmp(c,"invalid-queue-unmapped")){bad=8;memcpy(container+0x40,&bad,8);}
+        else {assert(!strcmp(c,"null-event"));memcpy(queue+0x10028,&bad,8);kind=1;}
+        assert(create_2d(dev,desc,(void *)88,&out)==0 && out==result_marker);
+        assert(create_2d1(dev,desc,(void *)88,&out)==0 && out==result_marker);
+        assert(atomic_load(&creates)==2 && !atomic_load(&flushed) && !atomic_load(&polls));
+        assert(atomic_load(&invalid_skips[kind])==2 && atomic_load(&skipped)==2 && !atomic_load(&mitigation_state));
         return 0;
     }
     if(!strcmp(c,"not-shared"))desc[10]=0;
@@ -180,25 +203,36 @@ int main(int argc,char **argv)
     else if(!strcmp(c,"event-error"))mode=4;
     else if(!strcmp(c,"original-error"))mode=5;
     else if(!strcmp(c,"concurrent"))mode=6;
+    else if(!strcmp(c,"reset-event"))mode=8;
+    else if(!strcmp(c,"reset-flush"))mode=9;
     else assert(!strcmp(c,"ready"));
     if(mode==6) {
         pthread_t a,b;assert(!pthread_create(&a,NULL,concurrent_create,(void *)0));
         assert(!pthread_create(&b,NULL,concurrent_create,(void *)1));
         assert(!pthread_join(a,NULL) && !pthread_join(b,NULL));
-        assert(atomic_load(&creates)==2 && atomic_load(&flushed)==2 && !atomic_load(&pinned));return 0;
+        assert(atomic_load(&creates)==2 && atomic_load(&flushed)==2);return 0;
     }
     int32_t hr=create_2d(dev,desc,(void *)88,&out);
     assert(!active_flush && !atomic_load(&active_poll));
     if(mode==3 || mode==4) {
-        assert(hr==(int32_t)0x80004005u && !out && atomic_load(&pinned)==1);
-        assert(atomic_load(&foreground_failed));
-        assert(create_2d1(dev,desc,(void *)88,&out)==hr && !out && atomic_load(&creates)==1);
-        hv_dxmt_shared_init_set_gpu_allowed(0);
+        assert(hr==0 && out==result_marker && atomic_load(&failures)==1);
+        assert(atomic_load(&mitigation_state)&1);
+        unsigned previous_polls=atomic_load(&polls);
+        assert(create_2d1(dev,desc,(void *)88,&out)==hr && out==result_marker && atomic_load(&creates)==2);
+        assert(atomic_load(&flushed)==1 && atomic_load(&polls)==previous_polls);
+        hv_dxmt_shared_init_reset();assert(!(atomic_load(&mitigation_state)&1));
+        mode=0;
         assert(create_2d1(dev,desc,(void *)88,&out)==0 && out==result_marker);
-        assert(atomic_load(&creates)==2 && atomic_load(&pinned)==1);
+        assert(atomic_load(&creates)==3 && atomic_load(&flushed)==2 && atomic_load(&waits)==1);
     } else if(mode==5)assert(hr==-123 && !out && !atomic_load(&flushed));
     else {
-        assert(hr==0 && out==result_marker && !atomic_load(&pinned) && !atomic_load(&foreground_failed));
+        assert(hr==0 && out==result_marker && !(atomic_load(&mitigation_state)&1));
+        if(mode==8 || mode==9) {
+            assert(atomic_load(&mitigation_state)==2 && !atomic_load(&failures));
+            assert(atomic_load(&polls)==(mode==8?1u:0u));
+            mode=0;assert(create_2d1(dev,desc,(void *)88,&out)==0 && out==result_marker);
+            assert(atomic_load(&flushed)==2 && atomic_load(&waits)==1);
+        }
         if(mode==2)assert(atomic_load(&polls)==1 && atomic_load(&skipped)==1);
         if(!strcmp(c,"not-shared") || !strcmp(c,"background"))assert(!atomic_load(&flushed));
         if(!strcmp(c,"ready"))assert(atomic_load(&polls)==2 && atomic_load(&waits)==1);

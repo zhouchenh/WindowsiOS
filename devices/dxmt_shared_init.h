@@ -12,10 +12,15 @@ const char *hv_dxmt_shared_init_status(void);
  * age. Safe while backend calls stall; its brief statistics mutex never spans a
  * backend call. Suitable for the host 3D status/memory census. */
 void hv_dxmt_shared_init_describe(char *buffer,size_t length);
-/* Initially allowed and not draining, matching the foreground host defaults.
- * GPU permission and drain are independent; either can disallow extra work.
+/* Initially allowed, presenter unpaused, not draining (foreground defaults).
+ * App permission, presenter pause and drain are independent disallow sources.
  * False or a transition during a wait preserves the original successful resource
  * return, abandoning this diagnostic mitigation rather than starting more work. */
 void hv_dxmt_shared_init_set_gpu_allowed(int allowed);
 void hv_dxmt_shared_init_set_draining(int draining);
+void hv_dxmt_shared_init_set_presenter_paused(int paused);
+/* Renderer reset/VM exit clears only mitigation-disable state, not lifecycle
+ * gates or cumulative counters. Old in-flight calls cannot relatch a new epoch.
+ * Timeout/error always preserves the original successful resource/reference. */
+void hv_dxmt_shared_init_reset(void);
 #endif
