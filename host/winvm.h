@@ -55,6 +55,16 @@ void hv_winvm_key_linux(uint16_t code, int down);
 /* Normalized tablet pointer: x_norm, y_norm in [0.0, 1.0] mapped to 0..32767;
  * buttons: bit0=Left, bit1=Right, bit2=Middle; wheel: -127..127. */
 void hv_winvm_tablet(double x_norm, double y_norm, uint8_t buttons, int8_t wheel);
+/* One touch screen frame (the xHCI's port 3): every contact on the screen; one lifting is in it once
+ * more with tip 0 (and confidence 0 to cancel it rather than end it as a tap). x_norm, y_norm in
+ * [0.0, 1.0] across the Windows screen, clamped. */
+typedef struct HvWinvmTouch {
+    uint8_t id, tip, confidence;
+    double x_norm, y_norm;
+} HvWinvmTouch;
+void hv_winvm_touch(const HvWinvmTouch *contacts, int n);
+/* 1 while the guest reads the touch screen (Windows has its HID touch driver running on it). */
+int hv_winvm_touch_ready(void);
 void hv_winvm_send_ctrl_alt_del(void);
 void hv_winvm_usb_stats(int *kbd_ready, int *tab_ready, uint64_t *delivered);
 void hv_winvm_engine_stats(uint64_t *jit_used_bytes, uint64_t *jit_cap_bytes,

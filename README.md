@@ -217,7 +217,7 @@ Windows 11 24H2 refuses FDT/DeviceTree boot and demands a compliant ServerReady/
 - **NVMe 1.4 + `USBXHCI.SYS`-Compliant USB 3.0 xHCI + WHQL `virtio-net` ([`devices/nvme.c`](devices/nvme.c), [`devices/xhci.c`](devices/xhci.c), [`devices/virtio_net.c`](devices/virtio_net.c)):**
   - PCIe endpoints advertise **Root Complex Integrated Endpoint (`0x0092`)** capabilities so `pci.sys` accepts bus-0 devices without root ports.
   - `nvme.c` implements admin/I/O queues, PRP lists, MSI-X, serial `WIN11IOS01`, and deferred flush synchronization (`hv_disk_sync()`) so NTFS metadata bursts don't stall iOS flash storage.
-  - `xhci.c` implements **Event Data TRB (`ED = 1`) cumulative transfer-length tracking (`EDTLA`)** and `CC_STALL` endpoint-halt recovery strictly required by Windows's `USBXHCI.SYS`, exposing Port 1 Boot Keyboard (`0627:0002`) and Port 2 Absolute Touch/Trackpad Tablet (`0627:0001`).
+  - `xhci.c` implements **Event Data TRB (`ED = 1`) cumulative transfer-length tracking (`EDTLA`)** and `CC_STALL` endpoint-halt recovery strictly required by Windows's `USBXHCI.SYS`, exposing Port 1 Boot Keyboard (`0627:0002`), Port 2 Absolute Touch/Trackpad Tablet (`0627:0001`) and Port 3 HID multi-touch Touch Screen (`0627:0003`, 10 contacts, driven by Windows' inbox touch driver; the app's Multi-touch mode).
 
 ### 5. From-Scratch PCIe Intel ICH6 Full-Duplex HD Audio ([`devices/hda.c`](devices/hda.c), [`host/audio_mac.c`](host/audio_mac.c))
 - Red Hat's `virtio-win` suite has **no** Windows `virtio-snd` driver. To achieve zero-driver-install plug-and-play audio in Windows 11 ARM64, we built a complete **Intel ICH6 High Definition Audio PCIe controller (`8086:2668`, `PCI\CC_0403`)** from scratch in `devices/hda.c` paired with a 6-node Full-Duplex HDA Codec (`1af4:0022`):
@@ -259,7 +259,7 @@ Windows 11 24H2 refuses FDT/DeviceTree boot and demands a compliant ServerReady/
 - `00:00.0` — Red Hat GPEX Host Bridge (`1b36:0008`)
 - `00:01.0` — VirtIO Network Adapter (`1af4:1000`, WHQL `NetKVM` over `libslirp` NAT + `/.henge/` WebDAV/OAuth)
 - `00:02.0` — NVMe 1.4 Controller (`1b36:0010`, Serial `WIN11IOS01`, MSI-X + `hvsparse` backing)
-- `00:03.0` — USB 3.0 xHCI Host Controller (`1b36:000d`, Port 1 HID Boot Keyboard + Port 2 Absolute Tablet)
+- `00:03.0` — USB 3.0 xHCI Host Controller (`1b36:000d`, Port 1 HID Boot Keyboard + Port 2 Absolute Tablet + Port 3 HID Touch Screen)
 - `00:04.0` — Intel ICH6 High Definition Audio (`8086:2668`, Codec `1af4:0022` Stereo Speaker Out + Stereo Mic In)
 
 ---

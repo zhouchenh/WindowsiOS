@@ -531,8 +531,10 @@ struct SessionToolbarItems {
         if !compact {
             SoundMenu()
         }
-        Button(vm.directTouch ? L("直接触摸", "Direct touch") : L("触控板", "Trackpad"),
-               systemImage: vm.directTouch ? "hand.point.up.left.fill" : "rectangle.and.hand.point.up.left") {
+        // Trackpad, or the touch mode picked in Settings (Direct touch or Multi-touch)
+        Button(!vm.directTouch ? L("触控板", "Trackpad") : vm.multiTouch ? L("多点触控", "Multi-touch") : L("直接触摸", "Direct touch"),
+               systemImage: !vm.directTouch ? "rectangle.and.hand.point.up.left"
+                   : vm.multiTouch ? "hand.draw.fill" : "hand.point.up.left.fill") {
             UIImpactFeedbackGenerator(style: .light).impactOccurred()
             vm.directTouch.toggle()
         }

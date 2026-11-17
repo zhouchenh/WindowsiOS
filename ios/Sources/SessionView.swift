@@ -167,6 +167,7 @@ struct SessionView: View {
 
             MetalDisplayView(
                 directTouch: laptop ? .constant(true) : $vm.directTouch, // the deck has the trackpad
+                multiTouch: vm.multiTouch,
                 keyboardVisible: laptop ? .constant(false) : $vm.systemKeyboardVisible,
                 hardwareKeyboard: vm.hardwareKeyboard,
                 focusAllowed: vm.isVMRunning && !vm.showSettings && vm.activeSafariURL == nil,
@@ -773,19 +774,32 @@ private struct SettingsSheet: View {
     private var inputPage: some View {
         Form {
             Section {
-                Picker(L("触摸屏幕时", "Touching the screen"), selection: $vm.directTouch) {
-                    Text(L("触控板", "Trackpad")).tag(false)
-                    Text(L("直接触摸", "Direct touch")).tag(true)
+                Picker(L("触摸屏幕时", "Touching the screen"), selection: $vm.touchMode) {
+                    Text(L("触控板", "Trackpad")).tag(TouchMode.trackpad)
+                    Text(L("直接触摸", "Direct touch")).tag(TouchMode.direct)
+                    Text(L("多点触控", "Multi-touch")).tag(TouchMode.multiTouch)
                 }
                 .pickerStyle(.segmented)
+                if vm.touchMode == .multiTouch && vm.isVMRunning && !vm.usbTouchReady {
+                    Label(L("Windows 的触摸屏还没就绪：先按直接触摸工作", "Windows' touch screen is not ready yet: works as Direct touch for now"),
+                          systemImage: "hourglass")
+                        .font(.footnote)
+                        .foregroundStyle(.secondary)
+                }
             } header: {
                 Text(L("触控", "Touch"))
             } footer: {
-                Text(vm.directTouch
-                    ? L("轻点 = 在手指位置左键 · 双指轻点或长按 = 右键 · 单指拖动 = 拖拽 · 双指滑动 = 滚动 · 四指（或三指）轻点 = 显示/隐藏控制按钮",
-                        "Tap = left click where you touch · Two-finger tap or long press = right click · Drag = drag · Two-finger slide = scroll · Four-finger (or three-finger) tap = show or hide the controls")
-                    : L("单指滑动 = 移动光标 · 单指轻点 = 左键 · 双指轻点 = 右键 · 双指滑动 = 滚动 · 轻点后立刻按住拖动（或长按后拖动）= 拖拽 · 四指（或三指）轻点 = 显示/隐藏控制按钮",
-                        "Slide = move pointer · Tap = left click · Two-finger tap = right click · Two-finger slide = scroll · Tap then hold and move (or long press, then move) = drag · Four-finger (or three-finger) tap = show or hide the controls"))
+                switch vm.touchMode {
+                case .multiTouch:
+                    Text(L("手指直接作为触摸交给 Windows（Windows 自带的触摸屏驱动，无需安装）：轻点、长按 = 右键、双指缩放、拖动滚动、Windows 的边缘和多指手势都由 Windows 处理。四指轻点 = 显示/隐藏控制按钮；沉浸全屏时从左右边缘向内轻扫也是。画面放大时三指拖动画面、三指轻点显示控制按钮。Windows 刚启动、还没认出触摸屏时，按直接触摸工作。",
+                           "Your fingers go to Windows as touches (Windows' own touch screen driver, nothing to install): Windows handles taps, press and hold = right click, pinch, drag to scroll, and its edge and multi-finger gestures. Four-finger tap = show or hide the controls; in immersive, so does a swipe in from the left or right edge. While the picture is zoomed, three fingers drag it and a three-finger tap shows the controls. Until Windows has started its touch screen (while it starts up), it works as Direct touch."))
+                case .direct:
+                    Text(L("轻点 = 在手指位置左键 · 双指轻点或长按 = 右键 · 单指拖动 = 拖拽 · 双指滑动 = 滚动 · 四指（或三指）轻点 = 显示/隐藏控制按钮",
+                           "Tap = left click where you touch · Two-finger tap or long press = right click · Drag = drag · Two-finger slide = scroll · Four-finger (or three-finger) tap = show or hide the controls"))
+                case .trackpad:
+                    Text(L("单指滑动 = 移动光标 · 单指轻点 = 左键 · 双指轻点 = 右键 · 双指滑动 = 滚动 · 轻点后立刻按住拖动（或长按后拖动）= 拖拽 · 四指（或三指）轻点 = 显示/隐藏控制按钮",
+                           "Slide = move pointer · Tap = left click · Two-finger tap = right click · Two-finger slide = scroll · Tap then hold and move (or long press, then move) = drag · Four-finger (or three-finger) tap = show or hide the controls"))
+                }
             }
 
             Section {

@@ -177,10 +177,15 @@ final class ChromeWindowGestures: NSObject, UIGestureRecognizerDelegate {
         edgePans = []
     }
 
+    /// The edge swipes are on now. Multi-touch holds a finger that lands at the left or right edge back from
+    /// Windows while they are (TouchscreenInput.swift): the swipe cancels it before Windows sees it.
+    static private(set) var edgeSwipeActive = false
+
     /// Edge swipes only while immersive: otherwise an edge drag belongs to Windows.
     func setEdgeSwipeEnabled(_ on: Bool) {
         let allowed = on && ChromeEnv.flag("HV_EDGE_SWIPE") != false
         edgePans.forEach { $0.isEnabled = allowed }
+        Self.edgeSwipeActive = allowed
     }
 
     @objc private func fourFingerTap(_ gr: UITapGestureRecognizer) {

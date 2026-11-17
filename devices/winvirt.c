@@ -192,7 +192,7 @@ int hv_winvirt_create(HvWinVirt *b, HvMachine *m, HvCpu *cpu, int ncpus, uint64_
      *    Slot 0: Host Bridge (1b36:0008)
      *    Slot 1: VirtIO-Net  (1af4:1000)
      *    Slot 2: NVMe 0      (1b36:0010, serial WIN11IOS01 -> matches UEFI Boot0001!)
-     *    Slot 3: xHCI USB 3  (1b36:000d, Port 1 Keyboard + Port 2 Absolute Tablet)
+     *    Slot 3: xHCI USB 3  (1b36:000d, Port 1 Keyboard + Port 2 Absolute Tablet + Port 3 Touch Screen)
      *    Slot 4: NVMe 1      (optional installer/secondary image)
      *    Slot 5: VirtIO-Snd  (optional audio) */
     b->pcie = hv_pcie_create(m, b->gic, WINVIRT_PCIE_ECAM_PA, WINVIRT_PCIE_ECAM_SZ,
