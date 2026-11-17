@@ -115,25 +115,31 @@ in Windows, who can connect, and on or off. Who can connect:
 | Scope | Listens on | Who reaches it |
 | --- | --- | --- |
 | This iPhone only | `127.0.0.1` and `[::1]` | apps on the iPhone (a Remote Desktop app connecting to `localhost`, Safari for OAuth redirects) |
-| Local network | the addresses of the Wi-Fi, wired and Personal Hotspot interfaces (`en…`, `bridge…`; IPv4, and IPv6 unique local `fc00::/7` only), followed as they change, plus `127.0.0.1` and `[::1]` | devices on the same Wi-Fi or wired network and on the iPhone's Personal Hotspot; not cellular (`pdp_ip…`), and not a global IPv6 address the internet may reach (`HV_NET_LAN_GLOBAL6=1` adds those) |
-| VPN | the address of the active VPN interface (`utun…`, `wg…`, `tun…`, `ppp…`, `ipsec…`, in that order of preference; one with an IPv4 address, or a unique local IPv6 address `fc00::/7`) | devices on the VPN (WireGuard and similar) |
+| Local network | the addresses of the Wi-Fi, wired and Personal Hotspot interfaces (`en…`, `bridge…`): IPv4, IPv6 unique local (`fc00::/7`) and IPv6 global, never link-local; followed as they change, plus `127.0.0.1` and `[::1]` | devices on the same Wi-Fi or wired network and on the iPhone's Personal Hotspot, over IPv4 and IPv6; not cellular (`pdp_ip…`). A global IPv6 address may be reachable from the internet where the router lets incoming IPv6 through: each forward has an **IPv6 global addresses** choice (on by default; `"ipv6Global": false` in the file), and `HV_NET_LAN_GLOBAL6=0` leaves them out of every forward |
+| VPN | every usable address of the active VPN interface (`utun…`, `wg…`, `tun…`, `ppp…`, `ipsec…`, in that order of preference): its IPv4 addresses and its IPv6 ones, unique local and global, never link-local | devices on the VPN (WireGuard and similar), over IPv4 and IPv6 |
 
 - **IPv4** is libslirp's own host forward (`slirp_add_hostfwd` / `slirp_remove_hostfwd`). The guest
   sees loopback clients as `10.0.2.2` and other clients with their own address.
 - **IPv6**: libslirp cannot take an IPv6 connection to the guest's IPv4 address, so a small relay of
   the app's own listens on `[::1]`, the local network's IPv6 addresses or the VPN's and hands each TCP connection,
   and each UDP peer's datagrams (one IPv4 socket per peer, idle peers dropped after 2 minutes), to the
-  IPv4 listener. Those clients appear in the guest as `10.0.2.2`. If only the IPv6 side cannot be
-  opened, the forward still listens on IPv4 and shows the reason as a warning.
+  IPv4 listener (the VPN's IPv4 address, or `127.0.0.1` for a VPN without IPv4). Those clients appear in the
+  guest as `10.0.2.2`. At most 8 addresses of each family per forward.
+- **Each family on its own**: the list shows every address a forward listens on, and for IPv4 and IPv6
+  separately whether it listens, failed (with the reason), or has no address of its own right now (`none`: "the
+  VPN has no IPv6 address", "no IPv6 address on the local network"; loopback still listens). An IPv6 address that
+  cannot be opened leaves the others and IPv4 open; IPv4 failing closes the forward (the relays need its listener).
 - Forwards always reach the guest's IPv4 address, with `HV_IPV6` on or off: a guest service has to
   listen on IPv4 (`0.0.0.0`, or a dual-stack `[::]` socket, as most Windows services do). libslirp
   could forward to the guest's IPv6 address (`slirp_add_hostxfwd`), but Windows picks that address
   itself (random interface IDs, temporary addresses), so this is left out.
-- **The VPN's address** is the VPN interface that is up with an IPv4 address that is not
-  link-local, else one with a unique local IPv6 address (`fc00::/7`), preferring `utun`, `wg`,
-  `tun`, `ppp`, then `ipsec`. iOS's own `utun` interfaces only have link-local IPv6 addresses, and
-  the carrier's tunnels for Wi-Fi Calling and VoLTE (`ipsec…` with a global IPv6 address from the
-  carrier and no IPv4) are no VPN the user connected: both are passed over. It is looked up again every 3 seconds while a VPN forward exists,
+- **The VPN** is the VPN interface that is up with an IPv4 address that is not link-local, else one
+  with a unique local IPv6 address (`fc00::/7`), else a `utun`, `wg`, `tun` or `ppp` one with a global
+  IPv6 address, preferring `utun`, `wg`, `tun`, `ppp`, then `ipsec`; the forward listens on all of its
+  usable addresses (so a WireGuard VPN that gives the iPhone a global IPv6 address is reachable over IPv6
+  too). iOS's own `utun` interfaces only have link-local IPv6 addresses, and the carrier's tunnels for
+  Wi-Fi Calling and VoLTE (`ipsec…` with a global IPv6 address from the carrier and no IPv4) are no VPN
+  the user connected: both are passed over. It is looked up again every 3 seconds while a VPN forward exists,
   and when the app's network monitor sees a change; a forward with no VPN connected waits ("no VPN")
   and opens when one comes. This works with VPNs that hand packets to iOS (the WireGuard app); a VPN
   app that runs its own network stack in user space never delivers incoming connections to other
@@ -143,9 +149,11 @@ in Windows, who can connect, and on or off. Who can connect:
   opening anything, so an edited forward never finds its own old listener in the way. A port another
   app holds is reported per forward (`in_use`; also `denied`, `no_address`, `no_vpn`) and tried again
   every 3 seconds. Two enabled forwards cannot share a port and protocol: the second is refused.
-- **Foreground only.** iOS suspends the app in the background (Windows pauses with it), so nothing
-  answers then. iOS may also take a suspended app's listening sockets away: the app opens every
-  forward again when it returns to the foreground (`hv_net_fwd_reopen`).
+- **Foreground only, unless Server mode.** Without it, iOS suspends the app in the background and
+  Windows pauses with it, so nothing answers then. With **Server mode** (below) and no host 3D, Windows
+  keeps running in the background and the forwards keep answering. iOS may take a suspended app's
+  listening sockets away: the app opens every forward again when it returns to the foreground
+  (`hv_net_fwd_reopen`).
 - **Local Network permission.** Listening on the local network is what iOS's *Local Network* privacy
   covers. The app declares `NSLocalNetworkUsageDescription`; when a local network forward is on, the
   settings browse for a Bonjour type of the app's own (`_applevm._tcp`, never advertised) to bring up
@@ -154,8 +162,9 @@ in Windows, who can connect, and on or off. Who can connect:
 **Saved per machine.** The forwards made in the app are kept in `port_forwards.json` in the
 machine's folder (`Documents/Machines/Win11/`, or the Arch one) and opened when the machine's
 network starts. The file is JSON: `{"version": 1, "rules": [{"id", "name", "protocol": "tcp" |
-"udp" | "tcp+udp", "hostPort", "guestPort", "scope": "loopback" | "lan" | "vpn", "enabled"}]}`. A
-file that cannot be read is renamed to `port_forwards.json.bad` and the list starts empty.
+"udp" | "tcp+udp", "hostPort", "guestPort", "scope": "loopback" | "lan" | "vpn", "ipv6Global"
+(only written when false), "enabled"}]}`. A file that cannot be read is renamed to
+`port_forwards.json.bad` and the list starts empty.
 
 **Session forwards** are not saved and last until the app quits; they show up in the same list:
 
@@ -182,6 +191,79 @@ itself) and `SSH-SETUP.bat` (`ssh_setup.ps1`: an OpenSSH server with key login
 only and TCP 22 open; `uninstall_ssh.ps1` removes it). The firewall rules allow every profile and
 every remote address, since clients through a forward keep their own address, which Windows would
 not count as its local subnet.
+
+## Server mode
+
+**Settings > Network > Server mode** (also in the session's **More** menu) keeps Windows running while
+the app is in the background or the phone is locked, so Remote Desktop and the other forwards keep
+answering, from other devices or from a Remote Desktop app on the same iPhone (`127.0.0.1` / `[::1]`).
+The code is `ios/Sources/ServerMode.swift` and the bridge's server mode (`winios_bridge.m`).
+
+- **How**: iOS keeps an app with background audio (`UIBackgroundModes: audio`) running while its audio
+  plays. The bridge keeps the HDA output unit running when Windows plays nothing (silence;
+  `hv_audio_set_keepalive` in `host/audio_mac.c`, made at 2 ch / 48 kHz when Windows has no stream). It is
+  started again when an interruption ends, after a media services reset (made again), and whenever the
+  app comes back to the front (an interruption may never report its end); it is cleared when Windows
+  stops. The session mixes with other apps, so there is no Now Playing entry. While Windows runs in the
+  background the microphone is closed (no indicator). Going to the background takes a short
+  `beginBackgroundTask` grace; disks are flushed on the way, on every memory warning and every ~32 s
+  (the diagnostics timer).
+- **Only without host 3D**: iOS refuses GPU work from background apps, and the 3D path
+  (virglrenderer, ANGLE, DXMT on Metal) needs it. The bridge lets Windows run in the background only
+  while no 3D is in use or offered and no debugger is attached (`backgroundBlocker`); otherwise it pauses
+  as before. **Graphics: 3D / 2D** switches without restarting Windows (below), so "Switch to 2D now
+  (Windows keeps running)" is the way into server mode; "Restart Windows without 3D" is the fallback (2D
+  is offered and Windows restarts; the 3D setting stays on for the next start of the app).
+- **Headless** shows an info card instead of the picture: the Metal layer is unbound (the presenter
+  stops) and the display plan is frozen, so Windows keeps its resolution. **Keep the screen on** is off
+  by default in server mode: the locked phone is just "the background".
+- **Guard**: at a critical thermal state or a critically low battery (5%, unplugged) Windows is paused
+  (its own flag, apart from the background pause) and a local notification is posted; it goes on by
+  itself once the phone has cooled down (or charges) and the app is in front, or with Resume. Low Power
+  Mode and the thermal state are shown in the panel.
+- **Remote Desktop helper**: the forward to Windows' RDP port (3389 unless changed) with a scope picker,
+  "Turn on Remote Desktop in Windows" (a WinKit helper job running `C:\WinKit\REMOTE-DESKTOP.bat`, else the
+  WINKIT drive's), the addresses to connect to (both families, with the port, and this iPhone's
+  loopback), and **Test connection**: an X.224 Connection Request to the forward over IPv4 and over IPv6,
+  which needs Windows' TPKT Connection Confirm back. A plain TCP connect would prove nothing: the forward
+  listens in the iPhone's kernel, which completes the handshake even with Windows paused.
+  `C:\WinKit\RETURN-TO-SCREEN.bat` (`tscon … /dest:console`) hands a Remote Desktop session back to the
+  app's screen without signing in again.
+- **What it cannot do**: start at boot, start without the app, or come back after iOS ends the app
+  (jetsam, which picks a background app holding gigabytes first, or a swipe up). For Windows that is a
+  power cut; its disks are safe (`pwrite` + `fsync`). A phone call or an app taking the audio for itself
+  can suspend the app until the interruption ends. JIT stays while the app lives; after the app is ended
+  it has to be enabled again in the foreground. Under LiveContainer the background modes are
+  LiveContainer's own, so background running depends on it.
+
+### Graphics: 3D / 2D without restarting Windows
+
+The display device (`devices/virtio_gpu.c`) offers `VIRGL` and the blob and context-init features (and
+the capsets) only while the wanted mode is 3D (`hv_virtio_gpu_set_3d`). Device features are read at
+every driver initialisation, so the next driver start negotiates the new mode. To start it, the app
+writes `Shared/gpu_mode.txt` (`seq=<n>`, `mode=3d|2d`); WinKit's task **WinKit Graphics**
+(`winkit/gpu_switch.ps1`, SYSTEM, installed by `START.bat`) restarts only the display adapter
+(`pnputil /restart-device` on `PCI\VEN_1AF4&DEV_1050…`) and reports `Shared/gpu_mode_applied.txt`
+(`result`, the device's status and problem code). The app waits for both the report and the driver's
+renegotiation (a new driver reset, DRIVER_OK, VIRGL as wanted) and gives up after 60 s with what it
+knows. A switch is refused while the app is in the background: leaving 3D tears the 3D state down on
+the GPU.
+
+- **Leaving 3D**: the driver's reset drops every 3D context and resource (`virgl_renderer_reset`) on the
+  renderer's thread; the renderer itself, the hostmem window and its BAR stay, idle, so 3D can come back
+  in the same run of the app: it is never torn down and made again. That thread only takes requests
+  from a driver that negotiated `VIRGL`, and it only clears a picture that is still its own, so a 2D
+  driver that started meanwhile keeps its scanout. A 2D driver after a switch is never taken for the
+  firmware (the "firmware stage" guess needs at most one reset since the machine started).
+- **Coming back to 3D** needs the renderer: only when Windows was started with host 3D (it keeps 2.5 GB
+  of address space free for Metal then). A Windows started without 3D stays 2D until it is restarted
+  with 3D on.
+- **Risks** (shown in the app): the screen goes black for a few seconds; apps using 3D lose their
+  graphics device (most recover, some crash); the known UTM Neptune context leak grows with each switch
+  until the app restarts. Without host 3D, Windows' 3D driver may not start; Windows then uses its basic
+  display (the screen may stay black; Remote Desktop renders on its own adapter and is not affected).
+- Optionally (**Back to 3D when the app returns to the front**, off by default) the app switches back to
+  3D by itself after a switch to 2D in this session.
 
 ## Why there is no bridged mode
 
@@ -224,9 +306,9 @@ a comment). Restart the VM after changing them.
 | `HV_NET_FWD` | none | TCP forwards into the guest for this session, comma-separated: `<host port>:<guest port>` (loopback), `lan:…`, `vpn:…`, or `a.b.c.d:…` (see [Port forwards](#port-forwards)). |
 | `HV_NET_FWD_FILE` | none (Mac) | The saved forwards' file for the Mac tool (on iOS it is the machine's `port_forwards.json`). |
 | `HV_NET_FWD_RULES` | on | `0`: saved forwards are listed but not opened (session forwards still are). |
-| `HV_NET_VPN_IF` | `utun,wg,tun,ppp,ipsec` | Which interfaces count as a VPN (name prefixes, comma-separated, preferred in this order). Only one with an IPv4 address or a unique local IPv6 address counts, so the carrier's Wi-Fi Calling / VoLTE tunnels (`ipsec…` with only a global IPv6 address) are not taken for a VPN. |
+| `HV_NET_VPN_IF` | `utun,wg,tun,ppp,ipsec` | Which interfaces count as a VPN (name prefixes, comma-separated, preferred in this order). One with an IPv4 address or a unique local IPv6 address counts, else one with a global IPv6 address that is not `ipsec…`, so the carrier's Wi-Fi Calling / VoLTE tunnels (`ipsec…` with only a global IPv6 address) are not taken for a VPN. |
 | `HV_NET_LAN_IF` | `en,bridge` | Which interfaces make up the local network: local network forwards listen on their addresses, and the settings show them. |
-| `HV_NET_LAN_GLOBAL6` | off | `1`: local network forwards also listen on the local network's global IPv6 addresses (reachable from the internet where the network does not filter incoming IPv6). |
+| `HV_NET_LAN_GLOBAL6` | on | `0`: no local network forward listens on the local network's global IPv6 addresses (each forward also has its own **IPv6 global addresses** choice). |
 
 ## Tests
 
@@ -247,4 +329,14 @@ a comment). Restart the VM after changing them.
   session forward; the guest's limits; reopening; the saved file, a damaged one, and
   `HV_NET_FWD_RULES=0`; names that are not UTF-8 or are cut inside a character; a machine's saved
   forwards loaded while session forwards hold their ports and slots; the IPv6 relay running out of
-  descriptors.
+  descriptors; each family's state in the list and the `ipv6Global` choice (parsed, listed, saved).
+- The address choice of every scope, over made-up interfaces (`tests/fake_ifaddrs.h`, documentation
+  addresses only), in `test_net_fwd` and `test_net_ipv6`: the local network's IPv4, unique local and
+  global IPv6 addresses (unique local first, at most 7 besides `[::1]`), never link-local, multicast,
+  IPv4-mapped or cellular ones, global ones left out by the rule or `HV_NET_LAN_GLOBAL6=0`; the VPN's
+  IPv4 and IPv6 addresses (a WireGuard VPN with all three kinds, one with only a unique local or only a
+  global IPv6 address relayed through IPv4 loopback, the preference order), and what is passed over
+  (iOS's link-local-only `utun`s, the carrier's `ipsec`).
+- `make test-core` runs `test_gpu_mode` (the graphics hot switch: what each driver start is offered,
+  the firmware-stage guess after a switch) and `test_audio_keepalive` (server mode's silent output over
+  this Mac's own output unit).

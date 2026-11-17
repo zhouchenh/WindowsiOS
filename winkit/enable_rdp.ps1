@@ -7,7 +7,7 @@
 # Safe to run again. Needs administrator rights: run it through REMOTE-DESKTOP.bat.
 #   powershell -ExecutionPolicy Bypass -File enable_rdp.ps1              turn it on
 #   powershell -ExecutionPolicy Bypass -File enable_rdp.ps1 -Uninstall   undo: back to how it was, rules removed
-# Then, in the app: Settings > Port forwarding > Add a port forward > Remote Desktop.
+# Then, in the app: Settings > Network > Server mode (or Port forwarding > Add a port forward > Remote Desktop).
 param([switch]$Uninstall)
 $ErrorActionPreference = 'Stop'
 $ts = 'HKLM:\System\CurrentControlSet\Control\Terminal Server'
@@ -119,17 +119,23 @@ public static extern bool LogonUser(string user, string domain, string password,
 Write-Host ''
 Write-Host "Remote Desktop is on (port $port, TCP and UDP), with the firewall open for it." -ForegroundColor Green
 Write-Host ''
-Write-Host 'Next, on the iPhone: Settings > Port forwarding > Add a port forward > Remote Desktop.'
-Write-Host '  "This iPhone only": a Remote Desktop app on the same iPhone connects to localhost.'
-Write-Host '  "Local network" or "VPN": other devices connect to the address the app shows.'
+Write-Host 'Next, on the iPhone: Settings > Network > Server mode > Add a Remote Desktop forward'
+Write-Host '(or Port forwarding > Add a port forward > Remote Desktop), then Test connection there.'
+Write-Host '  "This iPhone only": a Remote Desktop app on the same iPhone connects to 127.0.0.1 (or [::1]).'
+Write-Host '  "Local network" or "VPN": other devices connect to an address the app shows, over IPv4 or IPv6.'
 Write-Host "Sign in as: $who"
-Write-Host 'The account needs a password (a PIN is not enough). For a Microsoft account, use its password.'
+Write-Host 'The account needs a password (a PIN is not enough). For a Microsoft account, use its email and password,'
+Write-Host 'turn off "only allow Windows Hello sign-in for Microsoft accounts" (Settings > Accounts > Sign-in options),'
+Write-Host 'and if you only ever signed in with the PIN, sign in once with the password on this screen first.'
+Write-Host 'Let the Remote Desktop client use UDP. To hand a Remote Desktop session back to the app''s screen without'
+Write-Host 'signing in again, run C:\WinKit\RETURN-TO-SCREEN.bat inside it.'
 if ($blank) {
     Write-Host ''
     Write-Host "This account ($env:USERNAME) has no password, and Windows refuses Remote Desktop sign-ins without one." -ForegroundColor Yellow
     Write-Host 'Set a password first: press Ctrl+Alt+Del (the app: Shortcuts > Ctrl + Alt + Del) > Change a password,' -ForegroundColor Yellow
     Write-Host 'or Settings > Accounts > Sign-in options > Password. WinKit does not set one for you.' -ForegroundColor Yellow
 }
-Write-Host 'Connections only work while the app is open in the foreground on the iPhone.'
+Write-Host 'Connections work while the app is in the foreground, and in the background too with the app''s Server mode'
+Write-Host '(Windows keeps running there without host 3D; the app can switch to 2D without restarting Windows).'
 Write-Host 'To undo: run enable_rdp.ps1 -Uninstall as administrator.'
 exit 0

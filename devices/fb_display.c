@@ -145,6 +145,17 @@ void hv_fb_display_set_override(HvFbDisplay *fb, const uint8_t *pixels, uint32_t
     pthread_mutex_unlock(&fb->mu);
 }
 
+void hv_fb_display_clear_override_if(HvFbDisplay *fb, const uint8_t *pixels) {
+    if (!fb || !pixels) return;
+    pthread_mutex_lock(&fb->mu);
+    if (fb->ovr_host == pixels) {
+        fb->ovr_host = NULL;
+        fb->ovr_width = fb->ovr_height = fb->ovr_stride = 0;
+        fb->ovr_serial++;
+    }
+    pthread_mutex_unlock(&fb->mu);
+}
+
 void hv_fb_display_set_texture(HvFbDisplay *fb, void *mtl_texture, uint32_t tex_w, uint32_t tex_h, uint32_t rx,
                                uint32_t ry, uint32_t rw, uint32_t rh) {
     if (!fb) return;

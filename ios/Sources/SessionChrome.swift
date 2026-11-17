@@ -808,6 +808,7 @@ struct SessionMoreMenu: View {
                     ))
                 }
             }
+            ServerModeMenuItems(isLinux: vm.isLinux) // server mode, headless, graphics 3D / 2D: ServerMode.swift
             if !vm.isLinux { // these run inside Windows
                 Section(L("应用", "Apps")) {
                     Button("Claude Code", systemImage: "terminal") { vm.installClaudeCode() }

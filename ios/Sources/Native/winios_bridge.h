@@ -187,6 +187,8 @@ extern NSNotificationName const WinIOSDisplayWillReshapeNotification;
 - (NSString *)portForwardsJSON NS_SWIFT_NAME(portForwardsJSON());
 /// Adds a saved forward, or replaces the one with this id. nil when done, else why not (in English).
 /// protocols: 1 TCP, 2 UDP, 3 both. scope: 0 this device only, 1 local network, 2 VPN.
+/// ipv6Global: a local network forward also listens on the network's global IPv6 addresses (which the internet may
+/// reach where the router lets IPv6 in); unique local ones are always taken. Ignored for the other scopes.
 - (nullable NSString *)savePortForwardWithID:(NSString *)forwardID
                                         name:(NSString *)name
                                    protocols:(NSInteger)protocols
@@ -194,7 +196,8 @@ extern NSNotificationName const WinIOSDisplayWillReshapeNotification;
                                    guestPort:(NSInteger)guestPort
                                        scope:(NSInteger)scope
                                      enabled:(BOOL)enabled
-    NS_SWIFT_NAME(savePortForward(id:name:protocols:hostPort:guestPort:scope:enabled:));
+                                  ipv6Global:(BOOL)ipv6Global
+    NS_SWIFT_NAME(savePortForward(id:name:protocols:hostPort:guestPort:scope:enabled:ipv6Global:));
 - (BOOL)removePortForwardWithID:(NSString *)forwardID NS_SWIFT_NAME(removePortForward(id:));
 /// The device's addresses others can connect to (LAN and VPN), as JSON (hv_net_fwd_addresses_json).
 - (NSString *)portForwardAddressesJSON NS_SWIFT_NAME(portForwardAddressesJSON());
@@ -202,6 +205,59 @@ extern NSNotificationName const WinIOSDisplayWillReshapeNotification;
 - (void)refreshPortForwards;
 /// Which machine's saved forwards are in use (the running one's, else the selected one's).
 - (void)usePortForwardsOfMachineDirectory:(NSString *)dir;
+@end
+
+/* ---- Server mode (ios/Sources/ServerMode.swift, docs/networking.md "Server mode") ----
+   Windows keeps running while the app is in the background: an audio output unit kept running (silence) keeps
+   iOS from suspending the app, which only works with no host 3D in use (iOS refuses GPU work from the background)
+   and no debugger attached. Main thread. */
+
+/// Why Windows cannot run in the background now.
+typedef NS_ENUM(NSInteger, WinIOSBackgroundBlocker) {
+    WinIOSBackgroundBlockerNothing = 0,
+    WinIOSBackgroundBlockerNotRunning = 1,
+    WinIOSBackgroundBlockerHost3D = 2,           /* the display driver runs 3D, or 3D is offered for its next start */
+    WinIOSBackgroundBlockerSwitchPending = 3, /* 2D is offered, the 3D driver still runs (the switch is not done) */
+    WinIOSBackgroundBlockerDebugger = 4,     /* a debugger is attached: every trap would stop the app */
+};
+
+/// The graphics mode (virtio-gpu, devices/virtio_gpu.h): whether 3D can be offered at all (the renderer was loaded
+/// when Windows started), what the next driver start is offered, and what the running driver took.
+typedef struct WinIOSGraphicsMode {
+    bool capable, offered3D, negotiated3D, driverOK; /* bool, not BOOL: Swift sees Bool */
+    uint32_t resets; /* driver resets since start: a restarted display adapter moves it on */
+} WinIOSGraphicsMode;
+
+@interface WinIOSBridge (ServerMode)
+/// Keep Windows running in the background (only while backgroundBlocker is None). Saved by the Swift side.
+@property (nonatomic) BOOL runInBackground;
+/// The output unit keeps running with silence (hv_audio_set_keepalive), from now and at every start, except
+/// while the guest is paused (the app may then be suspended as before).
+@property (nonatomic) BOOL audioKeepAlive;
+@property (nonatomic, readonly) BOOL backgroundCapable;
+@property (nonatomic, readonly) WinIOSBackgroundBlocker backgroundBlocker;
+/// No picture: the Metal layer is unbound (the presenter stops) and Windows' size is frozen as it is.
+@property (nonatomic) BOOL headless;
+/// The screen stays on while Windows runs (iOS auto-lock off). YES by default.
+@property (nonatomic) BOOL keepScreenOn;
+/// Paused by the app's guard (critical temperature or battery), apart from the background pause.
+@property (nonatomic, readonly) BOOL guardPaused;
+- (void)setGuardPaused:(BOOL)paused reason:(NSString *)reason;
+/// The app is in the background with Windows running (server mode doing its job).
+@property (nonatomic, readonly) BOOL runningInBackground;
+/// Whether the output unit runs now (diagnostics).
+@property (nonatomic, readonly) BOOL audioOutputRunning;
+
+- (WinIOSGraphicsMode)graphicsMode;
+/// Offers 3D or 2D from the display driver's next start and, with restartAdapter, asks WinKit's graphics task in
+/// Windows to restart its display adapter now (Shared/gpu_mode.txt). Returns the request's number (> 0), 0 when
+/// only the offer changed, -1 when refused (why in *why, in the user's language). Refused in the background
+/// (leaving 3D needs the GPU) and for Linux.
+- (int64_t)requestGraphics3D:(BOOL)on restartAdapter:(BOOL)restart why:(NSString *_Nullable *_Nullable)why;
+/// Asks Windows to restart (the WinKit helper's job): with 2D offered, it comes back without 3D. NO when no helper.
+- (BOOL)requestWindowsRestart;
+/// What WinKit's graphics task last reported (Shared/gpu_mode_applied.txt: key=value lines), nil if nothing.
+- (nullable NSString *)graphicsSwitchReport;
 @end
 
 /// Posted on the main thread for each report of the WinKit focus agent; userInfo[@"report"] is the

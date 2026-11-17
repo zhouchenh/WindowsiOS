@@ -24,7 +24,7 @@ MAC_FRAMEWORKS = -framework Cocoa -framework Foundation -framework QuartzCore -f
 
 CORE_TESTS = $(B)/test_classify $(B)/test_jit_region $(B)/test_operands $(B)/test_jit $(B)/test_mem \
              $(B)/test_mmu $(B)/test_exc $(B)/test_share_clip $(B)/test_share_focus $(B)/test_pl031 \
-             $(B)/test_acpi $(B)/test_usb_touch
+             $(B)/test_acpi $(B)/test_usb_touch $(B)/test_gpu_mode $(B)/test_audio_keepalive
 
 all: $(CORE_TESTS) $(B)/hvsparse $(B)/winvm
 
@@ -80,6 +80,16 @@ $(B)/test_acpi: tests/test_acpi.c tests/fw_cfg_capture_stub.c tests/fw_cfg_captu
 $(B)/test_usb_touch: tests/test_usb_touch.c devices/xhci.c devices/usb_touch.c devices/*.h core/*.h | $(B)
 	$(CC) $(CFLAGS) -fsanitize=address,undefined -fno-sanitize-recover=all tests/test_usb_touch.c devices/xhci.c \
 		devices/usb_touch.c -o $@
+# The graphics hot switch (virtio_gpu.c: what each driver start is offered, 3D or 2D, the firmware-stage guess after
+# a switch) with stand-ins for the transport and the 3D renderer, and fb_display.c's override ownership.
+$(B)/test_gpu_mode: tests/test_gpu_mode.c devices/virtio_gpu.c devices/fb_display.c devices/*.h core/*.h | $(B)
+	$(CC) $(CFLAGS) -fsanitize=address,undefined -fno-sanitize-recover=all tests/test_gpu_mode.c devices/virtio_gpu.c \
+		devices/fb_display.c -framework CoreFoundation -o $@
+# The server mode's audio keep-alive (audio_mac.c) over this Mac's own output unit, playing silence, with a stand-in
+# HDA. Skipped where there is no output device.
+$(B)/test_audio_keepalive: tests/test_audio_keepalive.c host/audio_mac.c host/audio_mac.h | $(B)
+	$(CC) $(CFLAGS) -fsanitize=address,undefined -fno-sanitize-recover=all tests/test_audio_keepalive.c host/audio_mac.c \
+		-framework AudioToolbox -framework CoreFoundation -o $@
 
 # Guest DNS proxy against a stand-in resolver (no network needed).
 $(B)/test_dns_lifecycle: tests/test_dns_lifecycle.c $(B)/dns_proxy.o
@@ -97,12 +107,13 @@ test-dns: $(B)/test_dns_lifecycle $(B)/test_dns_parse
 # name servers from libslirp, so the DNS proxy's own announcement is what gets tested.
 $(B)/libresolv_no_ipv6.dylib: tests/resolv_no_ipv6.c | $(B)
 	$(CC) $(CFLAGS) -dynamiclib -install_name @rpath/libresolv_no_ipv6.dylib $< -lresolv -o $@
-$(B)/test_net_ipv6: tests/test_net_ipv6.c host/net_slirp.c host/dns_proxy.c host/*.h $(B)/libresolv_no_ipv6.dylib | $(B)
+$(B)/test_net_ipv6: tests/test_net_ipv6.c tests/fake_ifaddrs.h host/net_slirp.c host/dns_proxy.c host/*.h $(B)/libresolv_no_ipv6.dylib | $(B)
 	$(CC) $(CFLAGS) $(SLIRP_CFLAGS) tests/test_net_ipv6.c host/net_slirp.c host/dns_proxy.c \
 	      $(B)/libresolv_no_ipv6.dylib -Wl,-rpath,@executable_path $(SLIRP_LIBS) -lresolv -o $@
 # Port forwards (TCP and UDP, IPv4 and IPv6, loopback / local network / VPN, add, edit, remove, port in use, the saved
-# list) through libslirp to a stand-in guest that echoes: no network needed.
-$(B)/test_net_fwd: tests/test_net_fwd.c host/net_slirp.c host/dns_proxy.c host/*.h | $(B)
+# list) through libslirp to a stand-in guest that echoes, and the addresses each scope listens on over made-up
+# interfaces (tests/fake_ifaddrs.h): no network needed.
+$(B)/test_net_fwd: tests/test_net_fwd.c tests/fake_ifaddrs.h host/net_slirp.c host/dns_proxy.c host/*.h | $(B)
 	$(CC) $(CFLAGS) $(SLIRP_CFLAGS) tests/test_net_fwd.c host/net_slirp.c host/dns_proxy.c $(SLIRP_LIBS) -lresolv -o $@
 test-net: $(B)/test_net_ipv6 $(B)/test_net_fwd
 	$(B)/test_net_ipv6

@@ -144,6 +144,20 @@ uint64_t hv_winvm_display_frames(void) {
     return fb ? hv_fb_metal_frames(fb) : 0;
 }
 
+int hv_winvm_gpu_set_3d(int on) {
+    return board.gpu ? hv_virtio_gpu_set_3d(board.gpu, on) : -1;
+}
+
+void hv_winvm_gpu_mode(int *capable, int *offered3d, int *negotiated3d, int *driver_ok, uint32_t *resets) {
+    HvVgpuMode m;
+    hv_virtio_gpu_mode(board.gpu, &m);
+    if (capable) *capable = m.capable;
+    if (offered3d) *offered3d = m.offered3d;
+    if (negotiated3d) *negotiated3d = m.negotiated3d;
+    if (driver_ok) *driver_ok = m.driver_ok;
+    if (resets) *resets = m.resets;
+}
+
 int hv_winvm_gpu_status(char *buf, unsigned len) {
     return hv_virtio_gpu_describe(board.gpu, buf, len);
 }

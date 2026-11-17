@@ -2,6 +2,7 @@
 #import "winios_bridge.h"
 #include "virtio_gpu3d.h"
 
+#include "audio_mac.h"
 #include "hvsparse.h"
 #include "fb_display.h"
 #include <sys/sysctl.h>
@@ -23,6 +24,7 @@
 #include <time.h>
 
 static WinIOSBridge *s_shared_bridge = nil;
+static BOOL winios_machine_is_linux(void);
 
 NSNotificationName const WinIOSDisplayStateDidChangeNotification = @"WinIOSDisplayStateDidChangeNotification";
 NSNotificationName const WinIOSDisplayWillReshapeNotification = @"WinIOSDisplayWillReshapeNotification";
@@ -53,6 +55,11 @@ NSNotificationName const WinIOSDisplayWillReshapeNotification = @"WinIOSDisplayW
     NSInteger _hingeStatus;
     double _hingeAngleDegrees;
     BOOL _pausedInBackground;   /* the guest was stopped because the app went to the background */
+    /* server mode (main thread) */
+    BOOL _runInBackground, _audioKeepAlive, _headless, _keepScreenOn, _guardPaused, _inBackground;
+    BOOL _started3D;            /* host 3D was on when this machine started (the renderer loaded) */
+    int64_t _gpuSwitchSeq;
+    UIBackgroundTaskIdentifier _bgGrace;
 
     /* display sizing engine (main thread) */
     CGFloat _viewNativeScale;
@@ -247,6 +254,8 @@ static void winios_log_memory_census(void) {
         _displaySharpness = 0;
         _guestFollowsModes = YES;
         _tabletX = _tabletY = 0.5;
+        _keepScreenOn = YES;
+        _bgGrace = UIBackgroundTaskInvalid;
         dispatch_queue_attr_t attr = dispatch_queue_attr_make_with_qos_class(DISPATCH_QUEUE_SERIAL, QOS_CLASS_UTILITY, 0);
         _diagQueue = dispatch_queue_create("me.ammaar.windowsios.diag", attr);
         NSNotificationCenter *nc = [NSNotificationCenter defaultCenter];
@@ -262,6 +271,10 @@ static void winios_log_memory_census(void) {
         [nc addObserver:self selector:@selector(onAppBackgroundOrTerminate:) name:UIApplicationDidEnterBackgroundNotification object:nil];
         [nc addObserver:self selector:@selector(onAppBackgroundOrTerminate:) name:UIApplicationWillTerminateNotification object:nil];
         [nc addObserver:self selector:@selector(onAudioInterruption:) name:AVAudioSessionInterruptionNotification object:nil];
+        /* server mode: every output unit is gone after a media services reset; memory pressure in the background
+           comes before jetsam, which is a power cut for Windows (its disks are flushed first) */
+        [nc addObserver:self selector:@selector(onMediaServicesReset:) name:AVAudioSessionMediaServicesWereResetNotification object:nil];
+        [nc addObserver:self selector:@selector(onMemoryWarning:) name:UIApplicationDidReceiveMemoryWarningNotification object:nil];
         /* Windows' time zone follows the iPhone's (Shared/tz.txt, applied by the WinKit helper): a zone
            change, and the significant time changes (midnight, daylight saving, the clock set). */
         [nc addObserver:self selector:@selector(onTimeZoneChange:) name:NSSystemTimeZoneDidChangeNotification object:nil];
@@ -270,20 +283,26 @@ static void winios_log_memory_census(void) {
     return self;
 }
 
-- (void)configureAudioSessionAndMicPermission {
+static const AVAudioSessionCategoryOptions kWinIOSAudioOptions = AVAudioSessionCategoryOptionDefaultToSpeaker |
+                                                                  AVAudioSessionCategoryOptionAllowBluetooth |
+                                                                  AVAudioSessionCategoryOptionAllowBluetoothA2DP |
+                                                                  AVAudioSessionCategoryOptionMixWithOthers;
+
+- (void)configureAudioSession {
     AVAudioSession *session = [AVAudioSession sharedInstance];
-    AVAudioSessionCategoryOptions opts = AVAudioSessionCategoryOptionDefaultToSpeaker |
-                                         AVAudioSessionCategoryOptionAllowBluetooth |
-                                         AVAudioSessionCategoryOptionAllowBluetoothA2DP |
-                                         AVAudioSessionCategoryOptionMixWithOthers;
     NSError *err = nil;
-    if (![session setCategory:AVAudioSessionCategoryPlayAndRecord mode:AVAudioSessionModeDefault options:opts error:&err]) {
+    if (![session setCategory:AVAudioSessionCategoryPlayAndRecord mode:AVAudioSessionModeDefault options:kWinIOSAudioOptions error:&err]) {
         /* Fallback to Playback if PlayAndRecord temporarily rejected before permission */
         [session setCategory:AVAudioSessionCategoryPlayback withOptions:AVAudioSessionCategoryOptionMixWithOthers error:nil];
     }
     [session setPreferredSampleRate:48000.0 error:nil];
     [session setPreferredIOBufferDuration:0.010 error:nil];
     [session setActive:YES error:nil];
+}
+
+- (void)configureAudioSessionAndMicPermission {
+    AVAudioSessionCategoryOptions opts = kWinIOSAudioOptions;
+    [self configureAudioSession];
 
     if (@available(iOS 17.0, *)) {
         [AVAudioApplication requestRecordPermissionWithCompletionHandler:^(BOOL granted) {
@@ -298,29 +317,104 @@ static void winios_log_memory_census(void) {
     }
 }
 
+/* Posted on a thread of AVFoundation's: the work goes to the main thread. An interruption (a phone call, Siri, an
+   app taking a session that does not mix) stops the output unit; in the background that suspends the app and
+   Windows with it. When it ends the unit is started again; some interruptions never report an end, so the unit is
+   also started again whenever the app comes back to the front. */
 - (void)onAudioInterruption:(NSNotification *)note {
     NSNumber *typeNum = note.userInfo[AVAudioSessionInterruptionTypeKey];
-    if (typeNum && typeNum.unsignedIntegerValue == AVAudioSessionInterruptionTypeEnded) {
-        [[AVAudioSession sharedInstance] setActive:YES error:nil];
-    }
+    BOOL ended = typeNum && typeNum.unsignedIntegerValue == AVAudioSessionInterruptionTypeEnded;
+    dispatch_async(dispatch_get_main_queue(), ^{
+        if (ended) {
+            [[AVAudioSession sharedInstance] setActive:YES error:nil];
+            if (self->_vmRunning) hv_audio_restart_output(0);
+        } else if (self->_vmRunning && self->_inBackground && !self->_pausedInBackground) {
+            fprintf(stderr, "winvm: audio interrupted while Windows runs in the background: iOS may suspend it until the interruption ends\n");
+        }
+    });
+}
+
+- (void)onMediaServicesReset:(NSNotification *)note {
+    (void)note;
+    dispatch_async(dispatch_get_main_queue(), ^{
+        fprintf(stderr, "winvm: audio: media services were reset: session and output made again\n");
+        [self configureAudioSession];
+        if (self->_vmRunning) hv_audio_restart_output(1);
+    });
+}
+
+- (void)onMemoryWarning:(NSNotification *)note {
+    (void)note;
+    if (!_vmRunning) return;
+    fprintf(stderr, "winvm: memory warning%s: disks flushed\n", _inBackground ? " in the background" : "");
+    dispatch_async(_diagQueue, ^{ hv_winvm_flush_disks(); });
+}
+
+/* The guest's CPUs stop while the app is in the background (unless server mode keeps it running) or while the
+   guard holds it (critical temperature or battery). Each has its own flag: one ending does not resume the other. */
+- (void)applyPause {
+    if (!_vmRunning) return;
+    hv_winvm_set_paused(_pausedInBackground || _guardPaused);
+    [self applyAudioKeepAlive];
+}
+
+/* The silent output keeps the app running in the background: only while Windows runs, so a paused machine lets iOS
+   suspend the app as before. */
+- (void)applyAudioKeepAlive {
+    if (!_vmRunning) return;
+    BOOL want = _audioKeepAlive && !_pausedInBackground && !_guardPaused;
+    if (want != (hv_audio_keepalive() != 0)) hv_audio_set_keepalive(want);
+}
+
+- (void)applyIdleTimer {
+    UIApplication.sharedApplication.idleTimerDisabled = _vmRunning && _keepScreenOn;
+}
+
+- (void)endBackgroundGrace {
+    if (_bgGrace == UIBackgroundTaskInvalid) return;
+    [[UIApplication sharedApplication] endBackgroundTask:_bgGrace];
+    _bgGrace = UIBackgroundTaskInvalid;
 }
 
 - (void)onAppBackground:(NSNotification *)note {
     (void)note;
+    _inBackground = YES;
     [self cancelAllTouchContacts]; /* no finger stays down in Windows while the app is away */
-    if (_vmRunning && !getenv("WINIOS_RUN_IN_BACKGROUND")) {
-        hv_winvm_set_paused(1);
+    if (!_vmRunning) return;
+    /* a few seconds of grace while the app goes: the disks are flushed and the silent output takes over */
+    [self endBackgroundGrace];
+    _bgGrace = [[UIApplication sharedApplication] beginBackgroundTaskWithName:@"winvm.background"
+                                                            expirationHandler:^{ [self endBackgroundGrace]; }];
+    BOOL keep = (_runInBackground && self.backgroundBlocker == WinIOSBackgroundBlockerNothing) || getenv("WINIOS_RUN_IN_BACKGROUND");
+    if (!keep) {
         _pausedInBackground = YES;
-        fprintf(stderr, "winvm: paused (app in the background)\n");
+        [self applyPause];
+        fprintf(stderr, "winvm: paused (app in the background%s)\n",
+                _runInBackground ? [NSString stringWithFormat:@"; server mode blocked: %ld", (long)self.backgroundBlocker].UTF8String : "");
+    } else {
+        hv_audio_pause_capture(1); /* no microphone (and no indicator) while away */
+        [self applyAudioKeepAlive];
+        hv_audio_restart_output(0);
+        fprintf(stderr, "winvm: keeps running in the background (server mode; audio output %s)\n",
+                hv_audio_output_running() ? "running" : "NOT running: iOS may suspend the app");
     }
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(10 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        [self endBackgroundGrace];
+    });
 }
 
 - (void)resumeFromBackground {
+    _inBackground = NO;
+    [self endBackgroundGrace];
+    if (_vmRunning) {
+        hv_audio_pause_capture(0);
+        hv_audio_restart_output(0); /* an interruption may have stopped it without an end */
+    }
     if (!_pausedInBackground) return;
     _pausedInBackground = NO;
     if (_vmRunning) {
-        hv_winvm_set_paused(0);
-        fprintf(stderr, "winvm: resumed\n");
+        [self applyPause];
+        fprintf(stderr, "winvm: resumed%s\n", _guardPaused ? " from the background (still held by the guard)" : "");
         [self publishResumeMark];
     }
 }
@@ -409,6 +503,119 @@ static BOOL winios_battery_setting(void) {
             hv_winvm_flush_disks();
         });
     }
+}
+
+/* ---- server mode ---- */
+
+- (BOOL)runInBackground { return _runInBackground; }
+- (void)setRunInBackground:(BOOL)on {
+    _runInBackground = on;
+    fprintf(stderr, "winvm: server mode %s\n", on ? "on" : "off");
+}
+
+- (BOOL)audioKeepAlive { return _audioKeepAlive; }
+- (void)setAudioKeepAlive:(BOOL)on {
+    _audioKeepAlive = on;
+    if (_vmRunning) [self applyAudioKeepAlive];
+}
+
+- (BOOL)audioOutputRunning { return hv_audio_output_running() != 0; }
+- (BOOL)runningInBackground { return _vmRunning && _inBackground && !_pausedInBackground; }
+
+- (WinIOSGraphicsMode)graphicsMode {
+    WinIOSGraphicsMode g = {0};
+    if (!_vmRunning) return g;
+    int capable = 0, offered = 0, negotiated = 0, ok = 0;
+    uint32_t resets = 0;
+    hv_winvm_gpu_mode(&capable, &offered, &negotiated, &ok, &resets);
+    g.capable = capable != 0;
+    g.offered3D = offered != 0;
+    g.negotiated3D = negotiated != 0;
+    g.driverOK = ok != 0;
+    g.resets = resets;
+    return g;
+}
+
+- (WinIOSBackgroundBlocker)backgroundBlocker {
+    if (!_vmRunning) return WinIOSBackgroundBlockerNotRunning;
+    WinIOSGraphicsMode g = [self graphicsMode];
+    if (g.negotiated3D && !g.offered3D) return WinIOSBackgroundBlockerSwitchPending;
+    if (g.negotiated3D || g.offered3D) return WinIOSBackgroundBlockerHost3D;
+    if (winios_jit_is_traced()) return WinIOSBackgroundBlockerDebugger;
+    return WinIOSBackgroundBlockerNothing;
+}
+
+- (BOOL)backgroundCapable { return self.backgroundBlocker == WinIOSBackgroundBlockerNothing; }
+
+- (BOOL)headless { return _headless; }
+- (void)setHeadless:(BOOL)on {
+    if (on == _headless) return;
+    _headless = on;
+    CAMetalLayer *layer = _pendingLayer;
+    if (_vmRunning) hv_winvm_set_display_layer(on ? NULL : (__bridge void *)layer); /* nil pauses the presenter */
+    fprintf(stderr, "winvm: %s\n", on ? "headless: no picture, Windows' size kept" : "picture back");
+    if (!on) [self replanDisplay:@"headless off"]; /* the view may have changed shape meanwhile */
+    [self postDisplayStateChanged];
+}
+
+- (BOOL)keepScreenOn { return _keepScreenOn; }
+- (void)setKeepScreenOn:(BOOL)on {
+    _keepScreenOn = on;
+    [self applyIdleTimer];
+}
+
+- (BOOL)guardPaused { return _guardPaused; }
+- (void)setGuardPaused:(BOOL)paused reason:(NSString *)reason {
+    if (paused == _guardPaused) return;
+    _guardPaused = paused;
+    fprintf(stderr, "winvm: %s by the guard (%s)\n", paused ? "paused" : "resumed", reason.UTF8String ?: "");
+    [self applyPause];
+    if (!paused && !_pausedInBackground) [self publishResumeMark];
+}
+
+/* gpu_mode.txt, read by WinKit's graphics task (winkit/gpu_switch.ps1): "seq=<n>\r\nmode=3d|2d\r\n". A new seq
+   has it restart the display adapter (pnputil /restart-device), which then negotiates the mode offered. */
+- (int64_t)requestGraphics3D:(BOOL)on restartAdapter:(BOOL)restart why:(NSString *_Nullable *_Nullable)why {
+    NSString *no = nil;
+    BOOL zh = [[NSLocale preferredLanguages].firstObject hasPrefix:@"zh"];
+    if (!_vmRunning) no = zh ? @"Windows 没有在运行。" : @"Windows is not running.";
+    else if (winios_machine_is_linux()) no = zh ? @"Arch Linux 不支持切换。" : @"Not available for Arch Linux.";
+    else if ([UIApplication sharedApplication].applicationState == UIApplicationStateBackground)
+        no = zh ? @"App 在后台时不能切换：离开 3D 需要用 GPU。" : @"Not while the app is in the background: leaving 3D needs the GPU.";
+    else if (on && ![self graphicsMode].capable)
+        no = zh ? @"这次 Windows 启动时没有开主机 3D。打开 3D 并重启一次 Windows（关掉再打开 App），之后就能随时切换。"
+                : @"Windows was started without host 3D. Turn 3D on and restart Windows once (close and reopen the app); after that you can switch both ways.";
+    if (!no && hv_winvm_gpu_set_3d(on) != 0) no = zh ? @"显卡没有接受这个模式。" : @"The display device did not take that mode.";
+    if (no) {
+        if (why) *why = no;
+        return -1;
+    }
+    if (!restart) return 0;
+    _gpuSwitchSeq = MAX(_gpuSwitchSeq + 1, (int64_t)([[NSDate date] timeIntervalSince1970] * 10.0));
+    NSString *dir = [[self documentsPath] stringByAppendingPathComponent:@"Shared"];
+    [[NSFileManager defaultManager] createDirectoryAtPath:dir withIntermediateDirectories:YES attributes:nil error:nil];
+    NSString *text = [NSString stringWithFormat:@"seq=%lld\r\nmode=%@\r\n", (long long)_gpuSwitchSeq, on ? @"3d" : @"2d"];
+    [text writeToFile:[dir stringByAppendingPathComponent:@"gpu_mode.txt"] atomically:YES encoding:NSASCIIStringEncoding error:nil];
+    WinIOSGraphicsMode g = [self graphicsMode];
+    fprintf(stderr, "winvm: graphics switch %lld to %s asked of Windows (driver now %s, %u resets)\n", (long long)_gpuSwitchSeq,
+            on ? "3D" : "2D", g.negotiated3D ? "3D" : "2D", g.resets);
+    return _gpuSwitchSeq;
+}
+
+- (BOOL)requestWindowsRestart {
+    NSString *shared = [[self documentsPath] stringByAppendingPathComponent:@"Shared"];
+    NSDictionary *attrs = [[NSFileManager defaultManager] attributesOfItemAtPath:[shared stringByAppendingPathComponent:@"agent_alive.txt"] error:nil];
+    NSDate *seen = attrs[NSFileModificationDate];
+    if (!_vmRunning || !seen || -[seen timeIntervalSinceNow] > 40) return NO;
+    NSString *job = [NSString stringWithFormat:@"%@\r\nshutdown /r /t 5 /c \"Apple VM: restarting Windows\"\r\n", [NSUUID UUID].UUIDString];
+    [job writeToFile:[shared stringByAppendingPathComponent:@"agent_job.txt"] atomically:YES encoding:NSASCIIStringEncoding error:nil];
+    fprintf(stderr, "winvm: Windows asked to restart (offered %s)\n", [self graphicsMode].offered3D ? "3D" : "2D");
+    return YES;
+}
+
+- (nullable NSString *)graphicsSwitchReport {
+    NSString *f = [[[self documentsPath] stringByAppendingPathComponent:@"Shared"] stringByAppendingPathComponent:@"gpu_mode_applied.txt"];
+    return [NSString stringWithContentsOfFile:f encoding:NSUTF8StringEncoding error:nil];
 }
 
 - (void)notifyChanged {
@@ -681,6 +888,7 @@ static BOOL winios_plans_equal(WinIOSDisplayPlan a, WinIOSDisplayPlan b) {
         dispatch_async(dispatch_get_main_queue(), ^{ [self replanDisplay:why]; });
         return;
     }
+    if (_headless && _vmRunning) return; /* no picture: Windows keeps its size (planned again when the picture is back) */
     os_unfair_lock_lock(&_metricsLock);
     CGSize pts = _displayViewPts;
     os_unfair_lock_unlock(&_metricsLock);
@@ -1255,7 +1463,7 @@ static NSString *winios_unpack_resource(NSString *name, NSString *dst) {
 
 - (void)bindMetalLayer:(nullable CAMetalLayer *)layer {
     _pendingLayer = layer;
-    if (_vmRunning) {
+    if (_vmRunning && !_headless) {
         hv_winvm_set_display_layer((__bridge void *)layer);
     }
 }
@@ -1350,8 +1558,8 @@ static NSString *winios_unpack_resource(NSString *name, NSString *dst) {
     if (getenv("HV_SMBIOS_SKU") && !strcmp(getenv("HV_SMBIOS_SKU"), "WINIOS-CLI")) unsetenv("HV_SMBIOS_SKU"); /* the former command-line mode */
     winios_capture_stderr([self documentsPath]);
     winios_log_gpu_caps();
-    /* A running Windows keeps the screen on: auto-lock would suspend the whole machine. */
-    dispatch_async(dispatch_get_main_queue(), ^{ UIApplication.sharedApplication.idleTimerDisabled = YES; });
+    /* A running Windows keeps the screen on: auto-lock would suspend the whole machine (except in server mode with
+       "keep the screen on" off: the locked phone is the background, where Windows keeps running). Set once running. */
     setenv("HV_RAM_FILE", ramBacking.fileSystemRepresentation, 1);
 
     uint64_t preallocBytes = 0;
@@ -1524,6 +1732,13 @@ static NSString *winios_unpack_resource(NSString *name, NSString *dst) {
         [self notifyChanged];
         return;
     }
+    {
+        int capable = 0;
+        hv_winvm_gpu_mode(&capable, NULL, NULL, NULL, NULL);
+        _started3D = capable != 0; /* what really started: the renderer may have failed to load */
+        fprintf(stderr, "winvm: host 3D %s at start%s\n", _started3D ? "on" : "off",
+                _started3D && !linuxGuest ? " (2D/3D can be switched while Windows runs)" : "");
+    }
 
     /* display sizing: env.txt is loaded now (HV_DISPLAY_LEGACY), so plan again from the view's size */
     hv_fb_metal_set_legacy_fit(self.displayLegacy);
@@ -1538,11 +1753,14 @@ static NSString *winios_unpack_resource(NSString *name, NSString *dst) {
     [self postDisplayStateChanged];
 
     CAMetalLayer *layer = _pendingLayer;
-    if (layer) {
+    if (layer && !_headless) {
         hv_winvm_set_display_layer((__bridge void *)layer);
     }
 
     _vmRunning = YES;
+    _guardPaused = NO;
+    _pausedInBackground = NO;
+    [self applyAudioKeepAlive]; /* after hv_audio_attach_hda (in hv_winvm_create) */
     _touchDown = 0;
     _bootStartTime = CFAbsoluteTimeGetCurrent();
     _diagTickCount = 0;
@@ -1551,7 +1769,7 @@ static NSString *winios_unpack_resource(NSString *name, NSString *dst) {
     _lastWfiIdlePct = 0.0;
     _vmStatus = [NSString stringWithFormat:@"Running %@ (%d vCPUs, %llu MB RAM)",
                  winios_machine_is_linux() ? @"Arch Linux ARM" : @"Windows 11 ARM64", _configuredCPUs, _configuredRamMB];
-    [[UIApplication sharedApplication] setIdleTimerDisabled:YES];
+    [self applyIdleTimer];
     [self startBatteryPassthrough]; /* after _vmRunning: the board is there, the guest reads it at boot */
 
     hv_winvm_start(1, vm_exit_trampoline);
@@ -1718,6 +1936,11 @@ static void winios_type_run(NSString *text) {
         if ((_diagTickCount % 4u) == 0u) {
             hv_winvm_flush_disks();
         }
+        /* server mode: running in the background needs the silent output; say so when it stopped, and start it */
+        if (_inBackground && !_pausedInBackground && !_guardPaused && hv_audio_keepalive() && !hv_audio_output_running()) {
+            fprintf(stderr, "winvm: audio output not running in the background: starting it again\n");
+            hv_audio_restart_output(0);
+        }
         double uptime = CFAbsoluteTimeGetCurrent() - _bootStartTime;
         NSString *docs = [self documentsPath];
         /* Documents/screenshot.request (dropped in over USB) asks for one fresh latest_screen.png. */
@@ -1847,13 +2070,15 @@ static void winios_type_run(NSString *text) {
 
 - (void)handleVMExitWithReason:(NSString *)reason {
     _vmRunning = NO;
+    _guardPaused = NO;
+    hv_audio_shutdown(); /* the keep-alive goes with the machine: no silent output keeps the app alive for nothing */
     if (_batteryOn) UIDevice.currentDevice.batteryMonitoringEnabled = NO;
     _batteryOn = NO;
     _touchDown = 0;
     [self stopDiagTimer];
     [self endReshapeWatch:WinIOSReshapeStateIdle]; /* display hook */
     hv_fb_metal_hold_for_size(0, 0, 0);
-    [[UIApplication sharedApplication] setIdleTimerDisabled:NO];
+    [self applyIdleTimer];
     _vmStatus = [NSString stringWithFormat:@"Stopped (%@)", reason];
     dispatch_async(_diagQueue, ^{ [self writeDiagnosticsSnapshot]; });
     [self notifyChanged];
@@ -2155,7 +2380,8 @@ static NSString *winios_take_json(char *s, NSString *fallback) {
                                     hostPort:(NSInteger)hostPort
                                    guestPort:(NSInteger)guestPort
                                        scope:(NSInteger)scope
-                                     enabled:(BOOL)enabled {
+                                     enabled:(BOOL)enabled
+                                  ipv6Global:(BOOL)ipv6Global {
     [self usePortForwardsOfCurrentMachine];
     HvFwdRule r = {0};
     snprintf(r.id, sizeof r.id, "%s", forwardID.UTF8String ?: "");
@@ -2169,6 +2395,7 @@ static NSString *winios_take_json(char *s, NSString *fallback) {
     r.guest_port = (int)MAX(MIN(guestPort, 70000), -1);
     r.scope = (int)scope;
     r.enabled = enabled ? 1 : 0;
+    r.no_global6 = ipv6Global ? 0 : 1;
     char err[160] = {0};
     if (hv_net_fwd_put(&r, HV_FWD_SAVED, err, sizeof err) != 0) return [NSString stringWithUTF8String:err] ?: @"failed";
     NSLog(@"portfwd: saved \"%s\" %s %d -> %d scope %d %s", r.name, r.proto == 3 ? "tcp+udp" : r.proto == 2 ? "udp" : "tcp",

@@ -639,6 +639,9 @@ static void unmap_blob(HvVgpu3d *s, Res3d *r) {
     r->mapped = 0;
 }
 
+/* Gives up what 3D shows: its texture, and the override only while it is 3D's own read-back buffer. A 2D driver
+   that started after a switch (hv_virtio_gpu_set_3d) may already show its own scanout by the time the worker gets
+   here: that one stays. */
 static void clear_scanout(HvVgpu3d *s) {
     if (s->scanout_handle) {
         V.virgl_renderer_release_handle_for_scanout(s->scanout_handle_type, s->scanout_handle);
@@ -646,7 +649,7 @@ static void clear_scanout(HvVgpu3d *s) {
     }
     s->scanout_res = 0;
     hv_fb_display_set_texture(s->g->fb, NULL, 0, 0, 0, 0, 0, 0);
-    hv_fb_display_set_override(s->g->fb, NULL, 0, 0, 0);
+    if (s->readback) hv_fb_display_clear_override_if(s->g->fb, s->readback);
 }
 
 static void res_destroy(HvVgpu3d *s, Res3d *r) {
@@ -1173,6 +1176,9 @@ static void complete_fences(HvVgpu3d *s, const FenceEv *f) {
     }
 }
 
+/* A driver reset: every context and resource goes (virgl_renderer_reset). The renderer itself stays, idle, so the
+   next 3D driver start (after a switch back, hv_virtio_gpu_set_3d) finds it ready: it is never torn down and made
+   again within one run of the app. This runs Metal work: switches happen in the foreground only. */
 static void renderer_reset(HvVgpu3d *s) {
     clear_scanout(s);
     for (int i = 0; i < MAX_RES3D; i++)
@@ -1288,7 +1294,9 @@ static void *worker(void *arg) {
             Parked *p = malloc(sizeof *p);
             if (!p) break;
             hv_dev_lock(v->m);
-            int got = (v->status & 4) ? hv_virtq_pop(v, 0, &p->e) : 0;
+            /* Only a driver that took VIRGL is the worker's: after a switch to 2D the control queue is the 2D
+               handler's (virtio_gpu.c notify), even when a late fence event or reset wakes this thread. */
+            int got = (v->status & 4) && (v->driver_features & F_VIRGL) ? hv_virtq_pop(v, 0, &p->e) : 0;
             hv_dev_unlock(v->m);
             if (got <= 0) {
                 free(p);

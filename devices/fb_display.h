@@ -57,6 +57,8 @@ int hv_fb_display_get_frame(HvFbDisplay *fb, const uint8_t **pixels, uint32_t *w
 /* Show a host-memory scanout (virtio-gpu) instead of ramfb; pixels NULL goes back to ramfb.
    The memory must stay valid until the next call that replaces it (plus a presenter frame). */
 void hv_fb_display_set_override(HvFbDisplay *fb, const uint8_t *pixels, uint32_t w, uint32_t h, uint32_t stride);
+/* Clears the override only if it still shows these pixels (someone else may have set their own since). */
+void hv_fb_display_clear_override_if(HvFbDisplay *fb, const uint8_t *pixels);
 void hv_fb_display_override_flushed(HvFbDisplay *fb);
 /* Show a Metal texture (retained; NULL clears). Rect is the visible part. */
 void hv_fb_display_set_texture(HvFbDisplay *fb, void *mtl_texture, uint32_t tex_w, uint32_t tex_h, uint32_t rx,

@@ -16,6 +16,7 @@ func L(_ zh: String, _ en: String) -> String {
 struct SessionView: View {
     @ObservedObject var vm: VMViewModel
     @ObservedObject private var chrome = ChromeModel.shared
+    @ObservedObject private var server = ServerModeController.shared
     @Environment(\.horizontalSizeClass) private var horizontalSizeClass
     @State private var showPowerConfirm = false
     /// The display's "In immersive full screen": keep Windows' size (the canvas keeps its windowed size,
@@ -184,6 +185,15 @@ struct SessionView: View {
             .scaleEffect(canvas.scale, anchor: .topLeading)
             .offset(x: canvas.origin.x, y: canvas.origin.y)
             .opacity(vm.isVMRunning ? 1 : 0)
+
+            // Server mode, headless: the card covers the Windows view, which stays in place at its size (so Windows
+            // keeps its resolution) with its Metal layer unbound (the bridge's headless).
+            if vm.isVMRunning && server.enabled && server.headless {
+                HeadlessCard()
+                    .frame(width: canvas.visibleRect.width, height: canvas.visibleRect.height)
+                    .offset(x: canvas.visibleRect.minX, y: canvas.visibleRect.minY)
+                    .transition(.opacity)
+            }
 
             if vm.isVMRunning && !laptop && chrome.keyboardButtonShown && !vm.hardwareKeyboard && !vm.systemKeyboardVisible {
                 KeyboardFloatingButton(chrome: chrome, area: canvas.visibleRect, occlusions: occlusions,
@@ -852,6 +862,7 @@ private struct SettingsSheet: View {
 
     private var networkPage: some View {
         Form {
+            ServerModeSection() // Windows in the background, Remote Desktop, graphics 3D / 2D: ServerMode.swift
             PortForwardingSection() // forwarded ports: PortForwarding.swift
         }
     }

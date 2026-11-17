@@ -9,6 +9,13 @@ import UIKit
 // is their list, an editor, the addresses to connect to, and whether iOS allows the local network.
 // docs/networking.md has the details.
 
+/// One address family of a forward (hv_net_fwd_list_json's "ipv4" / "ipv6"): "listening", "error", "none" (the
+/// scope has no address of that family now; message says why) or "off".
+struct ForwardFamily: Decodable, Equatable {
+    var state: String
+    var message: String
+}
+
 /// One forward as hv_net_fwd_list_json describes it.
 struct PortForward: Identifiable, Decodable, Equatable {
     var id: String
@@ -24,11 +31,20 @@ struct PortForward: Identifiable, Decodable, Equatable {
     var message: String
     var warning: String
     var listen: [String]
+    /// Local network: also the network's global IPv6 addresses (missing from older engines: on).
+    var ipv6Global: Bool?
+    var ipv4: ForwardFamily?
+    var ipv6: ForwardFamily?
 
     enum CodingKeys: String, CodingKey {
         case id, name, hostPort, guestPort, scope, enabled, session, state, code, message, warning, listen
+        case ipv6Global, ipv4, ipv6
         case proto = "protocol"
     }
+
+    /// The addresses it listens on, IPv4 first.
+    var listen4: [String] { listen.filter { !$0.hasPrefix("[") } }
+    var listen6: [String] { listen.filter { $0.hasPrefix("[") } }
 }
 
 private struct PortForwardList: Decodable {
@@ -40,6 +56,9 @@ struct DeviceAddress: Decodable, Hashable {
     var interface: String
     var address: String
     var family: Int
+    /// A global IPv6 address (the internet may reach it where the router lets IPv6 in).
+    var global: Bool?
+    var isGlobal6: Bool { family == 6 && (global ?? false) }
 }
 
 private struct DeviceAddressList: Decodable {
@@ -89,11 +108,11 @@ enum ForwardScope: Int, CaseIterable, Identifiable {
             return L("只有这台\(PortForwardText.device)上的 App 能连接（例如 iOS 上的远程桌面 App 连 localhost）。",
                      "Only apps on this \(PortForwardText.device) can connect (for example a Remote Desktop app here, to localhost).")
         case .localNetwork:
-            return L("同一 Wi-Fi 或有线网络、或这台\(PortForwardText.device)个人热点上的设备能连接。蜂窝网络和互联网都连不进来。",
-                     "Devices on the same Wi-Fi or wired network, or on this \(PortForwardText.device)'s Personal Hotspot, can connect. Not over cellular, and not from the internet.")
+            return L("同一 Wi-Fi 或有线网络、或这台\(PortForwardText.device)个人热点上的设备能连接，IPv4 和 IPv6 都行。蜂窝网络连不进来。",
+                     "Devices on the same Wi-Fi or wired network, or on this \(PortForwardText.device)'s Personal Hotspot, can connect, over IPv4 and IPv6. Not over cellular.")
         case .vpn:
-            return L("只有 VPN（例如 WireGuard）里的设备能连接；VPN 地址变了会自动跟上。",
-                     "Only devices on your VPN (for example WireGuard) can connect. Follows the VPN's address when it changes.")
+            return L("只有 VPN（例如 WireGuard）里的设备能连接，IPv4 和 IPv6（VPN 的全部地址）都行；VPN 地址变了会自动跟上。",
+                     "Only devices on your VPN (for example WireGuard) can connect, over IPv4 and IPv6 (every address the VPN gives this \(PortForwardText.device)). Follows the VPN's addresses when they change.")
         }
     }
 }
@@ -113,6 +132,8 @@ struct PortForwardDraft: Identifiable {
     var scope: ForwardScope
     var enabled: Bool
     var session: Bool
+    /// Local network: listen on the global IPv6 addresses too (on by default).
+    var ipv6Global: Bool = true
 
     init(_ rule: PortForward) {
         id = rule.id
@@ -124,6 +145,7 @@ struct PortForwardDraft: Identifiable {
         scope = ForwardScope(json: rule.scope)
         enabled = rule.enabled
         session = rule.session
+        ipv6Global = rule.ipv6Global ?? true
     }
 
     init(name: String, proto: ForwardProtocol, hostPort: Int, guestPort: Int) {
@@ -260,7 +282,8 @@ final class PortForwardingModel: ObservableObject {
         }
         let name = d.name.trimmingCharacters(in: .whitespaces)
         if let err = bridge.savePortForward(id: d.id, name: name, protocols: d.proto.rawValue, hostPort: hp,
-                                            guestPort: gp, scope: d.scope.rawValue, enabled: d.enabled) {
+                                            guestPort: gp, scope: d.scope.rawValue, enabled: d.enabled,
+                                            ipv6Global: d.ipv6Global) {
             return L("没有保存：", "Not saved: ") + err
         }
         if d.scope == .localNetwork && d.enabled { localNetwork.check() }
@@ -338,13 +361,16 @@ struct PortForwardingSection: View {
                 }
             }
             if model.needsAddresses {
-                AddressRows(lan: model.lan, vpn: model.vpn, showLAN: model.rules.contains { $0.enabled && $0.scope == "lan" })
+                let lanRules = model.rules.filter { $0.enabled && $0.scope == "lan" }
+                AddressRows(lan: model.lan, vpn: model.vpn, showLAN: !lanRules.isEmpty,
+                            showVPN: model.rules.contains { $0.enabled && $0.scope == "vpn" },
+                            showGlobal6: lanRules.contains { $0.ipv6Global ?? true })
             }
         } header: {
             Text(L("端口转发", "Port forwarding"))
         } footer: {
-            Text(L("把这台\(PortForwardText.device)上的端口转到 Windows 里，例如用其他设备远程桌面或 SSH 连进 Windows。只有 App 在前台时才能连进来：App 到后台后 iOS 会暂停它（Windows 也一起暂停）。在 Windows 里运行 WINKIT 盘上的 REMOTE-DESKTOP.bat 或 SSH-SETUP.bat，打开远程桌面或 SSH 并放行防火墙。",
-                   "Lead a port on this \(PortForwardText.device) to a port in Windows, for example to use Remote Desktop or SSH from another device. Connections only come in while the app is open in the foreground: iOS pauses it, and Windows with it, in the background. In Windows, run REMOTE-DESKTOP.bat or SSH-SETUP.bat on the WINKIT drive to turn on Remote Desktop or SSH and open the firewall."))
+            Text(L("把这台\(PortForwardText.device)上的端口转到 Windows 里，例如用其他设备远程桌面或 SSH 连进 Windows。每个转发都同时监听 IPv4 和 IPv6。App 在前台时才能连进来，除非打开了上面的服务器模式（关闭主机 3D 时，Windows 在后台继续运行）。在 Windows 里运行 WINKIT 盘上的 REMOTE-DESKTOP.bat 或 SSH-SETUP.bat，打开远程桌面或 SSH 并放行防火墙。",
+                   "Lead a port on this \(PortForwardText.device) to a port in Windows, for example to use Remote Desktop or SSH from another device. Every forward listens over IPv4 and IPv6. Connections come in while the app is in the foreground, or in the background too with Server mode above (Windows keeps running there without host 3D). In Windows, run REMOTE-DESKTOP.bat or SSH-SETUP.bat on the WINKIT drive to turn on Remote Desktop or SSH and open the firewall."))
         }
         .onAppear { model.start() }
         .onDisappear { model.stop() }
@@ -386,8 +412,8 @@ private struct PortForwardRow: View {
                     .font(.caption)
                     .foregroundStyle(rule.state == "error" ? .red : .secondary)
             }
-            if !rule.warning.isEmpty && rule.state == "listening" {
-                Text(rule.warning).font(.caption2).foregroundStyle(.orange)
+            if rule.state == "listening" {
+                ForwardFamilyLines(rule: rule)
             }
             if rule.session {
                 Text(L("由 Windows 打开，App 退出后消失。编辑后会保存下来。", "Opened by Windows, until the app quits. Edit it to keep it."))
@@ -416,8 +442,7 @@ private struct PortForwardRow: View {
     private var statusText: String {
         switch rule.state {
         case "listening":
-            let at = rule.listen.joined(separator: ", ")
-            return L("正在监听", "Listening") + (at.isEmpty ? "" : " · " + at)
+            return L("正在监听", "Listening")
         case "waiting": return L("Windows 启动后打开", "Opens when Windows starts")
         case "off":
             switch rule.code {
@@ -446,48 +471,108 @@ private struct PortForwardRow: View {
     }
 }
 
-/// Where other devices connect to: the device's local network and VPN addresses (shown with the forwards that
-/// open beyond the device).
-private struct AddressRows: View {
+/// Each address family of a listening forward on its own line: where it listens, or why it does not.
+struct ForwardFamilyLines: View {
+    let rule: PortForward
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 1) {
+            line("IPv4", rule.ipv4, rule.listen4)
+            line("IPv6", rule.ipv6, rule.listen6)
+        }
+    }
+
+    @ViewBuilder
+    private func line(_ family: String, _ f: ForwardFamily?, _ at: [String]) -> some View {
+        let state = f?.state ?? (at.isEmpty ? "none" : "listening")
+        let message = f?.message ?? ""
+        let text: String = {
+            switch state {
+            case "listening":
+                return family + " · " + at.joined(separator: ", ") + (message.isEmpty ? "" : " · " + message)
+            case "error":
+                return family + " · " + L("打不开：", "not open: ") + message
+            case "none":
+                return family + " · " + (at.isEmpty ? "" : at.joined(separator: ", ") + " · ") + (message.isEmpty ? L("没有地址", "no address") : message)
+            default:
+                return family + " · " + (message.isEmpty ? L("未打开", "not open") : message)
+            }
+        }()
+        Text(text)
+            .font(.caption2.monospaced())
+            .foregroundStyle(state == "error" || (state == "listening" && !message.isEmpty) ? .orange : .secondary)
+            .textSelection(.enabled)
+    }
+}
+
+/// Where to connect to: the device's local network and VPN addresses (both families, with the port when one is
+/// given), and with showLoopback this device itself (127.0.0.1 and [::1], for an app on it).
+struct AddressRows: View {
     let lan: [DeviceAddress]
     let vpn: [DeviceAddress]
     let showLAN: Bool
+    var showVPN: Bool = true
+    /// The local network's global IPv6 addresses (some local network forward listens on them).
+    var showGlobal6: Bool = true
+    var port: Int? = nil
+    var showLoopback: Bool = false
+    var title: String = L("从其他设备连接到", "From another device, connect to")
 
     var body: some View {
         VStack(alignment: .leading, spacing: 4) {
-            Text(L("从其他设备连接到", "From another device, connect to"))
+            Text(title)
                 .font(.caption)
                 .foregroundStyle(.secondary)
+            if showLoopback {
+                row(L("这台\(PortForwardText.device)", "This \(PortForwardText.device)"),
+                    DeviceAddress(interface: "lo0", address: "127.0.0.1", family: 4, global: false))
+                row(L("这台\(PortForwardText.device)", "This \(PortForwardText.device)"),
+                    DeviceAddress(interface: "lo0", address: "::1", family: 6, global: false))
+            }
             if showLAN {
-                if lan.isEmpty {
+                let shown = lan.filter { showGlobal6 || !$0.isGlobal6 }
+                if shown.isEmpty {
                     Text(L("没有连接 Wi-Fi", "Not on Wi-Fi")).font(.callout).foregroundStyle(.secondary)
                 }
-                ForEach(lan, id: \.self) { a in row(label(for: a), a) }
+                ForEach(shown, id: \.self) { a in row(label(for: a), a) }
             }
-            if vpn.isEmpty {
-                if !showLAN { Text(L("没有连接 VPN", "No VPN connected")).font(.callout).foregroundStyle(.secondary) }
-            } else {
-                ForEach(vpn, id: \.self) { a in row("VPN (\(a.interface))", a) }
+            if showVPN {
+                if vpn.isEmpty {
+                    Text(L("没有连接 VPN", "No VPN connected")).font(.callout).foregroundStyle(.secondary)
+                } else {
+                    ForEach(vpn, id: \.self) { a in row("VPN (\(a.interface))", a) }
+                }
             }
         }
     }
 
     private func label(for a: DeviceAddress) -> String {
-        if a.interface.hasPrefix("bridge") { return L("个人热点", "Personal Hotspot") }
-        if a.interface == "en0" { return "Wi-Fi" }
-        return a.interface
+        let base: String
+        if a.interface.hasPrefix("bridge") { base = L("个人热点", "Personal Hotspot") }
+        else if a.interface == "en0" { base = "Wi-Fi" }
+        else { base = a.interface }
+        return a.isGlobal6 ? base + L("（全局）", " (global)") : base
+    }
+
+    private func text(_ a: DeviceAddress) -> String {
+        let host = a.family == 6 ? "[\(a.address)]" : a.address
+        if let port { return "\(host):\(port)" }
+        return host
     }
 
     private func row(_ label: String, _ a: DeviceAddress) -> some View {
-        HStack {
+        HStack(alignment: .firstTextBaseline) {
             Text(label).font(.callout)
-            Spacer()
-            Text(a.family == 6 ? "[\(a.address)]" : a.address)
+            Spacer(minLength: 8)
+            Text(text(a))
                 .font(.callout.monospaced())
+                .lineLimit(1)
+                .minimumScaleFactor(0.6)
                 .textSelection(.enabled)
         }
         .contextMenu {
-            Button(L("拷贝", "Copy")) { UIPasteboard.general.string = a.address }
+            Button(L("拷贝", "Copy")) { UIPasteboard.general.string = text(a) }
+            if port != nil { Button(L("只拷贝地址", "Copy the address only")) { UIPasteboard.general.string = a.address } }
         }
     }
 }
@@ -538,6 +623,19 @@ private struct PortForwardEditor: View {
                     }
                     .pickerStyle(.inline)
                     .labelsHidden()
+                    if draft.scope == .localNetwork {
+                        Toggle(L("IPv6 全局地址", "IPv6 global addresses"), isOn: $draft.ipv6Global)
+                        Label {
+                            Text(draft.ipv6Global
+                                 ? L("也在 Wi-Fi 的 IPv6 全局地址上监听。路由器放行入站 IPv6 时（很多家用路由器默认挡住，但不是全部），互联网上的设备也可能连到这个端口。只想让局域网连，就关掉它：IPv4 和 IPv6 本地地址（fd00::/8）照样能用。",
+                                     "Also listens on the Wi-Fi's global IPv6 addresses. Where the router lets incoming IPv6 through (many home routers block it, not all), devices on the internet may reach this port too. Turn it off to keep it to the local network: IPv4 and the local IPv6 addresses (fd00::/8) still work.")
+                                 : L("只在 IPv4 和 IPv6 本地地址（fd00::/8）上监听。很多家庭网络只有 IPv6 全局地址：那时局域网里的设备只能用 IPv4 连。",
+                                     "Listens on IPv4 and the local IPv6 addresses (fd00::/8) only. Many home networks only have global IPv6 addresses: devices there then connect over IPv4."))
+                                .font(.footnote)
+                        } icon: {
+                            Image(systemName: draft.ipv6Global ? "globe" : "house").foregroundStyle(draft.ipv6Global ? .orange : .secondary)
+                        }
+                    }
                     if draft.scope != .device {
                         Label {
                             Text(L("谁能连上这个端口，谁就能尝试登录 Windows。请给 Windows 账户设一个强密码，用完就关掉这个转发。只在你信任的网络上使用。",
