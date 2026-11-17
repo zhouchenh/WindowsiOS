@@ -167,7 +167,7 @@ PANTHER_UNATTEND_XML = r"""<?xml version="1.0" encoding="utf-8"?>
       <FirstLogonCommands>
         <SynchronousCommand wcm:action="add">
           <Order>1</Order>
-          <CommandLine>cmd /c "powercfg /h off &amp; powercfg /change monitor-timeout-ac 0 &amp; powercfg /change standby-timeout-ac 0"</CommandLine>
+          <CommandLine>cmd /c "powercfg /h off &amp; powercfg /change monitor-timeout-ac 0 &amp; powercfg /change standby-timeout-ac 0 &amp; powercfg /change monitor-timeout-dc 0 &amp; powercfg /change standby-timeout-dc 0 &amp; powercfg /setdcvalueindex scheme_current sub_battery batactioncrit 0 &amp; powercfg /setdcvalueindex scheme_current sub_battery batactionlow 0 &amp; powercfg /setdcvalueindex scheme_current sub_battery batlevelcrit 0 &amp; powercfg /setdcvalueindex scheme_current sub_energysaver esbattthreshold 0 &amp; powercfg /setactive scheme_current"</CommandLine>
           <Description>Disable hibernation and display/sleep timeouts</Description>
         </SynchronousCommand>
         <SynchronousCommand wcm:action="add">

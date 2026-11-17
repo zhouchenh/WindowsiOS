@@ -167,7 +167,9 @@ struct SessionView: View {
 
             MetalDisplayView(
                 directTouch: laptop ? .constant(true) : $vm.directTouch, // the deck has the trackpad
-                multiTouch: vm.multiTouch,
+                // Laptop forces direct touch: multi-touch only when Settings says Multi-touch (a saved
+                // multi-touch flag under Trackpad must not turn on there)
+                multiTouch: laptop ? vm.touchMode == .multiTouch : vm.multiTouch,
                 keyboardVisible: laptop ? .constant(false) : $vm.systemKeyboardVisible,
                 hardwareKeyboard: vm.hardwareKeyboard,
                 focusAllowed: vm.isVMRunning && !vm.showSettings && vm.activeSafariURL == nil,

@@ -73,7 +73,9 @@ else {
 $act = New-ScheduledTaskAction -Execute 'powershell.exe' -Argument "-NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File `"$home3d\winkit.ps1`" -Finish"
 $trg = New-ScheduledTaskTrigger -AtLogOn -User $env:USERNAME
 $prn = New-ScheduledTaskPrincipal -UserId $env:USERNAME -LogonType Interactive -RunLevel Highest
-Register-ScheduledTask -TaskName 'WinKit Finish' -Action $act -Trigger $trg -Principal $prn -Force | Out-Null
+# Battery passthrough: an unplugged iPhone means Windows is on battery, where a task with default settings never starts.
+$set = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries
+Register-ScheduledTask -TaskName 'WinKit Finish' -Action $act -Trigger $trg -Principal $prn -Settings $set -Force | Out-Null
 
 $is3dOk = Gpu | Where-Object { $_.FriendlyName -like '*3D*' -and $_.Status -eq 'OK' }
 if ($is3dOk) {

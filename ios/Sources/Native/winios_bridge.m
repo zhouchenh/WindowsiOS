@@ -1038,8 +1038,11 @@ static BOOL winios_plans_equal(WinIOSDisplayPlan a, WinIOSDisplayPlan b) {
 }
 
 /* An atomic the CPU thread keeps (hv_xhci_poll): no lock, fine to read on every touch. */
+/* Windows only: Linux's hid-multitouch takes this descriptor as a generic (non-Win8) touch screen, which
+   ignores Confidence, so a cancelled contact (tip 0, confidence 0) would act as a tap there. Arch keeps the
+   tablet pointer. */
 - (BOOL)usbTouchReady {
-    return _vmRunning && hv_winvm_touch_ready() != 0;
+    return _vmRunning && !winios_machine_is_linux() && hv_winvm_touch_ready() != 0;
 }
 
 - (uint64_t)usbEventsDelivered {

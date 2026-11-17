@@ -813,7 +813,19 @@ final class MetalCanvasUIView: UIView, UITextInput {
                                     duration: duration)
     }
 
+    /// The viewport as of the last change (a change that moves nothing must not end a touch gesture).
+    private var lastViewport = (zoom: CGFloat(1), offset: CGPoint.zero)
+
     private func viewportChanged() {
+        // Multi-touch maps each finger through the viewport: if the picture moved under fingers that are down
+        // (the keyboard hid and the picture slid back, the caret was followed), they would jump in Windows.
+        // The gesture ends there instead (cancelled in Windows).
+        let now = (zoom: viewport.zoom, offset: viewport.offset)
+        if abs(now.zoom - lastViewport.zoom) > 0.0001 || abs(now.offset.x - lastViewport.offset.x) > 0.5
+            || abs(now.offset.y - lastViewport.offset.y) > 0.5 {
+            takeTouchGestureBack()
+        }
+        lastViewport = now
         KeyboardDiagnostics.shared.zoom = viewport.zoom
         keyBar.miniMap.setNeedsLayout()
         updateFloatingMap()
