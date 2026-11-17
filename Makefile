@@ -14,7 +14,7 @@ ENGINE = $(CORE) $(HOST)
 DEV = $(B)/acpi.o $(B)/acpi_battery.o $(B)/fb_display.o $(B)/fb_metal.o $(B)/fdt.o $(B)/fw_cfg.o $(B)/gicv3.o $(B)/hda.o \
       $(B)/nvme.o $(B)/pcie.o $(B)/pflash.o $(B)/pl011.o $(B)/pl031.o $(B)/pl061.o $(B)/timer.o \
       $(B)/virtio.o $(B)/virtio_blk.o $(B)/virtio_input.o $(B)/virtio_net.o $(B)/virtio_snd.o $(B)/virtio_gpu.o $(B)/virtio_gpu3d.o \
-      $(B)/usb_touch.o $(B)/winvirt.o $(B)/xhci.o
+      $(B)/usb_touch.o $(B)/winvirt.o $(B)/xhci.o $(B)/neptune_hook.o $(B)/neptune_cleanup.o $(B)/neptune_device.o $(B)/dxmt_shared_init.o $(B)/dxmt_data_lock.o
 
 VM_HOST = $(B)/winvm.o $(B)/net_slirp.o $(B)/dns_proxy.o $(B)/share.o $(B)/audio_mac.o $(B)/hvsparse.o
 
@@ -119,6 +119,22 @@ test-net: $(B)/test_net_ipv6 $(B)/test_net_fwd
 	$(B)/test_net_ipv6
 	$(B)/test_net_fwd
 
+# Pinned Neptune/DXMT ABI guards and native cleanup/lifetime failure cases.
+$(B)/test_neptune_cleanup: tests/test_neptune_cleanup.c devices/neptune_cleanup.c devices/neptune_cleanup.h | $(B)
+	$(CC) $(CFLAGS) -Werror -pthread -fsanitize=address,undefined -fno-sanitize-recover=all $< -o $@
+test-neptune: $(B)/test_neptune_cleanup
+	python3 tests/test_neptune_hook.py
+	python3 tests/test_neptune_device.py
+	ASAN_OPTIONS=detect_leaks=0 $(B)/test_neptune_cleanup
+$(B)/test_fb_capture: tests/test_fb_capture.m devices/fb_metal.m devices/fb_display.c devices/*.h core/*.h | $(B)
+	$(CC) $(OBJCFLAGS) -Werror -fsanitize=address,undefined -fno-sanitize-recover=all \
+		tests/test_fb_capture.m devices/fb_display.c -framework Foundation -framework Metal \
+		-framework QuartzCore -framework CoreGraphics -framework ImageIO -o $@
+test-fb-capture: $(B)/test_fb_capture
+	ASAN_OPTIONS=detect_leaks=0 $(B)/test_fb_capture
+test-dxmt-shared-init:
+	python3 tests/test_dxmt_shared_init.py
+
 $(B)/hvsparse: tools/hvsparse_main.c host/hvsparse.c host/hvsparse.h | $(B)
 	$(CC) $(CFLAGS) tools/hvsparse_main.c host/hvsparse.c -o $@
 
@@ -166,7 +182,7 @@ ios-lib: $(IB)/libwinvm.a
 clean:
 	rm -rf $(B)
 
-.PHONY: all test-core test-dns test-net ios-lib clean
+.PHONY: all test-core test-dns test-net test-neptune test-fb-capture test-dxmt-shared-init ios-lib clean
 
 # ---- Windows guest tools: build/guest/WinIOSBrowser.exe (the OAuth bridge, see docs/oauth-bridge.md) ----
 # Freestanding AArch64 Win32: no CRT, only kernel32/ws2_32 imports. Needs Homebrew llvm and lld.
@@ -207,3 +223,29 @@ winkit-img: $(GB)/WinIOSBrowser.exe
 	scripts/make_winkit_img.sh dist/WinKit/drivers.img $(GB)/WinIOSBrowser.exe
 
 .PHONY: winkit-img
+
+# Manual shared-initialization diagnostic; deliberately not part of guest-tools,
+# winkit-img or START.bat. Copy this executable beside shared_init_probe.ps1.
+SHARED_PROBE_KERNEL32 = GetStdHandle WriteFile CreateThread CloseHandle GetTickCount64 Sleep ExitProcess
+$(GB)/shared_probe_kernel32.lib: Makefile | $(GB)
+	{ echo 'LIBRARY kernel32.dll'; echo 'EXPORTS'; for f in $(SHARED_PROBE_KERNEL32); do echo "$$f"; done; } > $(GB)/shared_probe_kernel32.def
+	$(GUEST_LLVM)/llvm-dlltool -m arm64 -d $(GB)/shared_probe_kernel32.def -l $@
+$(GB)/shared_probe_d3d11.lib: Makefile | $(GB)
+	{ echo 'LIBRARY d3d11.dll'; echo 'EXPORTS'; echo 'D3D11CreateDevice'; } > $(GB)/shared_probe_d3d11.def
+	$(GUEST_LLVM)/llvm-dlltool -m arm64 -d $(GB)/shared_probe_d3d11.def -l $@
+$(GB)/shared_probe_dxgi.lib: Makefile | $(GB)
+	{ echo 'LIBRARY dxgi.dll'; echo 'EXPORTS'; echo 'CreateDXGIFactory1'; } > $(GB)/shared_probe_dxgi.def
+	$(GUEST_LLVM)/llvm-dlltool -m arm64 -d $(GB)/shared_probe_dxgi.def -l $@
+$(GB)/shared_init_probe_arm64.obj: tools/shared_init_probe_arm64.c | $(GB)
+	$(GUEST_CC) $(GUEST_CFLAGS) -c $< -o $@
+$(GB)/SharedInitProbe.exe: $(GB)/shared_init_probe_arm64.obj $(GB)/shared_probe_kernel32.lib $(GB)/shared_probe_d3d11.lib $(GB)/shared_probe_dxgi.lib
+	$(GUEST_LLD)/lld-link $(filter-out /subsystem:%,$(GUEST_LDFLAGS)) /subsystem:console,6.02 /out:$@ $^
+shared-init-probe: $(GB)/SharedInitProbe.exe
+.PHONY: shared-init-probe
+
+# Host-side simulated COM/GPU ordering only; never launches the Windows binary.
+$(B)/test_shared_init_probe: tests/test_shared_init_probe.c tools/shared_init_probe_arm64.c | $(B)
+	$(CC) $(CFLAGS) -Werror -fno-builtin $< -o $@
+test-shared-init-probe: $(B)/test_shared_init_probe
+	@for c in control control-data late-zero late-data fixed baseline event-timeout shared-error unsupported bgra-late bgra-control a8-fixed; do $< $$c || exit; done
+.PHONY: test-shared-init-probe

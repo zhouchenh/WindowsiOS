@@ -679,45 +679,68 @@ uint64_t hv_fb_metal_frames(HvFbDisplay *fb) {
     return atomic_load_explicit(&p->framesPresented, memory_order_relaxed);
 }
 
-/* The 3D scanout is a GPU texture (possibly private storage): copy it into a shared one and read that. */
-static uint8_t *copy_texture_pixels(HvFbDisplay *fb, uint32_t *ow, uint32_t *oh) {
-    void *tref = NULL;
-    uint32_t tw = 0, th = 0, rx = 0, ry = 0, rw = 0, rh = 0;
-    if (hv_fb_display_get_texture(fb, &tref, &tw, &th, &rx, &ry, &rw, &rh) != 0) return NULL;
-    id<MTLTexture> src = (__bridge_transfer id<MTLTexture>)tref;
+typedef struct FbCaptureInfo {
+    const char *source, *error;
+    uint64_t serial_before, serial_after;
+    uint32_t width, height;
+    long gpu_status;
+    unsigned long pixel_format;
+} FbCaptureInfo;
+
+/* Only explicit raw captures log provenance; periodic callers stay silent. */
+static void log_capture(const FbCaptureInfo *info, const char *path) {
+    const char *name = strrchr(path, '/');
+    name = name ? name + 1 : path;
+    fprintf(stderr, "winvm: capture file=%s source=%s serial=%llu->%llu size=%ux%u format=%lu gpu_status=%ld error=%s\n",
+            name, info->source, (unsigned long long)info->serial_before, (unsigned long long)info->serial_after,
+            info->width, info->height, info->pixel_format, info->gpu_status, info->error);
+}
+
+/* Read the single retained texture selected by the capture, including its crop.
+ * Do not look up a second scanout: a mode change could select a different source. */
+static uint8_t *copy_texture_pixels(HvFbDisplay *fb, id<MTLTexture> src, uint32_t rx, uint32_t ry,
+                                    uint32_t rw, uint32_t rh, FbCaptureInfo *info) {
+    if (atomic_load(&g_paused)) { info->error = "gpu-paused"; return NULL; }
+    MTLPixelFormat f = src.pixelFormat;
+    info->pixel_format = (unsigned long)f;
+    if (f != MTLPixelFormatBGRA8Unorm && f != MTLPixelFormatBGRA8Unorm_sRGB &&
+        f != MTLPixelFormatRGBA8Unorm && f != MTLPixelFormatRGBA8Unorm_sRGB) {
+        info->error = "unsupported-texture-format";
+        return NULL;
+    }
     HvFbMetalPresenter *p = (__bridge HvFbMetalPresenter *)fb->metal;
     id<MTLDevice> dev = src.device;
     id<MTLCommandQueue> q = (p && p->queue && p->device == dev) ? p->queue : [dev newCommandQueue];
-    if (!q || !rw || !rh) return NULL;
-    MTLTextureDescriptor *td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:src.pixelFormat
+    if (!q || !rw || !rh) { info->error = "no-readback-queue-or-size"; return NULL; }
+    MTLTextureDescriptor *td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:f
                                                                                   width:rw
                                                                                  height:rh
                                                                               mipmapped:NO];
     td.storageMode = MTLStorageModeShared;
     td.usage = MTLTextureUsageShaderRead;
     id<MTLTexture> dst = [dev newTextureWithDescriptor:td];
-    if (!dst) return NULL;
+    if (!dst) { info->error = "readback-texture-allocation"; return NULL; }
     id<MTLCommandBuffer> cb = [q commandBuffer];
+    if (!cb) { info->error = "no-command-buffer"; return NULL; }
     id<MTLBlitCommandEncoder> blit = [cb blitCommandEncoder];
+    if (!blit) { info->error = "no-blit-encoder"; return NULL; }
     [blit copyFromTexture:src sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(rx, ry, 0)
                sourceSize:MTLSizeMake(rw, rh, 1) toTexture:dst destinationSlice:0 destinationLevel:0
         destinationOrigin:MTLOriginMake(0, 0, 0)];
     [blit endEncoding];
     [cb commit];
     [cb waitUntilCompleted];
-    if (cb.status != MTLCommandBufferStatusCompleted) return NULL;
+    info->gpu_status = (long)cb.status;
+    if (cb.status != MTLCommandBufferStatusCompleted) { info->error = "gpu-readback-failed"; return NULL; }
     uint8_t *px = malloc((size_t)rw * rh * 4);
-    if (!px) return NULL;
+    if (!px) { info->error = "pixel-allocation"; return NULL; }
     [dst getBytes:px bytesPerRow:rw * 4 fromRegion:MTLRegionMake2D(0, 0, rw, rh) mipmapLevel:0];
-    MTLPixelFormat f = src.pixelFormat;
     if (f == MTLPixelFormatRGBA8Unorm || f == MTLPixelFormatRGBA8Unorm_sRGB) /* to BGRA for the encoder below */
         for (size_t i = 0; i < (size_t)rw * rh; i++) {
             uint8_t t = px[i * 4];
             px[i * 4] = px[i * 4 + 2];
             px[i * 4 + 2] = t;
         }
-    *ow = rw;
-    *oh = rh;
     return px;
 }
 
@@ -740,27 +763,38 @@ static void blend_cursor(HvFbDisplay *fb, uint8_t *px, uint32_t w, uint32_t h, u
     free(cpx);
 }
 
-uint8_t *hv_fb_metal_snapshot(HvFbDisplay *fb, int allow_gpu, uint32_t *ow, uint32_t *oh) {
-    if (!fb) return NULL;
+static uint8_t *capture_pixels(HvFbDisplay *fb, int allow_gpu, uint32_t *ow, uint32_t *oh, FbCaptureInfo *info) {
+    *info = (FbCaptureInfo){.source = "none", .error = "none", .gpu_status = -1};
+    if (!fb) { info->error = "no-display"; return NULL; }
+    info->serial_before = __atomic_load_n(&fb->ovr_serial, __ATOMIC_RELAXED);
     uint32_t w = 0, h = 0;
     uint8_t *copy = NULL;
     void *tref = NULL;
     uint32_t tw, th, rx, ry, rw, rh;
     int texture = hv_fb_display_get_texture(fb, &tref, &tw, &th, &rx, &ry, &rw, &rh) == 0;
-    if (texture) CFRelease(tref);
     if (texture) {
-        if (!allow_gpu) return NULL; /* a 3D frame lives on the GPU */
+        info->source = "texture";
+        info->width = w = rw;
+        info->height = h = rh;
         @autoreleasepool {
-            copy = copy_texture_pixels(fb, &w, &h);
+            id<MTLTexture> src = (__bridge_transfer id<MTLTexture>)tref;
+            if (allow_gpu) copy = copy_texture_pixels(fb, src, rx, ry, rw, rh, info);
+            else info->error = "gpu-readback-disallowed";
         }
         if (!copy && allow_gpu < 2) return NULL;
     }
     if (!copy) {
+        info->source = texture ? "cpu-fallback" : "cpu";
         const uint8_t *px = NULL;
         uint32_t stride = 0;
-        if (hv_fb_display_get_frame(fb, &px, &w, &h, &stride) != 0 || !w || !h) return NULL;
+        if (hv_fb_display_get_frame(fb, &px, &w, &h, &stride) != 0 || !w || !h) {
+            info->error = "no-cpu-frame";
+            return NULL;
+        }
+        info->width = w;
+        info->height = h;
         copy = malloc((size_t)w * h * 4);
-        if (!copy) return NULL;
+        if (!copy) { info->error = "pixel-allocation"; return NULL; }
         for (uint32_t y = 0; y < h; y++) memcpy(copy + (size_t)y * w * 4, px + (size_t)y * stride, (size_t)w * 4);
     }
     blend_cursor(fb, copy, w, h, w * 4);
@@ -769,6 +803,11 @@ uint8_t *hv_fb_metal_snapshot(HvFbDisplay *fb, int allow_gpu, uint32_t *ow, uint
     *ow = w;
     *oh = h;
     return copy;
+}
+
+uint8_t *hv_fb_metal_snapshot(HvFbDisplay *fb, int allow_gpu, uint32_t *ow, uint32_t *oh) {
+    FbCaptureInfo info;
+    return capture_pixels(fb, allow_gpu, ow, oh, &info);
 }
 
 uint64_t hv_fb_metal_screen_serial(HvFbDisplay *fb, int *is_texture) {
@@ -808,11 +847,18 @@ void hv_fb_metal_set_paused(HvFbDisplay *fb, int paused) {
     fprintf(stderr, "winvm: presenter %s\n", paused ? "paused (app in the background)" : "running again");
 }
 
-int hv_fb_save_png(HvFbDisplay *fb, const char *path) {
+static int save_png(HvFbDisplay *fb, const char *path, int strict) {
     if (!fb || !path) return -1;
     uint32_t w = 0, h = 0;
-    uint8_t *copy = hv_fb_metal_snapshot(fb, 2, &w, &h);
-    if (!copy) return -1;
+    FbCaptureInfo info;
+    /* A raw-screen diagnostic must not silently substitute stale ramfb pixels
+     * when the active 3D texture cannot be read. CPU-only displays still work. */
+    uint8_t *copy = capture_pixels(fb, strict ? 1 : 2, &w, &h, &info);
+    info.serial_after = __atomic_load_n(&fb->ovr_serial, __ATOMIC_RELAXED);
+    if (!copy) {
+        if (strict) log_capture(&info, path);
+        return -1;
+    }
     @autoreleasepool {
         uint32_t stride = w * 4;
         size_t total = (size_t)stride * h;
@@ -834,6 +880,16 @@ int hv_fb_save_png(HvFbDisplay *fb, const char *path) {
         CGDataProviderRelease(prov);
         CGColorSpaceRelease(cs);
         free(copy);
+        info.error = rc ? "png-encode-or-write" : "none";
+        if (strict) log_capture(&info, path);
         return rc;
     }
+}
+
+int hv_fb_save_png(HvFbDisplay *fb, const char *path) {
+    return save_png(fb, path, 0);
+}
+
+int hv_fb_save_png_raw(HvFbDisplay *fb, const char *path) {
+    return save_png(fb, path, 1);
 }

@@ -19,6 +19,8 @@
 #include "dispatch.h"
 #include "net_slirp.h"
 #include "share.h"
+#include "virtio_gpu3d.h"
+#include "dxmt_shared_init.h"
 
 static HvMachine m;
 static HvCpu cpus[HV_MAX_CPUS];
@@ -148,6 +150,11 @@ int hv_winvm_gpu_set_3d(int on) {
     return board.gpu ? hv_virtio_gpu_set_3d(board.gpu, on) : -1;
 }
 
+void hv_winvm_set_gpu_allowed(int allowed) {
+    hv_vgpu3d_set_cleanup_active(allowed);
+    hv_dxmt_shared_init_set_gpu_allowed(allowed);
+}
+
 void hv_winvm_gpu_mode(int *capable, int *offered3d, int *negotiated3d, int *driver_ok, uint32_t *resets) {
     HvVgpuMode m;
     hv_virtio_gpu_mode(board.gpu, &m);
@@ -159,6 +166,7 @@ void hv_winvm_gpu_mode(int *capable, int *offered3d, int *negotiated3d, int *dri
 }
 
 void hv_winvm_gpu_set_background(int on) {
+    hv_dxmt_shared_init_set_draining(on);
     hv_virtio_gpu_set_background(board.gpu, on);
 }
 
@@ -174,6 +182,7 @@ uint64_t hv_winvm_display_serial(int *is_texture) {
 }
 
 void hv_winvm_display_set_paused(int paused) {
+    hv_dxmt_shared_init_set_presenter_paused(paused);
     HvFbDisplay *fb = atomic_load_explicit(&display_fb, memory_order_acquire);
     hv_fb_metal_set_paused(fb, paused);
 }
@@ -190,6 +199,11 @@ int hv_winvm_save_png(const char *path) {
     HvFbDisplay *fb = atomic_load_explicit(&display_fb, memory_order_acquire);
     return fb ? hv_fb_save_png(fb, path) : -1;
 }
+int hv_winvm_save_png_raw(const char *path) {
+    HvFbDisplay *fb = atomic_load_explicit(&display_fb, memory_order_acquire);
+    return fb ? hv_fb_save_png_raw(fb, path) : -1;
+}
+
 
 int hv_winvm_create(const HvWinVmConfig *c, char *err, size_t errlen) {
     if (!c || !c->code_fd || !c->vars_fd)
@@ -366,6 +380,7 @@ int hv_winvm_run_cpu0(void) {
             spawn_secondaries();
             continue;
         }
+        hv_dxmt_shared_init_reset();
         return r;
     }
 }

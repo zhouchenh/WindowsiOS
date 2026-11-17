@@ -459,6 +459,7 @@ static const AVAudioSessionCategoryOptions kWinIOSAudioOptions = AVAudioSessionC
 
 - (void)onAppBackground:(NSNotification *)note {
     (void)note;
+    hv_winvm_set_gpu_allowed(0); /* includes already-entered backend work on every trip */
     _inBackground = YES;
     [self cancelAllTouchContacts]; /* no finger stays down in Windows while the app is away */
     if (!_vmRunning) return;
@@ -530,6 +531,7 @@ static const AVAudioSessionCategoryOptions kWinIOSAudioOptions = AVAudioSessionC
 
 - (void)onAppActive:(NSNotification *)note {
     (void)note;
+    hv_winvm_set_gpu_allowed(1);
     [self resumeFromBackground];
     /* only now, not at WillEnterForeground: the GPU is refused until the app is active again */
     [self endAutoSwitchAway];
@@ -583,7 +585,7 @@ static const AVAudioSessionCategoryOptions kWinIOSAudioOptions = AVAudioSessionC
 
 - (nullable NSString *)gpuStatusLine {
     if (!_vmRunning) return nil;
-    char line[1024];
+    char line[2048];
     if (hv_winvm_gpu_status(line, sizeof line) < 0) return nil;
     return [NSString stringWithUTF8String:line];
 }
@@ -2253,7 +2255,7 @@ static void winios_type_run(NSString *text) {
     double hingeDeg = _hingeAngleDegrees;
     os_unfair_lock_unlock(&_metricsLock);
 
-    char gpuLine[1536] = "none";
+    char gpuLine[2048] = "none";
     if (running && hv_winvm_gpu_status(gpuLine, sizeof gpuLine) < 0) snprintf(gpuLine, sizeof gpuLine, "none");
 
     NSString *txt = [NSString stringWithFormat:
@@ -2501,7 +2503,7 @@ static void winios_after(double seconds, dispatch_block_t block) {
     f.dateFormat = @"yyyyMMdd-HHmmss";
     NSString *name = [NSString stringWithFormat:@"screen-%@.png", [f stringFromDate:[NSDate date]]];
     NSString *path = [docs stringByAppendingPathComponent:name];
-    if (hv_winvm_save_png(path.fileSystemRepresentation) != 0) {
+    if (hv_winvm_save_png_raw(path.fileSystemRepresentation) != 0) {
         fprintf(stderr, "winvm: screen capture: failed\n");
         return nil;
     }
