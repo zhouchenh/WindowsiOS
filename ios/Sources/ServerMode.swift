@@ -155,7 +155,7 @@ final class ServerModeController: ObservableObject {
     /// with nothing in the way (no host 3D, no switch pending, no debugger) running. Never Linux.
     var pipCanRun: Bool {
         let b = bridge
-        guard !isLinux, b.isVMRunning else { return false }
+        guard !isLinux, b.isVMRunning, !b.guardPaused else { return false } // a guard pause keeps Windows paused
         return b.autoSwitchPossible || (backgroundRunning && b.backgroundBlocker == .nothing)
     }
 
@@ -328,6 +328,7 @@ final class ServerModeController: ObservableObject {
 
     /// Offers the new mode and has Windows restart its display adapter; progress in graphicsPhase.
     func switchGraphics(to3D: Bool) {
+        defer { applyPiP() } // arming follows the graphics state at once, not only on the next tick
         guard !graphicsPhase.busy else { return }
         guard UIApplication.shared.applicationState == .active else {
             graphicsPhase = .failed(L("App 在后台时不能切换：离开 3D 需要用 GPU。", "Not while the app is in the background: leaving 3D needs the GPU."))

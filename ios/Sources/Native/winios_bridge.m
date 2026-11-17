@@ -656,7 +656,9 @@ static const AVAudioSessionCategoryOptions kWinIOSAudioOptions = AVAudioSessionC
     _autoWatch = nil;
     hv_winvm_gpu_set_background(0);
     WinIOSGraphicsMode g = [self graphicsMode];
-    BOOL unanswered = g.negotiated3D && !g.offered3D && ![self graphicsReportAnswers:_autoSeq];
+    /* "never answered" needs real evidence: the task polls once a second and reports only after pnputil and its settle
+       loop, so a short trip always looks unanswered. Only after 15 s of Windows running with no report. */
+    BOOL unanswered = g.negotiated3D && !g.offered3D && _autoRunSecs > 15.0 && ![self graphicsReportAnswers:_autoSeq];
     if (unanswered && _autoWithdrew3D && hv_winvm_gpu_set_3d(1) == 0) {
         /* Windows never answered this trip's request: 3D is offered again, so a later driver reset or restart does
            not come up without 3D (the evidence for the graphics task was there, but the task did not run) */
