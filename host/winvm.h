@@ -55,6 +55,9 @@ int hv_winvm_gpu_status(char *buf, unsigned len);
 /* Graphics hot switch (virtio_gpu.h): offer 3D or 2D from the guest's next display driver start. 0, or -1 when
    3D is asked for without the renderer loaded (the machine started without host 3D). */
 int hv_winvm_gpu_set_3d(int on);
+/* Deferred 3D cleanup may read GPU completion while active/inactive, never while in
+   the background. Safe before VM start; does not wait for a cleanup worker. */
+void hv_winvm_set_gpu_allowed(int allowed);
 /* The mode: capable, offered3d, negotiated3d, driver_ok, resets (all 0 without virtio-gpu). */
 void hv_winvm_gpu_mode(int *capable, int *offered3d, int *negotiated3d, int *driver_ok, uint32_t *resets);
 /* The app is in the background (1) or back in front (0): the 3D renderer's background drain (virtio_gpu3d.h). */

@@ -27,6 +27,9 @@
 #define VIRGL_RENDERER_UNSTABLE_APIS 1
 #include "virglrenderer.h"
 #include "virtio_gpu.h"
+#include "neptune_hook.h"
+#include "neptune_cleanup.h"
+#include "neptune_device.h"
 
 /* ---- protocol ---- */
 #define F_VIRGL (1ull << 0)
@@ -341,6 +344,18 @@ static int rebind_shm(void *any_symbol_in_image) {
 }
 
 /* ---- loading ---- */
+static const char *cleanup_disabled;
+
+static const char *cleanup_status(void) {
+    return cleanup_disabled ? cleanup_disabled : hv_npt_hook_status();
+}
+
+static double teardown_time_ms(void) {
+    struct timespec ts;
+    if (clock_gettime(CLOCK_MONOTONIC, &ts)) return 0;
+    return (double)ts.tv_sec * 1000.0 + (double)ts.tv_nsec / 1000000.0;
+}
+
 static void *open_fw(const char *dir, const char *rel, int global) {
     char p[PATH_MAX];
     snprintf(p, sizeof p, "%s/%s", dir, rel);
@@ -444,12 +459,33 @@ static int load_libs(HvVgpu3d *s) {
     /* DXMT shares textures with virglrenderer through shm_open too: same redirection, before
        Neptune loads it (same path, so the same image). */
     const char *dxmt = getenv("NPT_D3D11_LIBRARY_PATH");
+    void *dxmt_symbol = NULL;
     if (dxmt) {
         void *dh = dlopen(dxmt, RTLD_NOW | RTLD_LOCAL);
         void *sym = dh ? dlsym(dh, "D3D11CreateDevice") : NULL;
+        dxmt_symbol = sym;
         int rb2 = sym ? rebind_shm(sym) : -1;
         LOG("shm_open rebound in dxmt: %d slots\n", rb2);
     }
+    const char *defer = getenv("HV_NPT_DEFER_RELEASE");
+    const char *backend = getenv("NPT_BACKEND");
+    cleanup_disabled = defer && !strcmp(defer, "0") ? "disabled by HV_NPT_DEFER_RELEASE=0"
+                       : backend && strcmp(backend, "dxmt") ? "disabled for non-DXMT backend" : NULL;
+    if (!cleanup_disabled) {
+        int installed = hv_npt_install_device_hooks(dxmt_symbol);
+        WARN("DXMT device lifetime: %s\n", hv_npt_device_hook_status());
+        if (installed < 0) {
+            snprintf(s->why, sizeof s->why, "DXMT lifetime hook rollback failed; device creation refused");
+            return -1;
+        }
+        if (installed) {
+            hv_npt_cleanup_set_backend_verified(1);
+            hv_npt_install_free_hook((void *)V.virgl_renderer_init, hv_npt_capture_object, hv_npt_cleanup_submit);
+        } else {
+            cleanup_disabled = "disabled: DXMT lifetime hooks unavailable";
+        }
+    }
+    WARN("Neptune cleanup: %s\n", cleanup_status());
     LOG("shm_open rebound in virglrenderer: %d slots (files in %s)\n", rb, shm_dir);
     return 0;
 }
@@ -851,7 +887,9 @@ static uint32_t process(HvVgpu3d *s, const HvVirtqElem *e, const Hdr *h, uint32_
             }
         }
         LOG("ctx %u destroy (%d ring fences still parked on it answered)\n", h->ctx_id, n);
+        double started = teardown_time_ms();
         V.virgl_renderer_context_destroy(h->ctx_id);
+        double elapsed = teardown_time_ms() - started;
         int li = live_index(s, h->ctx_id);
         uint32_t cap = li >= 0 ? s->live[li].capset : 0;
         if (li >= 0) {
@@ -862,6 +900,9 @@ static uint32_t process(HvVgpu3d *s, const HvVirtqElem *e, const Hdr *h, uint32_
             s->ctx_destroy_unknown++;
         }
         live_log(s, li >= 0 ? "destroyed" : "destroyed (not known as live)", h->ctx_id, cap, "");
+        if (cap == CAPSET_NEPTUNE)
+            WARN("ctx %u Neptune teardown returned in %.1f ms; cleanup=%s (compare memory census after GPU retirement)\n",
+                 h->ctx_id, elapsed, cleanup_status());
         return 0;
     }
     case CMD_CTX_ATTACH_RESOURCE:
@@ -1267,8 +1308,13 @@ static void renderer_reset(HvVgpu3d *s) {
     for (int i = 0; i < MAX_RES3D; i++)
         if (s->res[i].id) unmap_blob(s, &s->res[i]);
     if (s->nlive) WARN("renderer reset: %u live contexts (%u neptune) go with it\n", s->nlive, s->nlive_npt);
-    s->nlive = s->nlive_npt = 0;
+    uint32_t dropped_neptune = s->nlive_npt;
+    double started = teardown_time_ms();
     V.virgl_renderer_reset();
+    s->nlive = s->nlive_npt = 0;
+    if (dropped_neptune)
+        WARN("renderer reset returned in %.1f ms: %u Neptune contexts; cleanup=%s (compare memory census after GPU retirement)\n",
+             teardown_time_ms() - started, dropped_neptune, cleanup_status());
     for (int i = 0; i < MAX_RES3D; i++) {
         free(s->res[i].iov);
         memset(&s->res[i], 0, sizeof s->res[i]);
@@ -1587,17 +1633,20 @@ void hv_vgpu3d_bar_update(HvVgpu3d *s) {
 }
 
 int hv_vgpu3d_describe(HvVgpu3d *s, char *buf, unsigned len) {
+    hv_npt_cleanup_poll();
     if (!s) s = g_state;
     if (!s) return snprintf(buf, len, "off");
     if (s->init_ok < 0) return snprintf(buf, len, "unavailable (%s)", s->why);
     pthread_mutex_lock(&s->mu);
     int drain_on = s->drain.on;
     pthread_mutex_unlock(&s->mu);
+    char cleanup[512];
+    hv_npt_cleanup_describe(cleanup, sizeof cleanup);
     return snprintf(buf, len,
-                    "on capsets=%u ctxs=%llu cmds=%llu submits=%llu (%lluKB) blobs=%llu maps=%llu fences=%llu "
+                    "on cleanup=%s %s capsets=%u ctxs=%llu cmds=%llu submits=%llu (%lluKB) blobs=%llu maps=%llu fences=%llu "
                     "(ring %llu global %llu) errors=%llu submit_errors=%llu live_ctxs=%u (neptune %u, peak %u) scanout=%u %ux%u%s "
                     "resets=%llu (skipped %llu) hostmem@%#llx drain=%s trips=%llu drained=%llu (ring %llu global %llu, this trip %llu, oldest %llums)",
-                    s->ncapsets, (unsigned long long)s->ctxs, (unsigned long long)s->cmds,
+                    cleanup_status(), cleanup, s->ncapsets, (unsigned long long)s->ctxs, (unsigned long long)s->cmds,
                     (unsigned long long)s->submits, (unsigned long long)(s->submit_bytes >> 10),
                     (unsigned long long)s->blobs, (unsigned long long)s->maps, (unsigned long long)s->fences,
                     (unsigned long long)s->fenced_ring, (unsigned long long)s->fenced_global,
@@ -1610,4 +1659,8 @@ int hv_vgpu3d_describe(HvVgpu3d *s, char *buf, unsigned len) {
                     (unsigned long long)(s->drained_ring + s->drained_global), (unsigned long long)s->drained_ring,
                     (unsigned long long)s->drained_global, (unsigned long long)s->drained_trip,
                     (unsigned long long)(s->drain_max_age_ns / 1000000ull));
+}
+
+void hv_vgpu3d_set_cleanup_active(int active) {
+    hv_npt_cleanup_set_active(active);
 }

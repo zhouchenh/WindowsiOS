@@ -14,7 +14,7 @@ ENGINE = $(CORE) $(HOST)
 DEV = $(B)/acpi.o $(B)/acpi_battery.o $(B)/fb_display.o $(B)/fb_metal.o $(B)/fdt.o $(B)/fw_cfg.o $(B)/gicv3.o $(B)/hda.o \
       $(B)/nvme.o $(B)/pcie.o $(B)/pflash.o $(B)/pl011.o $(B)/pl031.o $(B)/pl061.o $(B)/timer.o \
       $(B)/virtio.o $(B)/virtio_blk.o $(B)/virtio_input.o $(B)/virtio_net.o $(B)/virtio_snd.o $(B)/virtio_gpu.o $(B)/virtio_gpu3d.o \
-      $(B)/usb_touch.o $(B)/winvirt.o $(B)/xhci.o
+      $(B)/usb_touch.o $(B)/winvirt.o $(B)/xhci.o $(B)/neptune_hook.o $(B)/neptune_cleanup.o $(B)/neptune_device.o
 
 VM_HOST = $(B)/winvm.o $(B)/net_slirp.o $(B)/dns_proxy.o $(B)/share.o $(B)/audio_mac.o $(B)/hvsparse.o
 
@@ -119,6 +119,14 @@ test-net: $(B)/test_net_ipv6 $(B)/test_net_fwd
 	$(B)/test_net_ipv6
 	$(B)/test_net_fwd
 
+# Pinned Neptune/DXMT ABI guards and native cleanup/lifetime failure cases.
+$(B)/test_neptune_cleanup: tests/test_neptune_cleanup.c devices/neptune_cleanup.c devices/neptune_cleanup.h | $(B)
+	$(CC) $(CFLAGS) -Werror -pthread -fsanitize=address,undefined -fno-sanitize-recover=all $< -o $@
+test-neptune: $(B)/test_neptune_cleanup
+	python3 tests/test_neptune_hook.py
+	python3 tests/test_neptune_device.py
+	ASAN_OPTIONS=detect_leaks=0 $(B)/test_neptune_cleanup
+
 $(B)/hvsparse: tools/hvsparse_main.c host/hvsparse.c host/hvsparse.h | $(B)
 	$(CC) $(CFLAGS) tools/hvsparse_main.c host/hvsparse.c -o $@
 
@@ -166,7 +174,7 @@ ios-lib: $(IB)/libwinvm.a
 clean:
 	rm -rf $(B)
 
-.PHONY: all test-core test-dns test-net ios-lib clean
+.PHONY: all test-core test-dns test-net test-neptune ios-lib clean
 
 # ---- Windows guest tools: build/guest/WinIOSBrowser.exe (the OAuth bridge, see docs/oauth-bridge.md) ----
 # Freestanding AArch64 Win32: no CRT, only kernel32/ws2_32 imports. Needs Homebrew llvm and lld.

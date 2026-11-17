@@ -77,5 +77,8 @@ static inline int hv_vgpu3d_drain_due(const HvVgpu3dDrain *d, uint64_t parked_ns
 /* PCI config written: (re)place the hostmem window where the BAR now points. */
 void hv_vgpu3d_bar_update(HvVgpu3d *s);
 int hv_vgpu3d_describe(HvVgpu3d *s, char *buf, unsigned len);
+/* Lifecycle gate for deferred Neptune cleanup. Safe before renderer creation;
+   backgrounding never waits for a backend call or releases quarantined references. */
+void hv_vgpu3d_set_cleanup_active(int active);
 
 #endif

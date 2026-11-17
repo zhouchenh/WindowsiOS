@@ -19,6 +19,7 @@
 #include "dispatch.h"
 #include "net_slirp.h"
 #include "share.h"
+#include "virtio_gpu3d.h"
 
 static HvMachine m;
 static HvCpu cpus[HV_MAX_CPUS];
@@ -146,6 +147,10 @@ uint64_t hv_winvm_display_frames(void) {
 
 int hv_winvm_gpu_set_3d(int on) {
     return board.gpu ? hv_virtio_gpu_set_3d(board.gpu, on) : -1;
+}
+
+void hv_winvm_set_gpu_allowed(int allowed) {
+    hv_vgpu3d_set_cleanup_active(allowed);
 }
 
 void hv_winvm_gpu_mode(int *capable, int *offered3d, int *negotiated3d, int *driver_ok, uint32_t *resets) {
