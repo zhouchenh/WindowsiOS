@@ -15,6 +15,9 @@
 #include <stdatomic.h>
 #import <Metal/Metal.h>
 #include <mach/mach_time.h>
+#include <mach/mach.h>
+#include <os/proc.h>
+#include <pthread.h>
 #include <os/lock.h>
 #include <sys/stat.h>
 
@@ -155,6 +158,58 @@ static void winios_capture_stderr(NSString *docs) {
         winios_log_to_file = 1;
         fprintf(stderr, "winvm.log: stderr captured\n");
     }
+}
+
+
+/* One line in winvm.log (stderr) when memory or the 3D threads moved: Metal refusing a 32 MB buffer
+   crashed DXMT (scripts/patch_dxmt.py), so the log should show which limit was near (the footprint,
+   what iOS still allows, Metal's own allocations) and whether DXMT's command queues (one
+   dxmt-encode thread each) outnumber Neptune's contexts (one npt-ring thread each). Called on the
+   diagnostics queue every few seconds while the VM runs. */
+static void winios_log_memory_census(void) {
+    static id<MTLDevice> metal;
+    static uint64_t last_fp, last_metal;
+    static unsigned last_encode = ~0u, last_ring = ~0u;
+    if (!metal) metal = MTLCreateSystemDefaultDevice();
+    task_vm_info_data_t vm;
+    mach_msg_type_number_t cnt = TASK_VM_INFO_COUNT;
+    uint64_t fp = 0, vsize = 0;
+    if (task_info(mach_task_self(), TASK_VM_INFO, (task_info_t)&vm, &cnt) == KERN_SUCCESS) {
+        vsize = vm.virtual_size;
+        if (cnt >= TASK_VM_INFO_REV1_COUNT) fp = vm.phys_footprint;
+    }
+    uint64_t avail = os_proc_available_memory();
+    uint64_t mtl = metal ? metal.currentAllocatedSize : 0;
+    unsigned encode = 0, ring = 0, queue = 0, total = 0;
+    thread_act_array_t threads;
+    mach_msg_type_number_t nthreads = 0;
+    if (task_threads(mach_task_self(), &threads, &nthreads) == KERN_SUCCESS) {
+        total = nthreads;
+        for (mach_msg_type_number_t i = 0; i < nthreads; i++) {
+            thread_extended_info_data_t info;
+            mach_msg_type_number_t icnt = THREAD_EXTENDED_INFO_COUNT;
+            if (thread_info(threads[i], THREAD_EXTENDED_INFO, (thread_info_t)&info, &icnt) == KERN_SUCCESS) {
+                if (!strncmp(info.pth_name, "dxmt-encode", 11)) encode++;
+                else if (!strncmp(info.pth_name, "npt-ring", 8)) ring++;
+                else if (!strncmp(info.pth_name, "npt-queue", 9)) queue++;
+            }
+            mach_port_deallocate(mach_task_self(), threads[i]);
+        }
+        vm_deallocate(mach_task_self(), (vm_address_t)threads, nthreads * sizeof(thread_act_t));
+    }
+    const uint64_t step = 64ull << 20;
+    if (encode == last_encode && ring == last_ring && (fp > last_fp ? fp - last_fp : last_fp - fp) < step &&
+        (mtl > last_metal ? mtl - last_metal : last_metal - mtl) < step)
+        return;
+    last_fp = fp;
+    last_metal = mtl;
+    last_encode = encode;
+    last_ring = ring;
+    fprintf(stderr, "memory: footprint %lluMB, iOS allows %lluMB more, Metal %lluMB (working set %lluMB), address space %lluMB; "
+                    "threads %u: dxmt-encode %u, npt-ring %u, npt-queue %u\n",
+            (unsigned long long)(fp >> 20), (unsigned long long)(avail >> 20), (unsigned long long)(mtl >> 20),
+            (unsigned long long)(metal ? metal.recommendedMaxWorkingSetSize >> 20 : 0), (unsigned long long)(vsize >> 20),
+            total, encode, ring, queue);
 }
 
 @implementation WinIOSBridge
@@ -1541,7 +1596,7 @@ static void winios_type_run(NSString *text) {
     double hingeDeg = _hingeAngleDegrees;
     os_unfair_lock_unlock(&_metricsLock);
 
-    char gpuLine[768] = "none";
+    char gpuLine[1536] = "none";
     if (running && hv_winvm_gpu_status(gpuLine, sizeof gpuLine) < 0) snprintf(gpuLine, sizeof gpuLine, "none");
 
     NSString *txt = [NSString stringWithFormat:
@@ -1612,6 +1667,7 @@ static void winios_type_run(NSString *text) {
             ps.src_w, ps.src_h, ps.dst_w, ps.dst_h, ps.scale_x100 / 100.0];
     }
     [txt writeToFile:statusFile atomically:YES encoding:NSUTF8StringEncoding error:nil];
+    if (running) winios_log_memory_census();
 }
 
 - (void)handleVMExitWithReason:(NSString *)reason {

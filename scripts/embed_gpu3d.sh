@@ -16,6 +16,8 @@ for f in virglrenderer.1 epoxy.0 vulkan.1 EGL GLESv2 dxmt-native vulkan_kosmickr
     # A patched copy in work/3d/fw-override wins (see scripts/patch_kosmickrisp.py).
     OV="$(cd "$(dirname "$0")/.." && pwd)/work/3d/fw-override/$f.framework"
     if [ -d "$OV" ]; then cp -R "$OV" "$FW/"; echo "using patched $f"; else cp -R "$SRC/$f.framework" "$FW/"; fi
+    # DXMT: a Metal buffer that could not be made is skipped instead of written through (patch_dxmt.py).
+    if [ "$f" = dxmt-native ]; then python3 -I "$(dirname "$0")/patch_dxmt.py" "$FW/$f.framework/$f"; fi
     rm -rf "$FW/$f.framework/_CodeSignature"
     codesign --force --sign "$IDENT" --timestamp=none "$FW/$f.framework"
 done

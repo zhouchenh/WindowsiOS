@@ -48,3 +48,10 @@ The JIT script henge-jit.js (in the app, run by the built-in helper or by StikDe
 StikDebug's universal.js (https://github.com/StephenDev0/StikDebug, StikDebug/Scripts/
 universal.js) as adapted by Henge. That file has no licence header of its own; the StikDebug
 repository is under the GNU Affero General Public License, version 3.
+
+3D graphics: Frameworks/dxmt-native.framework is DXMT (https://github.com/3Shain/dxmt, GNU
+Lesser General Public License, version 2.1 or later) as built for iOS by UTM
+(https://github.com/utmapp/dxmt, its pin 66e27f3 or 8b9d334). It is modified by us after
+building: scripts/patch_dxmt.py in the Apple VM repository changes 67 bytes so that a Metal
+buffer that could not be created is skipped instead of written through (the script lists every
+change). The source code of DXMT is available at the addresses above.

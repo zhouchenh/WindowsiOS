@@ -200,7 +200,11 @@ struct HvVgpu3d {
     /* worker only */
     Parked *fenceq;
     uint32_t nparked_global;
-    uint32_t ctx_capset[64];              /* capset each context was created with, by ctx_id (logging) */
+    /* Live contexts and their capsets, for the log: whether Windows' contexts come and go as they should
+       (a crash in DXMT after a display change came with more DXMT devices than live contexts). */
+    struct { uint32_t id; uint8_t capset; } live[256];
+    uint32_t nlive, nlive_npt, peak_live;
+    uint64_t ctx_failed, ctx_destroyed, ctx_destroy_unknown;
     uint64_t fenced_ring, fenced_global; /* fenced commands by timeline */
     Res3d res[MAX_RES3D];
     uint32_t capsets[8], ncapsets;
@@ -754,6 +758,25 @@ static void readback_scanout(HvVgpu3d *s) {
     hv_fb_display_set_override(s->g->fb, s->readback, s->sc_w, s->sc_h, s->sc_w * 4);
 }
 
+/* ---- live contexts (worker only) ---- */
+static int live_index(HvVgpu3d *s, uint32_t id) {
+    for (uint32_t i = 0; i < s->nlive; i++)
+        if (s->live[i].id == id) return (int)i;
+    return -1;
+}
+
+/* One line per context create or destroy (a few a minute; stderr is winvm.log, which a crash keeps). */
+static void live_log(HvVgpu3d *s, const char *what, uint32_t id, uint32_t capset, const char *name) {
+    char ids[256];
+    int n = 0;
+    ids[0] = 0;
+    for (uint32_t i = 0; i < s->nlive && n < (int)sizeof ids - 12; i++)
+        n += snprintf(ids + n, sizeof ids - (size_t)n, " %u%s", s->live[i].id, s->live[i].capset == CAPSET_NEPTUNE ? "n" : "");
+    WARN("ctx %u %s (capset %u%s%s): live %u, neptune %u, peak %u, destroyed %llu, failed %llu, unknown %llu:%s\n", id,
+         what, capset, *name ? " " : "", name, s->nlive, s->nlive_npt, s->peak_live, (unsigned long long)s->ctx_destroyed,
+         (unsigned long long)s->ctx_failed, (unsigned long long)s->ctx_destroy_unknown, ids);
+}
+
 /* Returns 1 if the request was answered (or parked) here, 0 to answer RESP_OK_NODATA / error. */
 static uint32_t process(HvVgpu3d *s, const HvVirtqElem *e, const Hdr *h, uint32_t epoch, uint8_t *b, uint32_t got,
                         int *answered) {
@@ -783,10 +806,21 @@ static uint32_t process(HvVgpu3d *s, const HvVirtqElem *e, const Hdr *h, uint32_
         int rc = init ? V.virgl_renderer_context_create_with_flags(h->ctx_id, init, nlen, name)
                       : V.virgl_renderer_context_create(h->ctx_id, nlen, name);
         s->ctxs++;
-        if (h->ctx_id < 64) s->ctx_capset[h->ctx_id] = init & 0xff;
         LOG("ctx %u create capset %u '%s' -> %d\n", h->ctx_id, init & 0xff, name, rc);
-        if (rc) WARN("context %u (capset %u '%s') could not be created: %d (errno %d %s)\n", h->ctx_id, init & 0xff, name, rc, errno, strerror(errno));
-        return rc ? RESP_ERR_UNSPEC : 0;
+        if (rc) {
+            s->ctx_failed++;
+            WARN("context %u (capset %u '%s') could not be created: %d (errno %d %s)\n", h->ctx_id, init & 0xff, name, rc, errno, strerror(errno));
+            return RESP_ERR_UNSPEC;
+        }
+        if (live_index(s, h->ctx_id) < 0 && s->nlive < sizeof s->live / sizeof s->live[0]) {
+            s->live[s->nlive].id = h->ctx_id;
+            s->live[s->nlive].capset = (uint8_t)(init & 0xff);
+            s->nlive++;
+            if ((init & 0xff) == CAPSET_NEPTUNE) s->nlive_npt++;
+            if (s->nlive > s->peak_live) s->peak_live = s->nlive;
+        }
+        live_log(s, "created", h->ctx_id, init & 0xff, name);
+        return 0;
     }
     case CMD_CTX_DESTROY: {
         /* Its rings go with it: a ring fence still parked on it would never be written, and its
@@ -806,6 +840,16 @@ static uint32_t process(HvVgpu3d *s, const HvVirtqElem *e, const Hdr *h, uint32_
         }
         LOG("ctx %u destroy (%d ring fences still parked on it answered)\n", h->ctx_id, n);
         V.virgl_renderer_context_destroy(h->ctx_id);
+        int li = live_index(s, h->ctx_id);
+        uint32_t cap = li >= 0 ? s->live[li].capset : 0;
+        if (li >= 0) {
+            if (cap == CAPSET_NEPTUNE) s->nlive_npt--;
+            s->live[li] = s->live[--s->nlive];
+            s->ctx_destroyed++;
+        } else {
+            s->ctx_destroy_unknown++;
+        }
+        live_log(s, li >= 0 ? "destroyed" : "destroyed (not known as live)", h->ctx_id, cap, "");
         return 0;
     }
     case CMD_CTX_ATTACH_RESOURCE:
@@ -1133,6 +1177,8 @@ static void renderer_reset(HvVgpu3d *s) {
     clear_scanout(s);
     for (int i = 0; i < MAX_RES3D; i++)
         if (s->res[i].id) unmap_blob(s, &s->res[i]);
+    if (s->nlive) WARN("renderer reset: %u live contexts (%u neptune) go with it\n", s->nlive, s->nlive_npt);
+    s->nlive = s->nlive_npt = 0;
     V.virgl_renderer_reset();
     for (int i = 0; i < MAX_RES3D; i++) {
         free(s->res[i].iov);
@@ -1297,7 +1343,7 @@ static void *worker(void *arg) {
                 s->fenced_global++;
                 if (s->fenced_global <= 20)
                     LOG("global fence %llu: cmd %#x ctx %u (capset %u)\n", (unsigned long long)p->h.fence_id,
-                        p->h.type, p->h.ctx_id, p->h.ctx_id < 64 ? s->ctx_capset[p->h.ctx_id] : 0);
+                        p->h.type, p->h.ctx_id, live_index(s, p->h.ctx_id) >= 0 ? s->live[live_index(s, p->h.ctx_id)].capset : 0);
                 V.virgl_renderer_create_fence((int)p->h.fence_id, p->h.type);
                 s->nparked_global++;
             }
@@ -1417,12 +1463,14 @@ int hv_vgpu3d_describe(HvVgpu3d *s, char *buf, unsigned len) {
     if (s->init_ok < 0) return snprintf(buf, len, "unavailable (%s)", s->why);
     return snprintf(buf, len,
                     "on capsets=%u ctxs=%llu cmds=%llu submits=%llu (%lluKB) blobs=%llu maps=%llu fences=%llu "
-                    "(ring %llu global %llu) errors=%llu submit_errors=%llu scanout=%u %ux%u%s hostmem@%#llx",
+                    "(ring %llu global %llu) errors=%llu submit_errors=%llu live_ctxs=%u (neptune %u, peak %u) scanout=%u %ux%u%s "
+                    "hostmem@%#llx",
                     s->ncapsets, (unsigned long long)s->ctxs, (unsigned long long)s->cmds,
                     (unsigned long long)s->submits, (unsigned long long)(s->submit_bytes >> 10),
                     (unsigned long long)s->blobs, (unsigned long long)s->maps, (unsigned long long)s->fences,
                     (unsigned long long)s->fenced_ring, (unsigned long long)s->fenced_global,
-                    (unsigned long long)s->errors, (unsigned long long)s->submit_errors, s->scanout_res, s->sc_w,
+                    (unsigned long long)s->errors, (unsigned long long)s->submit_errors, s->nlive, s->nlive_npt, s->peak_live,
+                    s->scanout_res, s->sc_w,
                     s->sc_h,
                     s->scanout_handle || (s->g && s->g->fb && s->g->fb->ovr_tex) ? " metal" : "",
                     (unsigned long long)s->win_pa);
