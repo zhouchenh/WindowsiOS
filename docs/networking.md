@@ -300,16 +300,19 @@ after the task restarts.
 
 ### Leaving the app on 3D: auto-2D and Picture in Picture
 
-**Settings > Display > When leaving the app** (the same settings in the graphics section beside server
-mode): **Switch to 2D when leaving the app**, **Show Windows in Picture in Picture**, **Back to 3D on
-return**. Picture in Picture gives the app no GPU time: in the background iOS refuses every Metal command
+**Settings > Display > When leaving the app** (only there; the graphics section beside server mode shows
+their state): **Switch to 2D when leaving the app**, **Show Windows in Picture in Picture**, **Back to 3D on
+return**. A guard pause shows **Resume Windows** in that section when server mode is off. Picture in Picture gives the app no GPU time: in the background iOS refuses every Metal command
 buffer, PiP or not. What makes the switch possible without the GPU is that tearing 3D down on the host
 only releases objects; the danger is Windows waiting on fences signalled inside refused command buffers
 (DXMT's event queries, vrend's GL fences), which never retire.
 
 - **willResignActive** (also Control Center, Face ID and passkey sheets): one snapshot of the screen for
-  PiP (a 3D frame is read with one blit, still allowed while only inactive). Windows is not touched.
-- **didEnterBackground** with auto-2D on and Windows started with host 3D (not Linux, no debugger): the
+  PiP (a 3D frame is read with one blit, still allowed while only inactive: the only GPU work PiP does)
+  into the PiP layer, which stays hidden. Windows is not touched.
+- **didEnterBackground** with auto-2D on, Windows started with host 3D (not Linux, no debugger) and
+  evidence of WinKit's graphics task (`gpu_mode_applied.txt`, or the helper alive: the test a switch by
+  hand uses; without it Windows on 3D is paused as before): the
   bridge does not pause Windows; the presenter stops (`hv_fb_metal_set_paused`); the 3D device goes into
   **background drain** (`hv_vgpu3d_set_background`: the renderer's thread answers a parked ring or global
   fence itself once it has been parked 250 ms, counted from the later of when it was parked and when
@@ -317,14 +320,19 @@ only releases objects; the danger is Windows waiting on fences signalled inside 
   line); 2D is offered and `gpu_mode.txt` written (the task now polls every second); the silent output
   keeps the app running. Nothing there waits. The pending switch does not count as a background blocker
   while it runs this way. If the 3D driver is still there after 60 s of Windows running, Windows is paused
-  until the app is back (logged). A Windows already on 2D keeps running in the background with auto-2D on,
+  until the app is back (logged). If Windows never answered the request, 3D is offered again on return
+  (the graphics section says so). A Windows already on 2D keeps running in the background with auto-2D on,
   also without server mode.
-- **Picture in Picture** (`ios/Sources/Native/winios_pip.m`): an `AVSampleBufferDisplayLayer` over the
-  Windows view, empty (transparent) while in front, with `canStartPictureInPictureAutomaticallyFromInline`;
-  a live, always-playing playback delegate. In the background a timer copies the 2D screen on the CPU
+- **Picture in Picture** (`ios/Sources/Native/winios_pip.m`), armed only while leaving the app keeps
+  Windows running (auto-2D would switch, or server mode or auto-2D with nothing blocking; the setting is
+  disabled with the reason otherwise): an `AVSampleBufferDisplayLayer` over the Windows view, hidden in
+  front and while only inactive (the presenter's zoom and pan are not its fit), shown from
+  didEnterBackground or PiP's willStart, with `canStartPictureInPictureAutomaticallyFromInline`; a live,
+  always-playing playback delegate. From PiP's willStart until failedToStart, didStop or the return, a
+  timer copies the 2D screen on the CPU
   (`hv_winvm_display_snapshot` without the GPU) into IOSurface BGRA pixel buffers at most 10 times a second,
   only when it changed; while the screen is still a 3D texture the snapshot stays. Flushed when the layer
-  asks for it. The audio session stays the app's own (PlayAndRecord, mixing); whether automatic PiP needs
+  asks for it. On return the feed is stopped and its last tick waited for before the final flush. The audio session stays the app's own (PlayAndRecord, mixing); whether automatic PiP needs
   Playback is what the background test finds out (below).
 - **didBecomeActive** (not WillEnterForeground, where the GPU is still refused): drain off, the presenter
   on, PiP stopped, and back to 3D if that is on.
@@ -334,8 +342,11 @@ logs, relative to willResignActive, a trivial Metal command buffer every ~16 ms 
 changes), PiP's events, the app's lifecycle, `BGTaskScheduler.supportedResources` (background GPU), and a
 switch's timeline (the offer, Windows' report, the driver's restart and mode, the drain). Lines go to
 `winvm.log` (`winvm: bgtest:`), the whole log to `Documents/background_test.txt`, a summary to the
-settings. It also picks the audio session used while PiP is armed (the app's own, Playback mixing, Playback
-alone), to find what automatic PiP needs; never saved.
+settings. Its observers are registered first thing at launch, so t0 is willResignActive itself; the probe's
+times are its command buffers' completion times. It also picks the audio session used while PiP is armed
+(the app's own, Playback mixing, Playback alone), to find what automatic PiP needs; never saved. Both
+Playback modes have no input: Windows' microphone is stopped while one is in use and started again with the
+app's own.
 
 ## Why there is no bridged mode
 

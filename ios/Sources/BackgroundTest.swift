@@ -17,8 +17,13 @@ import UIKit
 // Lines go to winvm.log (stderr, "winvm: bgtest:"), the whole log to Documents/background_test.txt, and a short
 // summary to the settings. Off unless armed; one trip, then it disarms. A trip that only makes the app inactive
 // (Control Center, a banner) is not a trip to the background: the test stays armed.
+// BackgroundTest.shared is made first thing at launch (VMViewModel.init), before the bridge and Picture in Picture
+// register for the same notifications, so its handlers run first: t0 is willResignActive itself, and the snapshot PiP
+// takes there is logged.
 
-/// The Metal probe: one tiny blit per ~16 ms on its own queue; reports each change of (status, error code).
+/// The Metal probe: one tiny blit per ~16 ms on its own queue; reports each change of (status, error code). Times are
+/// when each command buffer completed (or was refused), taken in its completion handler, not when the report reached
+/// the main thread.
 private final class MetalProbe: @unchecked Sendable {
     private let device = MTLCreateSystemDefaultDevice()
     private let queue: MTLCommandQueue?
@@ -26,14 +31,15 @@ private final class MetalProbe: @unchecked Sendable {
     private let q = DispatchQueue(label: "applevm.bgtest.metal", qos: .userInitiated)
     private var timer: DispatchSourceTimer?
     private let t0: CFAbsoluteTime
-    private let report: @Sendable (String) -> Void
+    /// A line, and for a refusal (or no command buffer) the time it happened (seconds from t0).
+    private let report: @Sendable (String, Double?) -> Void
     // the probe's queue only
     private var inFlight = 0, committed = 0, ok = 0, failed = 0, noBuffer = 0
     private var fill: UInt8 = 0
     private var last: (Int, Int)?
     private var firstFail: Double?, lastOK: Double?, firstOKAfterFail: Double?
 
-    init(t0: CFAbsoluteTime, report: @escaping @Sendable (String) -> Void) {
+    init(t0: CFAbsoluteTime, report: @escaping @Sendable (String, Double?) -> Void) {
         self.t0 = t0
         self.report = report
         queue = device?.makeCommandQueue()
@@ -57,7 +63,7 @@ private final class MetalProbe: @unchecked Sendable {
         let at = CFAbsoluteTimeGetCurrent() - t0
         guard let queue, let buffer, let cb = queue.makeCommandBuffer() else {
             noBuffer += 1
-            if noBuffer == 1 { report(String(format: "metal: +%.3f s no command buffer", at)) }
+            if noBuffer == 1 { report(String(format: "metal: +%.3f s no command buffer", at), at) }
             return
         }
         fill &+= 1
@@ -67,27 +73,31 @@ private final class MetalProbe: @unchecked Sendable {
         }
         inFlight += 1
         committed += 1
+        let t0 = self.t0
         cb.addCompletedHandler { [weak self] done in
+            let doneAt = CFAbsoluteTimeGetCurrent() - t0 // the completion (or refusal) itself
             let status = Int(done.status.rawValue)
             let code = (done.error as NSError?)?.code ?? 0
-            self?.q.async { self?.finished(at: at, status: status, code: code) }
+            self?.q.async { self?.finished(at: at, doneAt: doneAt, status: status, code: code) }
         }
         cb.commit()
     }
 
-    private func finished(at: Double, status: Int, code: Int) {
+    private func finished(at: Double, doneAt: Double, status: Int, code: Int) {
         inFlight -= 1
-        if status == Int(MTLCommandBufferStatus.completed.rawValue) {
+        let completed = status == Int(MTLCommandBufferStatus.completed.rawValue)
+        if completed {
             ok += 1
-            if firstFail != nil && firstOKAfterFail == nil { firstOKAfterFail = at }
-            if firstFail == nil { lastOK = at }
+            if firstFail != nil && firstOKAfterFail == nil { firstOKAfterFail = doneAt }
+            if firstFail == nil { lastOK = doneAt }
         } else {
             failed += 1
-            if firstFail == nil { firstFail = at }
+            if firstFail == nil { firstFail = doneAt }
         }
         if last == nil || last! != (status, code) {
             last = (status, code)
-            report(String(format: "metal: committed at +%.3f s: %@ (error %d)", at, Self.name(status), code))
+            report(String(format: "metal: committed at +%.3f s, done at +%.3f s: %@ (error %d)", at, doneAt, Self.name(status), code),
+                   completed ? nil : doneAt)
         }
     }
 
@@ -98,7 +108,7 @@ private final class MetalProbe: @unchecked Sendable {
         return q.sync {
             var s = "metal: \(committed) committed, \(ok) completed, \(failed) refused or failed"
             if noBuffer > 0 { s += ", \(noBuffer) without a command buffer" }
-            if let f = firstFail { s += String(format: "; last success before +%.3f s, first refusal +%.3f s", lastOK ?? 0, f) }
+            if let f = firstFail { s += String(format: "; last completed +%.3f s, first refused +%.3f s (completion times)", lastOK ?? 0, f) }
             else { s += "; never refused" }
             if let b = firstOKAfterFail { s += String(format: ", working again at +%.3f s", b) }
             else if firstFail != nil { s += ", not working again by the end" }
@@ -115,7 +125,8 @@ final class BackgroundTest: ObservableObject {
     @Published private(set) var running = false
     @Published private(set) var summary: String = UserDefaults.standard.string(forKey: "winios.bgTestSummary") ?? ""
     /// The audio session while PiP is armed (bridge.pipAudioCategory): 0 the app's own, 1 Playback that mixes,
-    /// 2 Playback alone. Not saved.
+    /// 2 Playback alone. Both Playback modes turn Windows' microphone off (capture stopped, then started again with
+    /// the app's own). Not saved.
     @Published var pipAudio: Int = 0 {
         didSet { WinIOSBridge.shared.pipAudioCategory = pipAudio }
     }
@@ -146,7 +157,7 @@ final class BackgroundTest: ObservableObject {
                 MainActor.assumeIsolated { body(note) }
             })
         }
-        on(UIApplication.willResignActiveNotification) { _ in self.willResignActive() }
+        on(UIApplication.willResignActiveNotification) { _ in self.willResignActive(at: CFAbsoluteTimeGetCurrent()) }
         on(UIApplication.didEnterBackgroundNotification) { _ in
             guard self.running else { return }
             self.sawBackground = true
@@ -177,17 +188,17 @@ final class BackgroundTest: ObservableObject {
 
     // MARK: The trip
 
-    private func willResignActive() {
+    private func willResignActive(at now: CFAbsoluteTime) {
         if running {
             mark("willResignActive again")
             return
         }
         guard armed else { return }
-        begin()
+        begin(at: now)
     }
 
-    private func begin() {
-        t0 = CFAbsoluteTimeGetCurrent()
+    private func begin(at now: CFAbsoluteTime) {
+        t0 = now
         running = true
         lines = []
         first = [:]
@@ -213,8 +224,8 @@ final class BackgroundTest: ObservableObject {
         } else {
             mark("BGTaskScheduler supportedResources: not available before iOS 26")
         }
-        let p = MetalProbe(t0: t0) { line in
-            DispatchQueue.main.async { BackgroundTest.shared.markProbe(line) }
+        let p = MetalProbe(t0: t0) { line, refusedAt in
+            DispatchQueue.main.async { BackgroundTest.shared.markProbe(line, refusedAt: refusedAt) }
         }
         probe = p
         p.start()
@@ -241,14 +252,16 @@ final class BackgroundTest: ObservableObject {
         DispatchQueue.main.asyncAfter(deadline: .now() + 4, execute: w)
     }
 
-    private func markProbe(_ line: String) {
+    /// refusedAt: when the probe saw the refusal (its completion handler), which is what the summary shows.
+    private func markProbe(_ line: String, refusedAt: Double?) {
         guard running else { return }
-        mark(line, key: line.contains("completed") ? nil : "metalRefused")
+        mark(line, key: refusedAt != nil ? "metalRefused" : nil, keyAt: refusedAt)
     }
 
-    private func mark(_ what: String, key: String? = nil) {
+    /// keyAt: the time to keep for key when the event happened before this call (else now).
+    private func mark(_ what: String, key: String? = nil, keyAt: Double? = nil) {
         let at = CFAbsoluteTimeGetCurrent() - t0
-        if let key, first[key] == nil { first[key] = at }
+        if let key, first[key] == nil { first[key] = keyAt ?? at }
         let line = String(format: "+%.3f s  ", at) + what
         lines.append(line)
         FileHandle.standardError.write(Data("winvm: bgtest: \(line)\n".utf8))
@@ -375,8 +388,8 @@ struct BackgroundTestSection: View {
             }
             Picker(L("画中画时的音频会话", "Audio session with Picture in Picture on"), selection: $test.pipAudio) {
                 Text(L("App 自己的（播放和录音，混音）", "The app's own (play and record, mixes)")).tag(0)
-                Text(L("播放（混音）", "Playback (mixes)")).tag(1)
-                Text(L("播放（独占）", "Playback (alone)")).tag(2)
+                Text(L("播放（混音，无麦克风）", "Playback (mixes, no microphone)")).tag(1)
+                Text(L("播放（独占，无麦克风）", "Playback (alone, no microphone)")).tag(2)
             }
             if !test.summary.isEmpty {
                 Text(test.summary)
@@ -386,8 +399,8 @@ struct BackgroundTestSection: View {
         } header: {
             Text(L("后台测试", "Background test"))
         } footer: {
-            Text(L("诊断用。打开后，下一次 App 到后台（主屏幕手势、锁屏、切到别的 App）时记录：GPU 什么时候被拒绝、画中画是否启动、图形切换的每一步。回到 App 几秒后结束，结果在这里、winvm.log 和“文件”里的 background_test.txt。只经过控制中心或横幅不算，测试保持打开。音频会话只在画中画打开时改变，App 重启后恢复默认；“独占”会停掉别的 App 的声音，Windows 的麦克风也不可用。",
-                   "Diagnostics. On, the next time the app goes to the background (home gesture, lock, another app) is logged: when the GPU is refused, whether Picture in Picture starts, each step of a graphics switch. It ends a few seconds after you come back; the results are here, in winvm.log and in background_test.txt in Files. Control Center or a banner alone does not count; the test stays on. The audio session changes only while Picture in Picture is on, and goes back to the default when the app restarts; Alone stops other apps' sound, and Windows' microphone is off."))
+            Text(L("诊断用。打开后，下一次 App 到后台（主屏幕手势、锁屏、切到别的 App）时记录：GPU 什么时候被拒绝、画中画是否启动、图形切换的每一步。回到 App 几秒后结束，结果在这里、winvm.log 和“文件”里的 background_test.txt。只经过控制中心或横幅不算，测试保持打开。音频会话只在画中画打开时改变，App 重启后恢复默认；两种“播放”都没有录音，Windows 的麦克风在这期间关闭；“独占”还会停掉别的 App 的声音。",
+                   "Diagnostics. On, the next time the app goes to the background (home gesture, lock, another app) is logged: when the GPU is refused, whether Picture in Picture starts, each step of a graphics switch. It ends a few seconds after you come back; the results are here, in winvm.log and in background_test.txt in Files. Control Center or a banner alone does not count; the test stays on. The audio session changes only while Picture in Picture is on, and goes back to the default when the app restarts. Both Playback modes have no input: Windows' microphone is off while one is in use. Alone also stops other apps' sound."))
         }
     }
 }

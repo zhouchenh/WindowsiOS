@@ -281,8 +281,13 @@ typedef struct WinIOSGraphicsMode {
 @property (nonatomic, readonly) int64_t autoSwitchSeq;
 /// The app is in the background with an auto-2D switch under way or done (drain on).
 @property (nonatomic, readonly) BOOL autoSwitchAway;
-/// Auto-2D would switch if the app left now (Windows started with 3D, 3D in use, not Linux, no debugger).
+/// Auto-2D would switch if the app left now (Windows started with 3D, 3D in use, not Linux, no debugger, and WinKit's
+/// graphics task seen: graphicsTaskPresent). Otherwise Windows on 3D is paused in the background as before.
 @property (nonatomic, readonly) BOOL autoSwitchPossible;
+/// Evidence of WinKit's graphics task: Shared/gpu_mode_applied.txt exists, or the WinKit helper reported within 40 s.
+@property (nonatomic, readonly) BOOL graphicsTaskPresent;
+/// The last return to the app found that Windows never answered auto-2D's request: the 3D offer was put back.
+@property (nonatomic, readonly) BOOL autoSwitchRestored3D;
 /// The virtio-gpu status line (hv_winvm_gpu_status: the 3D renderer's counters and drain), nil when not running.
 - (nullable NSString *)gpuStatusLine;
 
@@ -291,7 +296,8 @@ typedef struct WinIOSGraphicsMode {
 @property (nonatomic) BOOL pipArmed;
 /// A test of what automatic PiP needs (Settings > Display > Background test): the audio session while PiP is armed.
 /// 0 the app's own (PlayAndRecord, mixes with other apps, the default), 1 Playback that mixes, 2 Playback alone
-/// (stops other apps' audio; Windows' microphone is off). Never saved: back to 0 at every launch.
+/// (stops other apps' audio). Both Playback modes have no input: Windows' microphone is off (capture stopped) while
+/// one is in use, and starts again with PlayAndRecord. Never saved: back to 0 at every launch.
 @property (nonatomic) NSInteger pipAudioCategory;
 /// The audio session's category now, for the logs ("PlayAndRecord+mix" and so on).
 @property (nonatomic, readonly) NSString *audioCategoryName;

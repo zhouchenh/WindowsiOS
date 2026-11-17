@@ -28,16 +28,19 @@ static const uint64_t kFeedIntervalNs = 100 * NSEC_PER_MSEC; /* 10 per second */
     AVSampleBufferDisplayLayer *_layer;
     AVPictureInPictureController *_controller;
     UIView *__weak _host;
-    BOOL _armed, _active, _shown; /* _shown: the layer holds a picture */
-    /* the feed (its queue only) */
+    BOOL _armed, _active;
+    /* PiP sessions (main): numbered at willStart; the one that last reached didStart. A didStop that arrives after a
+       newer session began (left again during the stop animation) is not that session's: it leaves the feed alone. */
+    uint64_t _session, _startedSession;
+    /* the feed (main starts and stops it; the rest is its queue's) */
     dispatch_queue_t _feedQ;
     dispatch_source_t _feed;
     CVPixelBufferPoolRef _pool;
     uint32_t _poolW, _poolH;
     CVPixelBufferRef _last; /* the last frame, enqueued again after a flush */
     uint64_t _lastSerial;
+    unsigned _flushes;
     _Atomic uint64_t _frames;
-    _Atomic int _gpuAllowed; /* the app is not in the background: a 3D frame may be read with a blit */
 }
 
 + (WinIOSPictureInPicture *)shared {
@@ -50,7 +53,6 @@ static const uint64_t kFeedIntervalNs = 100 * NSEC_PER_MSEC; /* 10 per second */
 - (instancetype)init {
     if ((self = [super init])) {
         _feedQ = dispatch_queue_create("applevm.pip.feed", dispatch_queue_attr_make_with_qos_class(DISPATCH_QUEUE_SERIAL, QOS_CLASS_UTILITY, 0));
-        atomic_store(&_gpuAllowed, 1);
         NSNotificationCenter *nc = NSNotificationCenter.defaultCenter;
         [nc addObserver:self selector:@selector(onResignActive:) name:UIApplicationWillResignActiveNotification object:nil];
         [nc addObserver:self selector:@selector(onBackground:) name:UIApplicationDidEnterBackgroundNotification object:nil];
@@ -84,7 +86,11 @@ static const uint64_t kFeedIntervalNs = 100 * NSEC_PER_MSEC; /* 10 per second */
                                            self.supported, self.possible, WinIOSBridge.shared.audioCategoryName]];
     if (!armed) {
         if (_active) [_controller stopPictureInPicture];
-        else [self clearPicture];
+        else {
+            [self stopFeed];
+            [self clearPicture];
+            [self setLayerHidden:YES];
+        }
     }
 }
 
@@ -95,6 +101,7 @@ static const uint64_t kFeedIntervalNs = 100 * NSEC_PER_MSEC; /* 10 per second */
         _layer = [AVSampleBufferDisplayLayer layer];
         _layer.videoGravity = AVLayerVideoGravityResizeAspect;
         _layer.backgroundColor = nil; /* empty: transparent over the Metal picture */
+        _layer.hidden = YES;          /* shown only from didEnterBackground or PiP's willStart (setLayerHidden:) */
     }
     [CATransaction begin];
     [CATransaction setDisableActions:YES];
@@ -123,6 +130,16 @@ static const uint64_t kFeedIntervalNs = 100 * NSEC_PER_MSEC; /* 10 per second */
     [CATransaction commit];
 }
 
+/* Hidden in the front and while the app is only inactive: the Metal presenter draws the picture with its own zoom,
+   pan and placement, which the layer's whole-screen fit would not match. */
+- (void)setLayerHidden:(BOOL)hidden {
+    if (!_layer || _layer.hidden == hidden) return;
+    [CATransaction begin];
+    [CATransaction setDisableActions:YES];
+    _layer.hidden = hidden;
+    [CATransaction commit];
+}
+
 - (void)makeController {
     if (_controller || !_layer || !self.supported) return;
     AVPictureInPictureControllerContentSource *src =
@@ -143,11 +160,11 @@ static const uint64_t kFeedIntervalNs = 100 * NSEC_PER_MSEC; /* 10 per second */
 
 /* ---- the app's lifecycle ---- */
 
-/* Inactive: the GPU still works. One snapshot (a 3D frame through one blit), nothing else. */
+/* Inactive: the GPU still works. One snapshot (a 3D frame through one blit, the only GPU work PiP ever does), into
+   the hidden layer; nothing else. */
 - (void)onResignActive:(NSNotification *)note {
     (void)note;
     if (!_armed || !_layer || !WinIOSBridge.shared.isVMRunning) return;
-    atomic_store(&_gpuAllowed, 1);
     CFAbsoluteTime t0 = CFAbsoluteTimeGetCurrent();
     uint32_t w = 0, h = 0;
     uint8_t *px = hv_winvm_display_snapshot(1, &w, &h);
@@ -163,28 +180,34 @@ static const uint64_t kFeedIntervalNs = 100 * NSEC_PER_MSEC; /* 10 per second */
         self->_lastSerial = serial;
     });
     free(px);
-    if (ok) _shown = YES;
     [self event:[NSString stringWithFormat:@"snapshot %ux%u (%s) in %.1f ms%@", w, h, isTex ? "3D" : "2D",
                                            (CFAbsoluteTimeGetCurrent() - t0) * 1000.0, ok ? @"" : @": not sent"]];
 }
 
+/* Off screen now: the layer may show (PiP takes it, and the app switcher's picture). The feed starts with PiP only. */
 - (void)onBackground:(NSNotification *)note {
     (void)note;
-    atomic_store(&_gpuAllowed, 0);
-    if (_armed && _shown) [self startFeed];
+    if (_armed) [self setLayerHidden:NO];
 }
 
+/* Back in front: the feed stops (and its last tick ends) before the final flush, so no frame stays over the live
+   picture; PiP stops. */
 - (void)onActive:(NSNotification *)note {
     (void)note;
-    atomic_store(&_gpuAllowed, 1);
     [self stopFeed];
-    if (_active) [_controller stopPictureInPicture]; /* the app is on screen: the picture is in the app */
-    else [self clearPicture];
+    [self clearPicture];
+    if (_active) [_controller stopPictureInPicture]; /* didStop hides the layer once PiP has let go of it */
+    else [self setLayerHidden:YES];
 }
 
+/* Main, with the feed stopped: empties the layer (always, whatever it was showing). */
 - (void)clearPicture {
-    if (!_shown || !_layer) return;
-    _shown = NO;
+    if (!_layer) return;
+    dispatch_sync(_feedQ, ^{
+        self->_lastSerial = 0; /* the next snapshot or frame is sent whatever it shows */
+        if (self->_last) CVPixelBufferRelease(self->_last);
+        self->_last = NULL;
+    });
     [_layer.sampleBufferRenderer flushWithRemovalOfDisplayedImage:YES completionHandler:nil];
 }
 
@@ -199,27 +222,30 @@ static const uint64_t kFeedIntervalNs = 100 * NSEC_PER_MSEC; /* 10 per second */
     dispatch_resume(_feed);
 }
 
+/* Returns once a tick already running has ended (cancel does not wait for it). */
 - (void)stopFeed {
     if (!_feed) return;
     dispatch_source_cancel(_feed);
     _feed = nil;
+    dispatch_sync(_feedQ, ^{});
 }
 
-/* The feed's queue: a new frame only when the screen changed; a 3D screen is only read while the GPU may be used. */
+/* The feed's queue: a new frame only when the 2D screen changed. Never the GPU: while the screen is a 3D texture the
+   willResignActive snapshot stays, until the 2D driver is up. */
 - (void)feedTick {
     AVSampleBufferVideoRenderer *r = _layer.sampleBufferRenderer;
     if (r.status == AVQueuedSampleBufferRenderingStatusFailed || r.requiresFlushToResumeDecoding) {
-        [self event:[NSString stringWithFormat:@"layer %@: flushed", r.requiresFlushToResumeDecoding ? @"needs a flush" : @"failed"]];
+        unsigned n = ++_flushes;
+        if (n <= 3 || n % 100 == 0)
+            [self event:[NSString stringWithFormat:@"layer %@: flushed (%u)", r.requiresFlushToResumeDecoding ? @"needs a flush" : @"failed", n]];
         [r flush];
         if (_last) [self enqueue:_last];
     }
     int isTex = 0;
     uint64_t serial = hv_winvm_display_serial(&isTex);
-    if (!serial || serial == _lastSerial) return;
-    int gpu = atomic_load(&_gpuAllowed);
-    if (isTex && !gpu) return; /* still 3D: the snapshot stays until the 2D driver is up */
+    if (!serial || serial == _lastSerial || isTex) return;
     uint32_t w = 0, h = 0;
-    uint8_t *px = hv_winvm_display_snapshot(gpu, &w, &h);
+    uint8_t *px = hv_winvm_display_snapshot(0, &w, &h);
     if (!px) return;
     _lastSerial = serial;
     [self sendPixels:px width:w height:h];
@@ -293,19 +319,31 @@ static const uint64_t kFeedIntervalNs = 100 * NSEC_PER_MSEC; /* 10 per second */
 
 - (void)pictureInPictureControllerWillStartPictureInPicture:(AVPictureInPictureController *)c {
     (void)c;
+    _session++;
     [self event:@"willStart"];
-    if (_shown) [self startFeed];
+    [self setLayerHidden:NO];
+    [self startFeed];
 }
 
 - (void)pictureInPictureControllerDidStartPictureInPicture:(AVPictureInPictureController *)c {
-    (void)c;
     _active = YES;
+    _startedSession = _session;
     [self event:@"didStart"];
+    if (UIApplication.sharedApplication.applicationState == UIApplicationStateActive) {
+        [c stopPictureInPicture]; /* the app came back while PiP was starting: the picture is in the app */
+        return;
+    }
+    [self startFeed];
 }
 
 - (void)pictureInPictureController:(AVPictureInPictureController *)c failedToStartPictureInPictureWithError:(NSError *)error {
     (void)c;
     [self event:[NSString stringWithFormat:@"failed to start: %@ %ld (%@)", error.domain, (long)error.code, error.localizedDescription]];
+    [self stopFeed];
+    if (UIApplication.sharedApplication.applicationState == UIApplicationStateActive) {
+        [self clearPicture];
+        [self setLayerHidden:YES];
+    }
 }
 
 - (void)pictureInPictureControllerWillStopPictureInPicture:(AVPictureInPictureController *)c {
@@ -316,9 +354,14 @@ static const uint64_t kFeedIntervalNs = 100 * NSEC_PER_MSEC; /* 10 per second */
 - (void)pictureInPictureControllerDidStopPictureInPicture:(AVPictureInPictureController *)c {
     (void)c;
     _active = NO;
-    [self event:@"didStop"];
-    [self stopFeed];
-    if (UIApplication.sharedApplication.applicationState == UIApplicationStateActive) [self clearPicture];
+    BOOL front = UIApplication.sharedApplication.applicationState == UIApplicationStateActive;
+    BOOL current = _startedSession == _session; /* no newer session began meanwhile */
+    [self event:[NSString stringWithFormat:@"didStop%@", current ? @"" : @" (a newer session began: its feed goes on)"]];
+    if (front || current) [self stopFeed];
+    if (front) {
+        [self clearPicture];
+        [self setLayerHidden:YES];
+    }
     if (!_host) [_layer removeFromSuperlayer];
 }
 
