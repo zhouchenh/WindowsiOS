@@ -110,11 +110,14 @@ already-entered concurrent creations may each retain one result.
 
 This branch feeds the independent permission and drain gates from
 `hv_winvm_display_set_paused` and `hv_winvm_gpu_set_background`. When integrating
-with the Neptune cleanup branch, add
+with the Neptune cleanup branch, **before enabling this candidate**, add
 `hv_dxmt_shared_init_set_gpu_allowed(allowed)` inside
 `hv_winvm_set_gpu_allowed(allowed)`, alongside the cleanup gate. The bridge then
-supplies permission on DidEnterBackground/DidBecomeActive. A plain background
-trip that pauses the whole VM cannot create more guest textures.
+must supply permission on every DidEnterBackground/DidBecomeActive trip. The
+existing display/drain calls alone do not cover a plain trip: pausing guest CPUs
+does not stop already-entered or queued backend work. Until that bridge wiring
+is present, keep this candidate disabled during background transitions. The
+lead owns the bridge integration for the test IPA.
 
 Keep the candidate opt-in until paired capture and a device probe establish its
 effect. A useful ordering probe creates a shared
