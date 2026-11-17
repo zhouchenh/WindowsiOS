@@ -236,7 +236,7 @@ static void winios_log_memory_census(void) {
     last_metal = mtl;
     last_encode = encode;
     last_ring = ring;
-    fprintf(stderr, "memory: footprint %lluMB, iOS allows %lluMB more, Metal %lluMB (working set %lluMB), address space %lluMB; "
+    fprintf(stderr, "memory: footprint %lluMB, iOS allows %lluMB more, Metal %lluMB (working set %lluMB), virtual size %lluMB (used + reserved, not free); "
                     "threads %u: dxmt-encode %u, npt-ring %u, npt-queue %u\n",
             (unsigned long long)(fp >> 20), (unsigned long long)(avail >> 20), (unsigned long long)(mtl >> 20),
             (unsigned long long)(metal ? metal.recommendedMaxWorkingSetSize >> 20 : 0), (unsigned long long)(vsize >> 20),
