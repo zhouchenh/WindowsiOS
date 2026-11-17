@@ -104,6 +104,10 @@ python3 scripts/provision_windows_arm64.py
 装好的系统：本地管理员账户 **Ammaar**（原项目的默认值）、**没有密码**、自动登录，计算机名 **Apple-VM**。
 账户名可以之后用 WinKit 的 `RENAME-USER.bat` 改掉。此时 Windows 里还没有网卡驱动，没网是正常的（第 7 步装）。
 
+时区默认是 **UTC**（想换成别的，运行脚本前设 `WINVM_TIMEZONE`，值是 Windows 的时区名，例如 `WINVM_TIMEZONE="China Standard Time"`）。
+时间本身不受时区影响：镜像已设成把 App 的硬件时钟当 UTC 读（`RealTimeIsUniversal`），并打开了 Windows 时间服务；
+第 7 步的 WinKit 装好后，Windows 的时区会自动跟随 iPhone。
+
 ## 第 5 步：打包系统盘
 
 ```bash
@@ -134,4 +138,6 @@ python3 scripts/provision_windows_arm64.py
 - **能不能不用 Mac？** 制作这一步不行：需要在 Mac 上运行模拟器装一遍 Windows。之后在设备上的所有操作都不需要 Mac。
 - **为什么不直接提供做好的镜像？** 镜像里是完整的 Windows，不能公开分发。
 - **`vars.fd` 弄丢了怎么办？** 重新做一遍第 4 步。空白的 `vars.fd` 里没有 Windows 的启动项。
+- **Windows 的时间差了几个小时？** 用旧方法做的镜像会把 App 的硬件时钟（UTC）当成本地时间读。双击一次新版 WinKit 的 `START.bat`
+  （或管理员运行 `C:\WinKit\clock_setup.ps1`），然后从“开始 → 电源 → 关机”，再从 App 启动。详见 [`winkit/README.md`](../winkit/README.md) 的“时间和时区”。
 - **想要更大的系统盘？** App 的设置 → 高级设置 → 系统盘容量可以扩容，扩完在 Windows 的“磁盘管理”里扩展 C 盘。

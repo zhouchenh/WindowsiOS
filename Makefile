@@ -23,7 +23,7 @@ MAC_FRAMEWORKS = -framework Cocoa -framework Foundation -framework QuartzCore -f
                  -framework AudioToolbox
 
 CORE_TESTS = $(B)/test_classify $(B)/test_jit_region $(B)/test_operands $(B)/test_jit $(B)/test_mem \
-             $(B)/test_mmu $(B)/test_exc $(B)/test_share_clip $(B)/test_share_focus
+             $(B)/test_mmu $(B)/test_exc $(B)/test_share_clip $(B)/test_share_focus $(B)/test_pl031
 
 all: $(CORE_TESTS) $(B)/hvsparse $(B)/winvm
 
@@ -65,6 +65,9 @@ $(B)/test_share_clip: tests/test_share_clip.c host/share.c host/share.h tests/sh
 $(B)/test_share_focus: tests/test_share_focus.c host/share.c host/share.h tests/share_net_fwd_stub.c | $(B)
 	$(CC) $(CFLAGS) -fsanitize=address,undefined -fno-sanitize-recover=all tests/test_share_focus.c host/share.c \
 		tests/share_net_fwd_stub.c -o $@
+# The PL031 RTC alone (UTC, HV_RTC=localtime, guest writes, the alarm), with a stand-in machine and GIC.
+$(B)/test_pl031: tests/test_pl031.c devices/pl031.c devices/pl031.h | $(B)
+	$(CC) $(CFLAGS) -fsanitize=address,undefined -fno-sanitize-recover=all tests/test_pl031.c devices/pl031.c -o $@
 
 # Guest DNS proxy against a stand-in resolver (no network needed).
 $(B)/test_dns_lifecycle: tests/test_dns_lifecycle.c $(B)/dns_proxy.o

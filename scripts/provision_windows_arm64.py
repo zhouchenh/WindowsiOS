@@ -13,6 +13,7 @@ import subprocess
 import sys
 import time
 from pathlib import Path
+from xml.sax.saxutils import escape as xml_escape
 
 ROOT = Path(__file__).resolve().parent.parent
 WORK = ROOT / "work"
@@ -94,12 +95,18 @@ echo [WIN11-PROVISION] Phase 1 DISM + BCDBOOT complete! Shutting down cleanly...
 wpeutil shutdown
 """
 
+# The Windows time zone of the image: UTC unless WINVM_TIMEZONE names another Windows zone id (e.g.
+# "China Standard Time"). A shared image should not carry its builder's zone: WinKit's helper sets the
+# iPhone's zone at the first logon. The RTC counts UTC and Windows is told so (RealTimeIsUniversal=1 below),
+# so the time itself is right whatever the zone.
+DEFAULT_TIMEZONE = "UTC"
+
 PANTHER_UNATTEND_XML = r"""<?xml version="1.0" encoding="utf-8"?>
 <unattend xmlns="urn:schemas-microsoft-com:unattend" xmlns:wcm="http://schemas.microsoft.com/WMIConfig/2002/State">
   <settings pass="specialize">
     <component name="Microsoft-Windows-Shell-Setup" processorArchitecture="arm64" publicKeyToken="31bf3856ad364e35" language="neutral" versionScope="nonSxS">
       <ComputerName>Apple-VM</ComputerName>
-      <TimeZone>Eastern Standard Time</TimeZone>
+      <TimeZone>@TIMEZONE@</TimeZone>
     </component>
     <component name="Microsoft-Windows-Deployment" processorArchitecture="arm64" publicKeyToken="31bf3856ad364e35" language="neutral" versionScope="nonSxS">
       <RunSynchronous>
@@ -110,6 +117,10 @@ PANTHER_UNATTEND_XML = r"""<?xml version="1.0" encoding="utf-8"?>
         <RunSynchronousCommand wcm:action="add">
           <Order>2</Order>
           <Path>reg add HKLM\SYSTEM\CurrentControlSet\Control\BitLocker /v PreventDeviceEncryption /t REG_DWORD /d 1 /f</Path>
+        </RunSynchronousCommand>
+        <RunSynchronousCommand wcm:action="add">
+          <Order>3</Order>
+          <Path>reg add HKLM\SYSTEM\CurrentControlSet\Control\TimeZoneInformation /v RealTimeIsUniversal /t REG_DWORD /d 1 /f</Path>
         </RunSynchronousCommand>
       </RunSynchronous>
     </component>
@@ -166,6 +177,11 @@ PANTHER_UNATTEND_XML = r"""<?xml version="1.0" encoding="utf-8"?>
         </SynchronousCommand>
         <SynchronousCommand wcm:action="add">
           <Order>3</Order>
+          <CommandLine>cmd /c "sc config w32time start= delayed-auto &amp; reg add HKLM\SYSTEM\CurrentControlSet\Services\W32Time\TimeProviders\NtpClient /v SpecialPollInterval /t REG_DWORD /d 3600 /f &amp; reg add HKLM\SYSTEM\CurrentControlSet\Services\W32Time\Config /v MaxPosPhaseCorrection /t REG_DWORD /d 0xFFFFFFFF /f &amp; reg add HKLM\SYSTEM\CurrentControlSet\Services\W32Time\Config /v MaxNegPhaseCorrection /t REG_DWORD /d 0xFFFFFFFF /f &amp; net start w32time &amp; w32tm /config /manualpeerlist:"time.windows.com,0x9 pool.ntp.org,0x9" /syncfromflags:manual /update"</CommandLine>
+          <Description>Windows Time: starts with Windows, syncs hourly, any correction size (the VM's clock stands still while the host sleeps)</Description>
+        </SynchronousCommand>
+        <SynchronousCommand wcm:action="add">
+          <Order>4</Order>
           <CommandLine>cmd /c "timeout /t 15 /nobreak &amp; shutdown /s /t 2 /f"</CommandLine>
           <Description>Clean shutdown once first desktop logon settles</Description>
         </SynchronousCommand>
@@ -189,7 +205,9 @@ def make_custom_boot_wim(dest_boot_wim: Path):
     snet = WORK / "startnet.cmd"
     unat = WORK / "unattend_panther.xml"
     snet.write_text(STARTNET_CMD.replace("\n", "\r\n"), encoding="utf-8")
-    unat.write_text(PANTHER_UNATTEND_XML.replace("\n", "\r\n"), encoding="utf-8")
+    # .replace, not str.format: the XML has literal braces ({default} in the bcdedit commands)
+    tz = xml_escape(os.environ.get("WINVM_TIMEZONE", "").strip() or DEFAULT_TIMEZONE)
+    unat.write_text(PANTHER_UNATTEND_XML.replace("@TIMEZONE@", tz).replace("\n", "\r\n"), encoding="utf-8")
     cmds = (
         f"add '{snet}' '/Windows/System32/startnet.cmd'\n"
         f"add '{unat}' '/Windows/System32/unattend_panther.xml'\n"

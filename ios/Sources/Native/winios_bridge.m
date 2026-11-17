@@ -20,6 +20,7 @@
 #include <pthread.h>
 #include <os/lock.h>
 #include <sys/stat.h>
+#include <time.h>
 
 static WinIOSBridge *s_shared_bridge = nil;
 
@@ -253,6 +254,10 @@ static void winios_log_memory_census(void) {
         [nc addObserver:self selector:@selector(onAppBackgroundOrTerminate:) name:UIApplicationDidEnterBackgroundNotification object:nil];
         [nc addObserver:self selector:@selector(onAppBackgroundOrTerminate:) name:UIApplicationWillTerminateNotification object:nil];
         [nc addObserver:self selector:@selector(onAudioInterruption:) name:AVAudioSessionInterruptionNotification object:nil];
+        /* Windows' time zone follows the iPhone's (Shared/tz.txt, applied by the WinKit helper): a zone
+           change, and the significant time changes (midnight, daylight saving, the clock set). */
+        [nc addObserver:self selector:@selector(onTimeZoneChange:) name:NSSystemTimeZoneDidChangeNotification object:nil];
+        [nc addObserver:self selector:@selector(onTimeZoneChange:) name:UIApplicationSignificantTimeChangeNotification object:nil];
     }
     return self;
 }
@@ -307,6 +312,7 @@ static void winios_log_memory_census(void) {
     if (_vmRunning) {
         hv_winvm_set_paused(0);
         fprintf(stderr, "winvm: resumed\n");
+        [self publishResumeMark];
     }
 }
 
@@ -439,6 +445,43 @@ static BOOL winios_plans_equal(WinIOSDisplayPlan a, WinIOSDisplayPlan b) {
     NSString *line = plan.legacy ? [NSString stringWithFormat:@"%ux%u", plan.modeWidth, plan.modeHeight]
                                  : [NSString stringWithFormat:@"%ux%u@%u", plan.modeWidth, plan.modeHeight, plan.scalePercent];
     [line writeToFile:[dir stringByAppendingPathComponent:@"res.txt"] atomically:YES encoding:NSASCIIStringEncoding error:nil];
+}
+
+/* The iPhone's time zone, where the WinKit helper reads it (http://10.0.2.4/tz.txt): its IANA name and
+   its offset from UTC in seconds, one per line ("Asia/Shanghai\r\n28800\r\n"). The helper sets Windows'
+   zone to match (tzutil) and reports it in tz_applied.txt. Windows only: Arch keeps UTC. */
+- (void)publishTimeZone {
+    if (winios_machine_is_linux()) return;
+    [NSTimeZone resetSystemTimeZone];
+    NSTimeZone *tz = [NSTimeZone systemTimeZone];
+    if (!tz.name.length) return;
+    NSString *dir = [[self documentsPath] stringByAppendingPathComponent:@"Shared"];
+    [[NSFileManager defaultManager] createDirectoryAtPath:dir withIntermediateDirectories:YES attributes:nil error:nil];
+    NSString *path = [dir stringByAppendingPathComponent:@"tz.txt"];
+    NSString *text = [NSString stringWithFormat:@"%@\r\n%ld\r\n", tz.name, (long)tz.secondsFromGMT];
+    NSString *old = [NSString stringWithContentsOfFile:path encoding:NSASCIIStringEncoding error:nil];
+    if ([old isEqualToString:text]) return;
+    [text writeToFile:path atomically:YES encoding:NSASCIIStringEncoding error:nil];
+    fprintf(stderr, "winvm: time zone %s (%+ld s) published for Windows\n", tz.name.UTF8String, (long)tz.secondsFromGMT);
+}
+
+- (void)onTimeZoneChange:(NSNotification *)note {
+    (void)note;
+    dispatch_async(dispatch_get_main_queue(), ^{
+        [NSTimeZone resetSystemTimeZone];
+        tzset(); /* HV_RTC=localtime reads the zone through localtime_r */
+        if (self->_vmRunning) [self publishTimeZone];
+    });
+}
+
+/* Windows' clock stood still while the app was in the background (and the iPhone asleep): a new line in
+   http://10.0.2.4/resumed.txt has WinKit's clock task resync it with the internet at once
+   (clock_setup.ps1), instead of at the next hourly poll. */
+- (void)publishResumeMark {
+    if (winios_machine_is_linux()) return;
+    NSString *dir = [[self documentsPath] stringByAppendingPathComponent:@"Shared"];
+    NSString *line = [NSString stringWithFormat:@"%.0f\r\n", [[NSDate date] timeIntervalSince1970]];
+    [line writeToFile:[dir stringByAppendingPathComponent:@"resumed.txt"] atomically:YES encoding:NSASCIIStringEncoding error:nil];
 }
 
 /* HV_DISPLAY_LEGACY=1 (Documents/env.txt): the sizing from before the 1:1 pipeline (points, at least
@@ -1212,6 +1255,15 @@ static NSString *winios_unpack_resource(NSString *name, NSString *dst) {
     BOOL linuxGuest = winios_machine_is_linux();
     /* Linux: its console on the serial port goes to the log (winvm.log), the boot can be followed there. */
     if (linuxGuest) setenv("HV_SERIAL_STDERR", "1", 1);
+    /* The RTC counts UTC; Windows reads it as UTC (RealTimeIsUniversal=1, from WinKit's START.bat and from
+       provisioning). A file rtc-localtime.on in the Windows machine's folder makes it count the iPhone's local
+       time instead (QEMU's -rtc base=localtime): only for a Windows without RealTimeIsUniversal, never with
+       it (the time would be shifted twice). Set or cleared on every start, never from env.txt, so it does not
+       carry over to the other machine: Arch always reads the RTC as UTC. */
+    if (!linuxGuest && [[NSFileManager defaultManager] fileExistsAtPath:[dir stringByAppendingPathComponent:@"rtc-localtime.on"]])
+        setenv("HV_RTC", "localtime", 1);
+    else
+        unsetenv("HV_RTC");
     if (getenv("HV_SMBIOS_SKU") && !strcmp(getenv("HV_SMBIOS_SKU"), "WINIOS-CLI")) unsetenv("HV_SMBIOS_SKU"); /* the former command-line mode */
     winios_capture_stderr([self documentsPath]);
     winios_log_gpu_caps();
@@ -1394,6 +1446,8 @@ static NSString *winios_unpack_resource(NSString *name, NSString *dst) {
     uint32_t gpuW = _committedPlan.modeWidth, gpuH = _committedPlan.modeHeight;
     if (gpuW && gpuH) hv_winvm_set_preferred_display(gpuW, gpuH); /* before the driver starts: no event needed */
     [self publishWantedPlan:_committedPlan];
+    tzset();
+    [self publishTimeZone];
     [self postDisplayStateChanged];
 
     CAMetalLayer *layer = _pendingLayer;
