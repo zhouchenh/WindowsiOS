@@ -583,7 +583,7 @@ static const AVAudioSessionCategoryOptions kWinIOSAudioOptions = AVAudioSessionC
 
 - (nullable NSString *)gpuStatusLine {
     if (!_vmRunning) return nil;
-    char line[1024];
+    char line[2048];
     if (hv_winvm_gpu_status(line, sizeof line) < 0) return nil;
     return [NSString stringWithUTF8String:line];
 }
@@ -2501,7 +2501,7 @@ static void winios_after(double seconds, dispatch_block_t block) {
     f.dateFormat = @"yyyyMMdd-HHmmss";
     NSString *name = [NSString stringWithFormat:@"screen-%@.png", [f stringFromDate:[NSDate date]]];
     NSString *path = [docs stringByAppendingPathComponent:name];
-    if (hv_winvm_save_png(path.fileSystemRepresentation) != 0) {
+    if (hv_winvm_save_png_raw(path.fileSystemRepresentation) != 0) {
         fprintf(stderr, "winvm: screen capture: failed\n");
         return nil;
     }

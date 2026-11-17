@@ -66,7 +66,7 @@ class Guards(unittest.TestCase):
         with tempfile.TemporaryDirectory(prefix='dxmt-shared-') as d:
             exe = Path(d)/'test'
             subprocess.run(['clang', '-std=c11', '-Wall', '-Wextra', '-Werror', '-O2',
-                            str(ROOT/'tests/test_dxmt_shared_init.c'), '-o', str(exe)], check=True)
+                            str(ROOT/'tests/test_dxmt_shared_init.c'), str(ROOT/'devices/dxmt_data_lock.c'), '-o', str(exe)], check=True)
             for case in ('guards', 'install', 'interposed', 'protect-fail', 'rollback',
                          'fatal', 'race', 'disabled', 'ready', 'not-shared', 'background',
                          'gates', 'midwait', 'timeout', 'event-error', 'original-error', 'concurrent'):

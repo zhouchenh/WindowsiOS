@@ -14,7 +14,7 @@ ENGINE = $(CORE) $(HOST)
 DEV = $(B)/acpi.o $(B)/acpi_battery.o $(B)/fb_display.o $(B)/fb_metal.o $(B)/fdt.o $(B)/fw_cfg.o $(B)/gicv3.o $(B)/hda.o \
       $(B)/nvme.o $(B)/pcie.o $(B)/pflash.o $(B)/pl011.o $(B)/pl031.o $(B)/pl061.o $(B)/timer.o \
       $(B)/virtio.o $(B)/virtio_blk.o $(B)/virtio_input.o $(B)/virtio_net.o $(B)/virtio_snd.o $(B)/virtio_gpu.o $(B)/virtio_gpu3d.o \
-      $(B)/usb_touch.o $(B)/winvirt.o $(B)/xhci.o $(B)/neptune_hook.o $(B)/neptune_cleanup.o $(B)/neptune_device.o $(B)/dxmt_shared_init.o
+      $(B)/usb_touch.o $(B)/winvirt.o $(B)/xhci.o $(B)/neptune_hook.o $(B)/neptune_cleanup.o $(B)/neptune_device.o $(B)/dxmt_shared_init.o $(B)/dxmt_data_lock.o
 
 VM_HOST = $(B)/winvm.o $(B)/net_slirp.o $(B)/dns_proxy.o $(B)/share.o $(B)/audio_mac.o $(B)/hvsparse.o
 

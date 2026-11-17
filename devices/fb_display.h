@@ -112,15 +112,17 @@ typedef struct HvFbMetalStats {
     uint32_t scale_x100;   /* the last frame's on-screen scale (drawable pixels per guest pixel) x 100 */
 } HvFbMetalStats;
 void hv_fb_metal_get_stats(HvFbMetalStats *out);
-/* Save the active scanout, logging source/serial/size/error (identical repeats
-   are suppressed). An active 3D
-   readback failure returns -1; it never substitutes an older CPU framebuffer. */
+/* Silent periodic snapshot; permits older CPU pixels if GPU readback fails. */
 int hv_fb_save_png(HvFbDisplay *fb, const char *path);
+/* Explicit raw diagnostic: always log file/source/serial/size/format/error.
+   An active 3D readback failure returns -1 without CPU fallback or file writes. */
+int hv_fb_save_png_raw(HvFbDisplay *fb, const char *path);
 /* A copy of the screen as it is shown now, the hardware cursor blended in: BGRA, opaque, rows of *w * 4 bytes,
    malloc'd (the caller frees it). allow_gpu 0 never touches the GPU: NULL while the screen is a 3D (Metal) texture.
    1 reads a 3D texture with one blit, which only works while the app may use the GPU (in front, or merely inactive:
    never in the background); NULL when that fails. 2 explicitly permits falling back to the 2D pixels when the
-   blit fails. Any thread; NULL when there is no picture. */
+   blit fails. GPU readback supports BGRA8/RGBA8 (including sRGB), otherwise NULL
+   in strict mode. Any thread; NULL when there is no picture. */
 uint8_t *hv_fb_metal_snapshot(HvFbDisplay *fb, int allow_gpu, uint32_t *w, uint32_t *h);
 /* A value that changes whenever the picture does (a 3D frame, a 2D flush or ramfb change, the cursor): sampled, cheap.
    0: no picture. *is_texture (may be NULL): the screen is a 3D texture now. */

@@ -47,6 +47,7 @@ void hv_winvm_set_display_layer(void *ca_metal_layer);
 int hv_winvm_display_size(uint32_t *w, uint32_t *h);
 uint64_t hv_winvm_display_frames(void);
 int hv_winvm_save_png(const char *path);
+int hv_winvm_save_png_raw(const char *path);
 /* Preferred display mode for virtio-gpu (e.g. the iPad screen in points); the guest driver
    is told through a display-change event. No-op without virtio-gpu. */
 void hv_winvm_set_preferred_display(uint32_t w, uint32_t h);

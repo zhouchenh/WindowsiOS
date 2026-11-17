@@ -518,15 +518,21 @@ static int load_libs(HvVgpu3d *s) {
                                                         hv_npt_capture_object, hv_npt_cleanup_submit);
                 WARN("Neptune record hook: %s\n", hv_npt_hook_status());
                 if (captured != 1) {
-                    /* No devices exist yet. Do not run with only the process-wide
-                       device hooks, or retry around this refusal via env changes. */
-                    cleanup_install_fatal = 1;
-                    if (captured < 0) atomic_store(&cleanup_record_state, 2);
-                    snprintf(s->why, sizeof s->why, "Neptune capture hook not installed; device creation refused");
-                    WARN("Neptune cleanup: %s; backend refused\n", cleanup_status());
-                    return -1;
-                }
-                atomic_store(&cleanup_record_state, 1);
+                    /* No backend exists yet. A safe free-hook refusal can
+                       restore original lifetime behavior; an uncertain GOT or
+                       vtable must still refuse backend creation. */
+                    int rolled_back = hv_npt_rollback_device_hooks();
+                    hv_npt_cleanup_set_backend_verified(0);
+                    atomic_store(&cleanup_device_state, rolled_back == 1 ? 0 : 2);
+                    if (captured < 0 || rolled_back != 1) {
+                        cleanup_install_fatal = 1;
+                        if (captured < 0) atomic_store(&cleanup_record_state, 2);
+                        snprintf(s->why, sizeof s->why, "Neptune hook rollback incomplete; device creation refused");
+                        WARN("Neptune cleanup: %s; backend refused\n", cleanup_status());
+                        return -1;
+                    }
+                    WARN("Neptune capture hook refused; DXMT lifetime restored: %s\n", hv_npt_device_hook_status());
+                } else atomic_store(&cleanup_record_state, 1);
             }
         }
     }
@@ -1700,7 +1706,7 @@ int hv_vgpu3d_describe(HvVgpu3d *s, char *buf, unsigned len) {
     return snprintf(buf, len,
                     "on cleanup=%s capsets=%u ctxs=%llu cmds=%llu submits=%llu (%lluKB) blobs=%llu maps=%llu fences=%llu "
                     "(ring %llu global %llu) errors=%llu submit_errors=%llu live_ctxs=%u (neptune %u, peak %u) scanout=%u %ux%u%s "
-                    "resets=%llu (skipped %llu) hostmem@%#llx drain=%s trips=%llu drained=%llu (ring %llu global %llu, this trip %llu, oldest %llums) %s %s",
+                    "resets=%llu (skipped %llu) hostmem@%#llx %s %s drain=%s trips=%llu drained=%llu (ring %llu global %llu, this trip %llu, oldest %llums)",
                     cleanup_status(), s->ncapsets, (unsigned long long)s->ctxs, (unsigned long long)s->cmds,
                     (unsigned long long)s->submits, (unsigned long long)(s->submit_bytes >> 10),
                     (unsigned long long)s->blobs, (unsigned long long)s->maps, (unsigned long long)s->fences,
@@ -1710,10 +1716,10 @@ int hv_vgpu3d_describe(HvVgpu3d *s, char *buf, unsigned len) {
                     s->sc_h,
                     s->scanout_handle || (s->g && s->g->fb && s->g->fb->ovr_tex) ? " metal" : "",
                     (unsigned long long)s->resets, (unsigned long long)s->resets_skipped, (unsigned long long)s->win_pa,
-                    drain_on ? "on" : "off", (unsigned long long)s->drain_trips,
+                    cleanup, shared, drain_on ? "on" : "off", (unsigned long long)s->drain_trips,
                     (unsigned long long)(s->drained_ring + s->drained_global), (unsigned long long)s->drained_ring,
                     (unsigned long long)s->drained_global, (unsigned long long)s->drained_trip,
-                    (unsigned long long)(s->drain_max_age_ns / 1000000ull), cleanup, shared);
+                    (unsigned long long)(s->drain_max_age_ns / 1000000ull));
 }
 
 void hv_vgpu3d_set_cleanup_active(int active) {

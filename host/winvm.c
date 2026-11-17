@@ -198,6 +198,11 @@ int hv_winvm_save_png(const char *path) {
     HvFbDisplay *fb = atomic_load_explicit(&display_fb, memory_order_acquire);
     return fb ? hv_fb_save_png(fb, path) : -1;
 }
+int hv_winvm_save_png_raw(const char *path) {
+    HvFbDisplay *fb = atomic_load_explicit(&display_fb, memory_order_acquire);
+    return fb ? hv_fb_save_png_raw(fb, path) : -1;
+}
+
 
 int hv_winvm_create(const HvWinVmConfig *c, char *err, size_t errlen) {
     if (!c || !c->code_fd || !c->vars_fd)

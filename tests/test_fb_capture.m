@@ -162,15 +162,15 @@ static void snapshot_failures(const char *path) {
     int *failures[] = {&d->failQueue, &d->failAllocation, &d->failBuffer, &d->failEncoder, &d->failGPU};
     for (unsigned i = 0; i < sizeof(failures)/sizeof(*failures); i++) {
         *failures[i] = 1;
-        assert(hv_fb_save_png(&fb, path) == -1); assert_empty(path);
+        assert(hv_fb_save_png_raw(&fb, path) == -1); assert_empty(path);
         *failures[i] = 0;
     }
     unsigned calls = d->queueCalls;
     atomic_store(&g_paused, 1);
-    assert(hv_fb_save_png(&fb, path) == -1); assert_empty(path); assert(d->queueCalls == calls);
+    assert(hv_fb_save_png_raw(&fb, path) == -1); assert_empty(path); assert(d->queueCalls == calls);
     atomic_store(&g_paused, 0);
     t->format = MTLPixelFormatRGBA16Float;
-    assert(hv_fb_save_png(&fb, path) == -1); assert_empty(path); assert(d->queueCalls == calls);
+    assert(hv_fb_save_png_raw(&fb, path) == -1); assert_empty(path); assert(d->queueCalls == calls);
     t->format = MTLPixelFormatBGRA8Unorm;
     d->failGPU = 1;
     uint32_t w = 0, h = 0;
@@ -182,7 +182,7 @@ static void snapshot_failures(const char *path) {
 static void snapshot_pixels(const char *path) {
     uint32_t cpu[4] = {0x00112233, 0x00445566, 0x00778899, 0x00aabbcc};
     HvFbDisplay fb; init_fb(&fb, cpu);
-    assert(!hv_fb_save_png(&fb, path));
+    assert(!hv_fb_save_png_raw(&fb, path));
     struct stat st; assert(!stat(path, &st) && st.st_size > 32);
     FakeDevice *d = [FakeDevice new]; FakeTexture *t = texture(d);
     t->format = MTLPixelFormatRGBA8Unorm;
@@ -192,7 +192,36 @@ static void snapshot_pixels(const char *path) {
     uint8_t *pixels = hv_fb_metal_snapshot(&fb, 1, &w, &h);
     assert(pixels && w == 2 && h == 2);
     assert(((uint32_t *)pixels)[0] == 0xff332211 && ((uint32_t *)pixels)[3] == 0xffccbbaa);
-    free(pixels); assert(!hv_fb_save_png(&fb, path));
+    free(pixels); assert(!hv_fb_save_png_raw(&fb, path));
+    hv_fb_display_set_texture(&fb, NULL, 0, 0, 0, 0, 0, 0); pthread_mutex_destroy(&fb.mu);
+}
+static void capture_api_separation(const char *path) {
+    uint32_t cpu[4] = {0xffaabbcc, 0xffaabbcc, 0xffaabbcc, 0xffaabbcc};
+    HvFbDisplay fb; init_fb(&fb, cpu);
+    FakeDevice *d = [FakeDevice new]; FakeTexture *t = texture(d);
+    hv_fb_display_set_texture(&fb, (__bridge void *)t, 8, 8, 1, 1, 2, 2);
+    FILE *log = tmpfile(); assert(log);
+    fflush(stderr); int saved = dup(STDERR_FILENO); assert(saved >= 0);
+    assert(dup2(fileno(log), STDERR_FILENO) >= 0);
+    assert(!hv_fb_save_png(&fb, path)); /* periodic capture cannot consume raw provenance */
+    assert(!hv_fb_save_png_raw(&fb, path));
+    assert(!hv_fb_save_png(&fb, path));
+    assert(!hv_fb_save_png_raw(&fb, path)); /* identical serials still log */
+    d->failGPU = 1;
+    assert(!hv_fb_save_png(&fb, path)); /* silent legacy fallback remains available */
+    struct stat before, after; assert(!stat(path, &before) && before.st_size > 32);
+    assert(hv_fb_save_png_raw(&fb, path) == -1); assert(!stat(path, &after));
+    assert(before.st_size == after.st_size && before.st_mtimespec.tv_sec == after.st_mtimespec.tv_sec &&
+           before.st_mtimespec.tv_nsec == after.st_mtimespec.tv_nsec);
+    fflush(stderr); assert(dup2(saved, STDERR_FILENO) >= 0); close(saved);
+    rewind(log); char line[1024]; unsigned count = 0;
+    const char *name = strrchr(path, '/'); assert(name); ++name;
+    while (fgets(line, sizeof line, log)) {
+        assert(strstr(line, "winvm: capture file=") && strstr(line, name));
+        assert(strstr(line, "source=texture") && strstr(line, "format=80"));
+        assert(strstr(line, count < 2 ? "error=none" : "error=gpu-readback-failed")); ++count;
+    }
+    assert(count == 3); fclose(log);
     hv_fb_display_set_texture(&fb, NULL, 0, 0, 0, 0, 0, 0); pthread_mutex_destroy(&fb.mu);
 }
 static void late_producer_cache_repro(void) {
@@ -249,6 +278,7 @@ int main(void) {
         int f = mkstemp(failed), g = mkstemp(good); assert(f >= 0 && g >= 0); close(f); close(g);
         snapshot_failures(failed);
         snapshot_pixels(good);
+        capture_api_separation(good);
         late_producer_cache_repro();
         real_metal_readback();
         unlink(failed); unlink(good);

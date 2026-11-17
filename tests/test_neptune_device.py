@@ -65,9 +65,9 @@ class Guards(unittest.TestCase):
         with tempfile.TemporaryDirectory(prefix='neptune-device-') as d:
             exe = Path(d)/'test'
             subprocess.run(['clang', '-std=c11', '-Wall', '-Wextra', '-Werror', '-O2',
-                            '-I'+include, str(ROOT/'tests/test_neptune_device.c'), '-o', str(exe)], check=True)
+                            '-I'+include, str(ROOT/'tests/test_neptune_device.c'), str(ROOT/'devices/dxmt_data_lock.c'), '-o', str(exe)], check=True)
             for case in ('guards', 'install', 'interposed', 'protect-fail', 'rollback',
-                         'rollback-fatal', 'ops-fail', 'race', 'compiler', 'compiler-failure'):
+                         'rollback-fatal', 'ops-fail', 'race', 'compiler', 'compiler-failure', 'remove', 'remove-protect', 'remove-restore', 'remove-race'):
                 with self.subTest(case=case):
                     subprocess.run([str(exe), case], check=True, capture_output=True, text=True)
 

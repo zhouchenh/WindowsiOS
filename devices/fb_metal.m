@@ -684,29 +684,16 @@ typedef struct FbCaptureInfo {
     uint64_t serial_before, serial_after;
     uint32_t width, height;
     long gpu_status;
+    unsigned long pixel_format;
 } FbCaptureInfo;
 
-/* The mini-map also captures every few seconds. Keep repeated identical
- * results quiet; a changed source, notification serial, or error is logged. */
-static void log_capture(const FbCaptureInfo *info) {
-    static os_unfair_lock capture_lock = OS_UNFAIR_LOCK_INIT;
-    static FbCaptureInfo previous;
-    static uint64_t suppressed;
-    os_unfair_lock_lock(&capture_lock);
-    if (previous.source && !strcmp(previous.source, info->source) && !strcmp(previous.error, info->error) &&
-        previous.serial_before == info->serial_before && previous.serial_after == info->serial_after &&
-        previous.width == info->width && previous.height == info->height && previous.gpu_status == info->gpu_status) {
-        suppressed++;
-        os_unfair_lock_unlock(&capture_lock);
-        return;
-    }
-    uint64_t skipped = suppressed;
-    suppressed = 0;
-    previous = *info;
-    os_unfair_lock_unlock(&capture_lock);
-    fprintf(stderr, "winvm: capture source=%s serial=%llu->%llu size=%ux%u gpu_status=%ld error=%s suppressed=%llu\n",
-            info->source, (unsigned long long)info->serial_before, (unsigned long long)info->serial_after,
-            info->width, info->height, info->gpu_status, info->error, (unsigned long long)skipped);
+/* Only explicit raw captures log provenance; periodic callers stay silent. */
+static void log_capture(const FbCaptureInfo *info, const char *path) {
+    const char *name = strrchr(path, '/');
+    name = name ? name + 1 : path;
+    fprintf(stderr, "winvm: capture file=%s source=%s serial=%llu->%llu size=%ux%u format=%lu gpu_status=%ld error=%s\n",
+            name, info->source, (unsigned long long)info->serial_before, (unsigned long long)info->serial_after,
+            info->width, info->height, info->pixel_format, info->gpu_status, info->error);
 }
 
 /* Read the single retained texture selected by the capture, including its crop.
@@ -715,6 +702,7 @@ static uint8_t *copy_texture_pixels(HvFbDisplay *fb, id<MTLTexture> src, uint32_
                                     uint32_t rw, uint32_t rh, FbCaptureInfo *info) {
     if (atomic_load(&g_paused)) { info->error = "gpu-paused"; return NULL; }
     MTLPixelFormat f = src.pixelFormat;
+    info->pixel_format = (unsigned long)f;
     if (f != MTLPixelFormatBGRA8Unorm && f != MTLPixelFormatBGRA8Unorm_sRGB &&
         f != MTLPixelFormatRGBA8Unorm && f != MTLPixelFormatRGBA8Unorm_sRGB) {
         info->error = "unsupported-texture-format";
@@ -859,16 +847,16 @@ void hv_fb_metal_set_paused(HvFbDisplay *fb, int paused) {
     fprintf(stderr, "winvm: presenter %s\n", paused ? "paused (app in the background)" : "running again");
 }
 
-int hv_fb_save_png(HvFbDisplay *fb, const char *path) {
+static int save_png(HvFbDisplay *fb, const char *path, int strict) {
     if (!fb || !path) return -1;
     uint32_t w = 0, h = 0;
     FbCaptureInfo info;
     /* A raw-screen diagnostic must not silently substitute stale ramfb pixels
      * when the active 3D texture cannot be read. CPU-only displays still work. */
-    uint8_t *copy = capture_pixels(fb, 1, &w, &h, &info);
+    uint8_t *copy = capture_pixels(fb, strict ? 1 : 2, &w, &h, &info);
     info.serial_after = __atomic_load_n(&fb->ovr_serial, __ATOMIC_RELAXED);
     if (!copy) {
-        log_capture(&info);
+        if (strict) log_capture(&info, path);
         return -1;
     }
     @autoreleasepool {
@@ -893,7 +881,15 @@ int hv_fb_save_png(HvFbDisplay *fb, const char *path) {
         CGColorSpaceRelease(cs);
         free(copy);
         info.error = rc ? "png-encode-or-write" : "none";
-        log_capture(&info);
+        if (strict) log_capture(&info, path);
         return rc;
     }
+}
+
+int hv_fb_save_png(HvFbDisplay *fb, const char *path) {
+    return save_png(fb, path, 0);
+}
+
+int hv_fb_save_png_raw(HvFbDisplay *fb, const char *path) {
+    return save_png(fb, path, 1);
 }

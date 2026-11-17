@@ -1,6 +1,7 @@
 /* SPDX-License-Identifier: GPL-2.0-or-later */
 /* Opt-in, pinned native shared-texture initialization boundary. Data slots only. */
 #include "dxmt_shared_init.h"
+#include "dxmt_data_lock.h"
 #include "dxmt_shared_init_layout.h"
 #include <dlfcn.h>
 #include <mach-o/loader.h>
@@ -15,7 +16,6 @@
 #include <string.h>
 #include <time.h>
 
-static pthread_mutex_t shared_install_mutex=PTHREAD_MUTEX_INITIALIZER;
 static _Atomic(uintptr_t) shared_image;
 static _Atomic(const char *) shared_status="disabled: HV_DXMT_SHARED_INIT is opt-in";
 static _Atomic bool shared_fatal;
@@ -337,7 +337,7 @@ static int install_shared_image(uintptr_t base)
 }
 int hv_dxmt_install_shared_init(void *create_device)
 {
-    pthread_mutex_lock(&shared_install_mutex);
+    hv_dxmt_data_lock();
     int result=-1;
     if (!atomic_load_explicit(&shared_fatal,memory_order_acquire)) {
         const char *env=getenv("HV_DXMT_SHARED_INIT");
@@ -349,6 +349,6 @@ int hv_dxmt_install_shared_init(void *create_device)
             result=reject("disabled: shared-init symbol identity mismatch");
         else result=install_shared_image((uintptr_t)info.dli_fbase);
     }
-    pthread_mutex_unlock(&shared_install_mutex);
+    hv_dxmt_data_unlock();
     return result;
 }

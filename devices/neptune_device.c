@@ -2,6 +2,7 @@
 /* Pinned DXMT data-only lifetime interception. Install before creating devices.
  * QI contains an inlined AddRef, so all three IUnknown slots must participate. */
 #include "neptune_device.h"
+#include "dxmt_data_lock.h"
 #include "neptune_device_layout.h"
 #include "neptune_hook.h"
 #include "neptune_cleanup.h"
@@ -15,7 +16,6 @@
 #include <stdint.h>
 #include <string.h>
 
-static pthread_mutex_t device_install_mutex = PTHREAD_MUTEX_INITIALIZER;
 static _Atomic(uintptr_t) device_image;
 static _Atomic(const char *) device_status = "not installed";
 static _Atomic bool device_fatal;
@@ -268,7 +268,7 @@ int hv_npt_install_device_hooks(void *create_device)
 {
     /* A previous partial transaction poisons this process, including calls
      * whose new symbol fails identity checks. Never downgrade fatal to off. */
-    pthread_mutex_lock(&device_install_mutex);
+    hv_dxmt_data_lock();
     int result=-1;
     if (!atomic_load_explicit(&device_fatal,memory_order_acquire)) {
         Dl_info info;
@@ -276,6 +276,45 @@ int hv_npt_install_device_hooks(void *create_device)
         else if (!dladdr(create_device,&info)) result=reject("disabled: DXMT image unavailable");
         else result=install_device_image((uintptr_t)info.dli_fbase);
     }
-    pthread_mutex_unlock(&device_install_mutex);
+    hv_dxmt_data_unlock();
+    return result;
+}
+
+int hv_npt_rollback_device_hooks(void)
+{
+    hv_dxmt_data_lock();
+    int result = -1;
+    if (atomic_load_explicit(&device_fatal, memory_order_acquire)) goto done;
+    if (!device_installed) { result = 1; goto done; }
+    uintptr_t base = atomic_load_explicit(&device_image, memory_order_acquire);
+    uintptr_t *slots = (void *)(base + HV_NPT_DEVICE_VTABLE);
+    const uintptr_t hooks[3] = {(uintptr_t)hv_npt_device_query_interface,
+        (uintptr_t)hv_npt_device_addref, (uintptr_t)hv_npt_device_release};
+    vm_address_t page = (uintptr_t)slots & ~(uintptr_t)(vm_page_size - 1);
+    vm_prot_t protection;
+    if (!device_region(page, vm_page_size, &protection) || !(protection & VM_PROT_READ) ||
+        (protection & VM_PROT_EXECUTE) || vm_protect(mach_task_self(), page, vm_page_size, FALSE,
+            VM_PROT_READ | VM_PROT_WRITE | VM_PROT_COPY) != KERN_SUCCESS) goto fatal;
+    bool restored = true;
+    for (size_t i = 0; i < 3; ++i) {
+        uintptr_t expected = hooks[i];
+        if (!__atomic_compare_exchange_n(slots + i, &expected, base + hv_npt_device_targets[i], false,
+                __ATOMIC_RELEASE, __ATOMIC_ACQUIRE)) restored = false;
+    }
+    if (vm_protect(mach_task_self(), page, vm_page_size, FALSE, protection) != KERN_SUCCESS)
+        restored = false;
+    if (!restored) goto fatal;
+    device_installed = false;
+    /* Keep callback publication immutable and prevent later reinstall. This
+     * operation is allowed only before backend creation, so no deferred device
+     * can refer to it. Original COM behavior is used for this process. */
+    reject("disabled: DXMT lifetime hooks restored after capture-hook refusal");
+    result = 1;
+    goto done;
+fatal:
+    atomic_store_explicit(&device_fatal, true, memory_order_release);
+    reject("fatal: DXMT lifetime hook removal incomplete; refuse backend devices");
+done:
+    hv_dxmt_data_unlock();
     return result;
 }

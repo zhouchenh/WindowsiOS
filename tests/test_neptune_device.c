@@ -231,10 +231,38 @@ static void transaction(const char *mode)
     }
     munmap(b,0x142c000);
 }
+static void remove_hooks(const char *mode)
+{
+    uint8_t *b = fixture(); uintptr_t *v = (void *)(b + HV_NPT_DEVICE_VTABLE);
+    assert(!mprotect(b, 0x142c000, PROT_READ));
+    assert(install_device_image((uintptr_t)b) == 1);
+    if (!strcmp(mode, "remove-protect")) fail_at = protects + 1;
+    if (!strcmp(mode, "remove-restore")) fail_at = protects + 2;
+    if (!strcmp(mode, "remove-race")) race = v + 1;
+    int result = hv_npt_rollback_device_hooks();
+    if (!strcmp(mode, "remove")) {
+        assert(result == 1 && !device_installed && !atomic_load(&device_fatal));
+        for (size_t i = 0; i < 3; ++i) assert(v[i] == (uintptr_t)b + hv_npt_device_targets[i]);
+        vm_prot_t protection; assert(device_region((uintptr_t)v, 24, &protection));
+        assert(protection == VM_PROT_READ);
+        assert(hv_npt_rollback_device_hooks() == 1); /* idempotent */
+        assert(install_device_image((uintptr_t)b) == 0); /* original behavior for process lifetime */
+    } else {
+        assert(result == -1 && atomic_load(&device_fatal));
+        assert(hv_npt_rollback_device_hooks() == -1 && hv_npt_install_device_hooks(NULL) == -1);
+        if (!strcmp(mode, "remove-race")) {
+            assert(v[1] == 1); /* never overwrite another interposer */
+            assert(v[0] == (uintptr_t)b + hv_npt_device_targets[0]);
+            assert(v[2] == (uintptr_t)b + hv_npt_device_targets[2]);
+        }
+    }
+    munmap(b, 0x142c000);
+}
 int main(int argc,char **argv)
 {
     assert(argc==2);
-    if (!strcmp(argv[1],"guards")) guards();
+    if (!strncmp(argv[1],"remove",6)) remove_hooks(argv[1]);
+    else if (!strcmp(argv[1],"guards")) guards();
     else if (!strcmp(argv[1],"compiler")) compiler_barrier(false);
     else if (!strcmp(argv[1],"compiler-failure")) compiler_barrier(true);
     else transaction(argv[1]);
