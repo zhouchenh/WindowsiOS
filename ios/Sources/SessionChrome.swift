@@ -829,18 +829,29 @@ struct SessionMoreMenu: View {
 
 // MARK: - Floating keyboard button and the hint
 
-/// The keyboard button in thumb reach: bottom-right, or bottom-left after dragging it there.
-/// It keeps clear of the camera island (reservedRegions(kind: .occlusion)).
+/// The keyboard button in thumb reach: bottom-right, or bottom-left after dragging it there, resting just
+/// above the Windows taskbar (so the clock, the tray and the widgets button stay visible; it now sits where
+/// Windows shows its notification toasts instead). It keeps clear of the camera island
+/// (reservedRegions(kind: .occlusion)).
 struct KeyboardFloatingButton: View {
     @ObservedObject var chrome: ChromeModel
+    @ObservedObject var display = DisplaySettings.shared
     /// The area it sits in (the Windows screen), in the same coordinates as `occlusions`.
     let area: CGRect
     let occlusions: [CGRect]
+    /// The guest's framebuffer in pixels (vm.fbWidth x vm.fbHeight; zero before the first frame).
+    let framebuffer: CGSize
+    /// The guest has a Windows taskbar at the bottom (not the Linux guest).
+    let reservesTaskbar: Bool
     let action: () -> Void
 
     @State private var drag: CGFloat = 0
     private let size: CGFloat = 52
     private let margin: CGFloat = 16
+    /// Room left between the button and the top of the Windows taskbar.
+    private let taskbarGap: CGFloat = 8
+    /// Windows 11's taskbar height in DIPs (it is always at the bottom edge).
+    static let taskbarDIPs: CGFloat = 48
 
     var body: some View {
         let origin = restingOrigin()
@@ -883,14 +894,41 @@ struct KeyboardFloatingButton: View {
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
     }
 
-    /// Its corner, moved up past any occluded region it would sit under.
+    /// Its corner, above the Windows taskbar, then moved up past any occluded region it would sit under.
     private func restingOrigin() -> CGPoint {
         let x = chrome.keyboardButtonOnLeft ? area.minX + margin : area.maxX - margin - size
-        var y = area.maxY - margin - size
+        var bottom = area.maxY - margin
+        if reservesTaskbar {
+            let pct = Self.taskbarScale(framebuffer: framebuffer, plan: display.plan, applied: display.applied)
+            bottom = min(bottom, Self.taskbarTop(area: area, framebuffer: framebuffer, scalePercent: pct) - taskbarGap)
+        }
+        var y = bottom - size
         for r in occlusions where r.intersects(CGRect(x: x, y: y, width: size, height: size).insetBy(dx: -6, dy: -6)) {
             y = min(y, r.minY - size - margin)
         }
         return CGPoint(x: x, y: max(area.minY + margin, y))
+    }
+
+    /// Windows' scale for the framebuffer on screen: what the WinKit helper reported Windows took for that
+    /// mode, else the scale planned for it, else Windows' recommended one (0: unknown). The plan's scale
+    /// belongs to the plan's mode only, which differs while Windows has not taken a new size yet.
+    static func taskbarScale(framebuffer fb: CGSize, plan: WinIOSDisplayPlan, applied: WinIOSDisplayApplied) -> UInt32 {
+        let w = UInt32(max(0, fb.width)), h = UInt32(max(0, fb.height))
+        if applied.scalePercent > 0 && applied.modeWidth == w && applied.modeHeight == h { return applied.scalePercent }
+        if plan.legacy == 0 && plan.scalePercent > 0 && plan.modeWidth == w && plan.modeHeight == h { return plan.scalePercent }
+        return applied.recommendedPercent
+    }
+
+    /// The top of the Windows taskbar in `area`'s coordinates: 48 DIPs at Windows' scale (150% when
+    /// unknown), through the picture's aspect fit in `area` (as MetalCanvasUIView maps touches), kept to
+    /// 20 points ... a quarter of the area. Before the first frame: a 64-point band.
+    static func taskbarTop(area: CGRect, framebuffer fb: CGSize, scalePercent: UInt32) -> CGFloat {
+        guard fb.width > 0, fb.height > 0, area.width > 0, area.height > 0 else { return area.maxY - 64 }
+        let ppp = min(area.width / fb.width, area.height / fb.height) // points per framebuffer pixel
+        let pictureBottom = area.midY + fb.height * ppp / 2
+        let pct = CGFloat(scalePercent > 0 ? scalePercent : 150)
+        let band = taskbarDIPs * pct / 100 * ppp
+        return pictureBottom - min(max(band, 20), area.height * 0.25)
     }
 }
 

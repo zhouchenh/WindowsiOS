@@ -183,7 +183,9 @@ struct SessionView: View {
             .opacity(vm.isVMRunning ? 1 : 0)
 
             if vm.isVMRunning && !laptop && chrome.keyboardButtonShown && !vm.hardwareKeyboard && !vm.systemKeyboardVisible {
-                KeyboardFloatingButton(chrome: chrome, area: canvas.visibleRect, occlusions: occlusions) {
+                KeyboardFloatingButton(chrome: chrome, area: canvas.visibleRect, occlusions: occlusions,
+                                       framebuffer: CGSize(width: CGFloat(vm.fbWidth), height: CGFloat(vm.fbHeight)),
+                                       reservesTaskbar: !vm.isLinux) {
                     UIImpactFeedbackGenerator(style: .light).impactOccurred()
                     vm.systemKeyboardVisible = true
                 }

@@ -332,6 +332,10 @@ final class MiniMapView: UIView {
         guard window != nil, !isHidden, alpha > 0.01 else { return }
         ticks += 1
         setNeedsLayout() // the pointer moves
+        // Windows took another shape: the key bar lays out again (the map's width, and whether it fits at all)
+        if let bar = superview as? WindowsKeyBar, abs(preferredWidth(forHeight: bounds.height) - bounds.width) > 0.5 {
+            bar.setNeedsLayout()
+        }
         if ticks % 12 == 0 { refreshPicture() } // the picture: every 3 s
     }
 
