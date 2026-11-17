@@ -57,6 +57,9 @@ bool winios_jit_acquire(size_t bytes, bool detach_after);
 bool winios_jit_is_live(void);
 WinIosDualMapping winios_jit_mapping(void);
 void *winios_jit_guest_ram(uint64_t *out_bytes);
+/* Emit allocation facts after stderr capture starts. Configuration may have
+ * changed since the once-per-process RAM allocation, so log both values. */
+void winios_jit_log_memory_config(uint64_t selected_ram_mb);
 /* The virtio-gpu 3D hostmem window reserved before guest RAM (NULL if none). */
 void *winios_gpu_window(uint64_t *out_bytes);
 const char *winios_jit_status_text(void);

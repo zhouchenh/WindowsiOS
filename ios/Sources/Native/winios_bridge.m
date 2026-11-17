@@ -1412,6 +1412,12 @@ static BOOL winios_plans_equal(WinIOSDisplayPlan a, WinIOSDisplayPlan b) {
 }
 
 - (BOOL)tryAcquireJIT:(BOOL)detachAfter {
+    /* RAM and its VA-fit probe are allocated during JIT acquisition, before
+       startConfiguredVMInDirectory loads env.txt. Keep that override effective
+       at the allocation boundary; a live JIT/RAM mapping requires app restart. */
+    static dispatch_once_t envBeforeJIT;
+    if (!winios_jit_is_live())
+        dispatch_once(&envBeforeJIT, ^{ winios_load_env_file([self documentsPath]); });
     BOOL ok = winios_jit_acquire(winios_jit_configured_bytes(), detachAfter);
     dispatch_async(_diagQueue, ^{
         [self writeDiagnosticsSnapshot];
@@ -1821,6 +1827,7 @@ static NSString *winios_unpack_resource(NSString *name, NSString *dst) {
         else if (availMB < 3400 && availMB > 1800) ramMB = (availMB - 768) & ~127ull;
         else if (availMB <= 1800) ramMB = 2048;
     }
+    winios_jit_log_memory_config(ramMB);
 
     NSString *sharedDir = [[self documentsPath] stringByAppendingPathComponent:@"Shared"];
     [[NSFileManager defaultManager] createDirectoryAtPath:sharedDir withIntermediateDirectories:YES attributes:nil error:nil];

@@ -99,6 +99,9 @@ static uint32_t g_cfg_jit_mb, g_cfg_ram_mb;
    The probe is unmapped immediately: it reserves neither VA nor physical memory for later use. */
 static uint32_t g_cfg_3d_room_mb = 1024;
 static bool g_cfg_3d_enabled;
+/* Allocation facts survive later configuration changes. A VM restart reuses
+ * preallocated RAM; only a fresh app process can run this fit test again. */
+static uint32_t g_prealloc_room_mb, g_prealloc_ram_cap_mb;
 
 void winios_jit_configure_3d(bool on) {
     g_cfg_3d_enabled = on;
@@ -135,6 +138,18 @@ static uint64_t g_gpu_window_bytes;
 void *winios_gpu_window(uint64_t *out_bytes) {
     if (out_bytes) *out_bytes = g_gpu_window_bytes;
     return g_gpu_window;
+}
+
+void winios_jit_log_memory_config(uint64_t selected_ram_mb) {
+    WINIOS_LOG("memory-config: selected RAM %llu MiB, preallocated %llu MiB, "
+               "RAM cap configured %u MiB / at allocation %u MiB (0=automatic), JIT %zu MiB, hostmem %llu MiB; "
+               "VA-fit target configured %u MiB / passed-and-released %u MiB "
+               "(0=no successful probe; not a physical/Metal reservation)",
+               (unsigned long long)selected_ram_mb,
+               (unsigned long long)(g_guest_ram_bytes >> 20),
+               g_cfg_ram_mb, g_prealloc_ram_cap_mb, g_mapping.size >> 20,
+               (unsigned long long)(g_gpu_window_bytes >> 20),
+               g_cfg_3d_room_mb, g_prealloc_room_mb);
 }
 
 static void prealloc_ledger_exempt_ram(void) {
@@ -176,6 +191,8 @@ static void prealloc_ledger_exempt_ram(void) {
             munmap(room, room_bytes);
             g_guest_ram = p;
             g_guest_ram_bytes = mb << 20;
+            g_prealloc_room_mb = g_cfg_3d_room_mb;
+            g_prealloc_ram_cap_mb = g_cfg_ram_mb;
             WINIOS_LOG("pre-allocated %llu MiB ledger-exempt Guest RAM at %p; %u MiB contiguous VA-fit probe passed and released "
                        "(physical total %llu MiB, physical reserve policy 2560 MiB)",
                        (unsigned long long)mb, (void *)p, g_cfg_3d_room_mb, (unsigned long long)phys_mb);
