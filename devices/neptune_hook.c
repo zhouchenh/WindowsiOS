@@ -192,7 +192,7 @@ int hv_npt_check_dxmt(void *create_device)
         return failure(HOOK_BAD_DXMT);
     uintptr_t image = (uintptr_t)info.dli_fbase, expected = 0;
     if (!atomic_compare_exchange_strong_explicit(&trusted_dxmt_image, &expected, image,
-                                                 memory_order_release, memory_order_acquire) && expected != image)
+                                                 memory_order_acq_rel, memory_order_acquire) && expected != image)
         return failure(HOOK_BAD_DXMT);
     return 1;
 }
@@ -253,7 +253,7 @@ int hv_npt_read_child_parent(void *child, void **raw_device)
         image = (uintptr_t)info.dli_fbase;
         uintptr_t expected = 0;
         if (!atomic_compare_exchange_strong_explicit(&trusted_dxmt_image, &expected, image,
-                                                     memory_order_release, memory_order_acquire))
+                                                     memory_order_acq_rel, memory_order_acquire))
             image = expected;
     }
     return read_parent_at(image, method, object, raw_device);
@@ -385,7 +385,7 @@ static int configure_image(const struct mach_header_64 *mh, intptr_t slide,
     atomic_store_explicit(&published, &hook_state, memory_order_release);
     uintptr_t expected = expected_free;
     bool bound = __atomic_compare_exchange_n(slot, &expected, (uintptr_t)npt_free_hook, false,
-                                             __ATOMIC_RELEASE, __ATOMIC_ACQUIRE);
+                                             __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE);
     if (vm_protect(mach_task_self(), page, vm_page_size, FALSE, old_protection) != KERN_SUCCESS) {
         /* State remains alive if a thread already loaded our hook. No immediate
          * cleanup is attempted here, even when the import is rolled back. */
@@ -393,7 +393,7 @@ static int configure_image(const struct mach_header_64 *mh, intptr_t slide,
         if (bound) {
             expected = (uintptr_t)npt_free_hook;
             rolled_back=__atomic_compare_exchange_n(slot, &expected, expected_free, false,
-                                                     __ATOMIC_RELEASE, __ATOMIC_ACQUIRE);
+                                                     __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE);
         }
         bool protected_again=vm_protect(mach_task_self(), page, vm_page_size, FALSE,
                                         old_protection)==KERN_SUCCESS;
