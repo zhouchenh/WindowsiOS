@@ -531,7 +531,7 @@ static int load_libs(HvVgpu3d *s) {
     }
     int map_vr = hv_gpu_map_diagnostics_install((void *)V.virgl_renderer_init, HV_GPU_MAP_VIRGL);
     int map_dx = map_vr < 0 ? -1 : hv_gpu_map_diagnostics_install(dxmt_symbol, HV_GPU_MAP_DXMT);
-    LOG("GPU mapping diagnostics: virgl=%s; dxmt=%s; limit=64 line attempts/process (concurrent reports skipped)\n",
+    WARN("GPU mapping diagnostics: virgl=%s; dxmt=%s; limit=64 line attempts/process (concurrent reports skipped)\n",
         hv_gpu_map_diagnostics_status(HV_GPU_MAP_VIRGL), hv_gpu_map_diagnostics_status(HV_GPU_MAP_DXMT));
     if (map_vr < 0 || map_dx < 0) {
         snprintf(s->why, sizeof s->why, "GPU mapping diagnostic import rollback failed; restart required");
