@@ -236,6 +236,15 @@ static void remove_hooks(const char *mode)
     uint8_t *b = fixture(); uintptr_t *v = (void *)(b + HV_NPT_DEVICE_VTABLE);
     assert(!mprotect(b, 0x142c000, PROT_READ));
     assert(install_device_image((uintptr_t)b) == 1);
+    if (!strcmp(mode, "remove-used")) {
+        int before = protects;
+        hv_npt_device_hooks_mark_used();
+        assert(hv_npt_rollback_device_hooks() == 0 && device_installed && protects == before);
+        assert(v[0] == (uintptr_t)hv_npt_device_query_interface);
+        assert(v[1] == (uintptr_t)hv_npt_device_addref && v[2] == (uintptr_t)hv_npt_device_release);
+        assert(install_device_image((uintptr_t)b) == 1); /* existing hooks stay installed */
+        munmap(b, 0x142c000); return;
+    }
     if (!strcmp(mode, "remove-protect")) fail_at = protects + 1;
     if (!strcmp(mode, "remove-restore")) fail_at = protects + 2;
     if (!strcmp(mode, "remove-race")) race = v + 1;

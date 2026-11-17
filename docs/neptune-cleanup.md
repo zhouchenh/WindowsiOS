@@ -95,9 +95,14 @@ Only data pages are made writable, with their protection restored afterward.
 There are no writes to executable memory. Unknown images, unexpected bytes or
 refused page protection keep the original behavior and report the reason.
 Overrides in `work/3d/fw-override` receive the same runtime checks.
-If a partially installed hook cannot be fully rolled back, or the final record
-hook cannot install after the device hooks, backend creation fails for the
-process instead of using only part of the cleanup implementation. Status reports
+If the final record hook safely refuses before any backend creation, the three
+DXMT lifetime slots are CAS-restored with their original page protection. The
+process then keeps original lifetime behavior. Backend creation irreversibly
+seals this rollback path, including a failed initialization attempt; existing
+devices or deferred jobs can never lose their lifetime hooks. An uncertain GOT
+or vtable rollback, or a later refusal after that seal, prevents further backend
+creation for the process. Both DXMT installers use the same data-page lock.
+Status reports
 the device and record hooks separately; startup logs give each guard result.
 
 The existing guarded `scripts/patch_dxmt.py` upload-failure protection is unchanged.
@@ -108,14 +113,15 @@ disable this cleanup and restore the previous leak behavior for comparison.
 ## App lifecycle integration
 
 `hv_winvm_set_gpu_allowed(int)` is safe before VM creation and initially allows
-GPU work. The iOS bridge must set it to zero on `UIApplicationDidEnterBackground`
+GPU work. The iOS bridge sets it to zero on `UIApplicationDidEnterBackground`
 and back to one on `UIApplicationDidBecomeActive`. Merely inactive states such
 as Control Center remain allowed. `WillEnterForeground` is too early.
 
 While disallowed, queued cleanup and new backend reads wait. The watchdog clock
 pauses. A call already entered in DXMT cannot be cancelled; its references stay
-owned. The lead's Picture in Picture/background integration wires these lifecycle
-calls separately from this branch.
+owned. These callbacks apply to every trip, including plain background trips
+that only pause guest CPUs. Presenter pause and background drain remain separate
+permissions for the optional shared-initialization mitigation.
 This conservative gate also delays already-quiescent device destruction while
 away. An auto-2D trip therefore need not immediately reclaim all DXMT memory in
 the background; pending retirement resumes when permission returns.
@@ -143,7 +149,7 @@ not change the guest or its drivers.
 4. Check each cleanup batch's reference count, device retirement counters, elapsed time and
    result. A quarantined or stuck batch is a failed reclamation test even though
    it preserves safety. Save its call/reason and the surrounding census lines.
-5. Once the lead has wired the lifecycle API, repeat a normal background and
+5. Repeat a normal background and
    foreground trip while cleanup is pending. The app must remain responsive;
    cleanup must wait while backgrounded. This test does not require a graphics
    mode or display-topology change inside Windows.

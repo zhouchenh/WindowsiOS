@@ -459,6 +459,7 @@ static const AVAudioSessionCategoryOptions kWinIOSAudioOptions = AVAudioSessionC
 
 - (void)onAppBackground:(NSNotification *)note {
     (void)note;
+    hv_winvm_set_gpu_allowed(0); /* includes already-entered backend work on every trip */
     _inBackground = YES;
     [self cancelAllTouchContacts]; /* no finger stays down in Windows while the app is away */
     if (!_vmRunning) return;
@@ -530,6 +531,7 @@ static const AVAudioSessionCategoryOptions kWinIOSAudioOptions = AVAudioSessionC
 
 - (void)onAppActive:(NSNotification *)note {
     (void)note;
+    hv_winvm_set_gpu_allowed(1);
     [self resumeFromBackground];
     /* only now, not at WillEnterForeground: the GPU is refused until the app is active again */
     [self endAutoSwitchAway];

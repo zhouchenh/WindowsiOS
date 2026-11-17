@@ -522,8 +522,8 @@ static int load_libs(HvVgpu3d *s) {
                        restore original lifetime behavior; an uncertain GOT or
                        vtable must still refuse backend creation. */
                     int rolled_back = hv_npt_rollback_device_hooks();
-                    hv_npt_cleanup_set_backend_verified(0);
-                    atomic_store(&cleanup_device_state, rolled_back == 1 ? 0 : 2);
+                    if (rolled_back != 0) hv_npt_cleanup_set_backend_verified(0);
+                    atomic_store(&cleanup_device_state, rolled_back == 1 ? 0 : rolled_back == 0 ? 1 : 2);
                     if (captured < 0 || rolled_back != 1) {
                         cleanup_install_fatal = 1;
                         if (captured < 0) atomic_store(&cleanup_record_state, 2);
@@ -646,6 +646,7 @@ static int renderer_init(HvVgpu3d *s) {
     int flags = VIRGL_RENDERER_NEPTUNE | VIRGL_RENDERER_RENDER_SERVER | VIRGL_RENDERER_ASYNC_FENCE_CB |
                 VIRGL_RENDERER_THREAD_SYNC | VIRGL_RENDERER_NATIVE_SHARE_TEXTURE;
     if (getenv("HV_GPU3D_VENUS")) flags |= VIRGL_RENDERER_VENUS;
+    hv_npt_device_hooks_mark_used();
     int rc = V.virgl_renderer_init(s, flags, &cbs);
     if (rc != 0) {
         snprintf(s->why, sizeof s->why, "virgl_renderer_init failed: %d", rc);
@@ -1348,6 +1349,7 @@ static void complete_fences(HvVgpu3d *s, const FenceEv *f) {
    next 3D driver start (after a switch back, hv_virtio_gpu_set_3d) finds it ready: it is never torn down and made
    again within one run of the app. A real reset runs Metal work; see below for when it is skipped. */
 static void renderer_reset(HvVgpu3d *s) {
+    hv_dxmt_shared_init_reset();
     /* A renderer that did nothing since its last reset has nothing to drop, so the reset is skipped: after a switch
        to 2D, Windows (and so its driver resets: a restart, Windows Update, a TDR) can run in the background, where
        no Metal work may happen. The first reset after real 3D use still runs, and that one follows a 3D driver, so

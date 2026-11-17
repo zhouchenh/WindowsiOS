@@ -19,7 +19,7 @@
 static _Atomic(uintptr_t) device_image;
 static _Atomic(const char *) device_status = "not installed";
 static _Atomic bool device_fatal;
-static bool device_installed;
+static bool device_installed, device_creation_started;
 static struct {
     int32_t (*query)(void *, const void *, void **);
     int32_t (*event_value)(void *);
@@ -214,6 +214,7 @@ static int install_device_image(uintptr_t base)
                 return reject("rejected: installed DXMT slots changed");
         return 1;
     }
+    if (device_creation_started) return reject("disabled: backend creation already started");
     if (atomic_load(&device_image)) return reject("disabled: previous device publication cannot retry");
     for (size_t i=0;i<3;++i)
         if (__atomic_load_n(slots+i,__ATOMIC_ACQUIRE)!=base+hv_npt_device_targets[i])
@@ -280,12 +281,24 @@ int hv_npt_install_device_hooks(void *create_device)
     return result;
 }
 
+void hv_npt_device_hooks_mark_used(void)
+{
+    hv_dxmt_data_lock();
+    device_creation_started = true;
+    hv_dxmt_data_unlock();
+}
+
 int hv_npt_rollback_device_hooks(void)
 {
     hv_dxmt_data_lock();
     int result = -1;
     if (atomic_load_explicit(&device_fatal, memory_order_acquire)) goto done;
     if (!device_installed) { result = 1; goto done; }
+    if (device_creation_started) {
+        reject("refused: lifetime hooks must remain after backend creation started");
+        result = 0;
+        goto done;
+    }
     uintptr_t base = atomic_load_explicit(&device_image, memory_order_acquire);
     uintptr_t *slots = (void *)(base + HV_NPT_DEVICE_VTABLE);
     const uintptr_t hooks[3] = {(uintptr_t)hv_npt_device_query_interface,

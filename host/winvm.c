@@ -152,6 +152,7 @@ int hv_winvm_gpu_set_3d(int on) {
 
 void hv_winvm_set_gpu_allowed(int allowed) {
     hv_vgpu3d_set_cleanup_active(allowed);
+    hv_dxmt_shared_init_set_gpu_allowed(allowed);
 }
 
 void hv_winvm_gpu_mode(int *capable, int *offered3d, int *negotiated3d, int *driver_ok, uint32_t *resets) {
@@ -181,7 +182,7 @@ uint64_t hv_winvm_display_serial(int *is_texture) {
 }
 
 void hv_winvm_display_set_paused(int paused) {
-    hv_dxmt_shared_init_set_gpu_allowed(!paused);
+    hv_dxmt_shared_init_set_presenter_paused(paused);
     HvFbDisplay *fb = atomic_load_explicit(&display_fb, memory_order_acquire);
     hv_fb_metal_set_paused(fb, paused);
 }
@@ -379,6 +380,7 @@ int hv_winvm_run_cpu0(void) {
             spawn_secondaries();
             continue;
         }
+        hv_dxmt_shared_init_reset();
         return r;
     }
 }
