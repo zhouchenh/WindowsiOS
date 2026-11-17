@@ -327,7 +327,7 @@ static int install_shared_image(uintptr_t base)
     for (;bound<2;++bound) {
         uintptr_t expected=base+hv_shared_targets[bound];
         if (!__atomic_compare_exchange_n(slots[bound],&expected,hooks[bound],false,
-            __ATOMIC_RELEASE,__ATOMIC_ACQUIRE)) break;
+            __ATOMIC_ACQ_REL,__ATOMIC_ACQUIRE)) break;
     }
     bool restored=vm_protect(mach_task_self(),page,vm_page_size,FALSE,protection)==KERN_SUCCESS;
     if (bound!=2 || !restored) {
@@ -337,7 +337,7 @@ static int install_shared_image(uintptr_t base)
         if (writable) for (size_t i=0;i<bound;++i) {
             uintptr_t expected=hooks[i];
             if (!__atomic_compare_exchange_n(slots[i],&expected,base+hv_shared_targets[i],false,
-                __ATOMIC_RELEASE,__ATOMIC_ACQUIRE)) rolled_back=false;
+                __ATOMIC_ACQ_REL,__ATOMIC_ACQUIRE)) rolled_back=false;
         }
         bool protected_again=vm_protect(mach_task_self(),page,vm_page_size,FALSE,protection)==KERN_SUCCESS;
         if (!rolled_back || !protected_again) {

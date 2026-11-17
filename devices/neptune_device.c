@@ -286,7 +286,7 @@ static int install_device_image(uintptr_t base)
     if (ready) for (;bound<3;++bound) {
         uintptr_t expected=base+hv_npt_device_targets[bound];
         if (!__atomic_compare_exchange_n(slots+bound,&expected,hooks[bound],false,
-            __ATOMIC_RELEASE,__ATOMIC_ACQUIRE)) break;
+            __ATOMIC_ACQ_REL,__ATOMIC_ACQUIRE)) break;
     }
     bool restored=vm_protect(mach_task_self(),page,vm_page_size,FALSE,protection)==KERN_SUCCESS;
     if (!ready || bound!=3 || !restored) {
@@ -298,7 +298,7 @@ static int install_device_image(uintptr_t base)
         if (writable) for (size_t i=0;i<bound;++i) {
             uintptr_t expected=hooks[i];
             if (!__atomic_compare_exchange_n(slots+i,&expected,base+hv_npt_device_targets[i],false,
-                __ATOMIC_RELEASE,__ATOMIC_ACQUIRE)) rolled_back=false;
+                __ATOMIC_ACQ_REL,__ATOMIC_ACQUIRE)) rolled_back=false;
         }
         bool protected_again=vm_protect(mach_task_self(),page,vm_page_size,FALSE,protection)==KERN_SUCCESS;
         if (!rolled_back || !protected_again) {
@@ -360,7 +360,7 @@ int hv_npt_rollback_device_hooks(void)
     for (size_t i = 0; i < 3; ++i) {
         uintptr_t expected = hooks[i];
         if (!__atomic_compare_exchange_n(slots + i, &expected, base + hv_npt_device_targets[i], false,
-                __ATOMIC_RELEASE, __ATOMIC_ACQUIRE)) restored = false;
+                __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) restored = false;
     }
     if (vm_protect(mach_task_self(), page, vm_page_size, FALSE, protection) != KERN_SUCCESS)
         restored = false;
