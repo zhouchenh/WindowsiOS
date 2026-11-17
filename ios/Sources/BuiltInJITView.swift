@@ -260,8 +260,8 @@ struct BuiltInJITSetupView: View {
             Text(L("3. 连接", "3. Connection"))
         } footer: {
             if jit.connectionMode == .localDevVPN {
-                Text(L("免费的 App Store App。调试器通过它连到本机（10.7.0.1）。只有蜂窝网络时，如果连不上，请关掉再打开蜂窝数据，或连一次 Wi-Fi。",
-                       "A free App Store app. The debugger reaches this device (10.7.0.1) through it. On cellular only, if it cannot connect, turn Cellular Data off and on again, or join a Wi-Fi once."))
+                Text(L("免费的 App Store App。调试器通过它连到本机（10.7.0.1）。只有蜂窝网络时 iOS 会拒绝连接：先打开飞行模式（或连上 Wi-Fi）再开启 JIT，开启后 JIT 一直保持到 App 关闭。",
+                       "A free App Store app. The debugger reaches this device (10.7.0.1) through it. On cellular only, iOS refuses the connection: turn on Airplane Mode (or join a Wi-Fi) before enabling JIT; once on, JIT stays until the app is closed."))
             } else {
                 Text(L("iOS 同时只能连一个 VPN。如果你的 VPN 服务器把某个地址转回本机（“反射”，例如把第二个 IPv6 地址 NAT64 到本机的 IPv4 隧道地址），调试器就能通过它连到本机，不需要 LocalDevVPN。填 IPv4 或 IPv6 地址，方括号可有可无。服务器的设置见 docs/builtin-jit.md。",
                        "iOS runs one VPN at a time. If your VPN's server routes an address back to this device (a reflector, for example NAT64 from a second IPv6 address to this device's IPv4 tunnel address), the debugger reaches this device through it instead of LocalDevVPN. Enter an IPv4 or IPv6 address, with or without brackets. docs/builtin-jit.md shows server setups."))

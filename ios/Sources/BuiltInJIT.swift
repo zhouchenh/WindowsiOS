@@ -596,8 +596,8 @@ enum JITConnectionProblem: Equatable {
             return L("连不上本机。请连接 LocalDevVPN，然后重试。",
                      "Apple VM couldn't reach this device. Connect LocalDevVPN, then try again.")
         }
-        return L("LocalDevVPN 显示已连接，但 iOS 仍可能把连接走蜂窝网络。在控制中心关掉蜂窝数据，等 2 秒再打开；或者连一次任意 Wi-Fi（个人热点也行）。保持 LocalDevVPN 连接，关掉 Tailscale 等其他 VPN，然后重试。",
-                 "LocalDevVPN can show Connected while iOS still sends the connection over cellular. Turn Cellular Data off in Control Center, wait 2 seconds, then turn it back on. Or join any Wi-Fi once; a hotspot works. Keep LocalDevVPN connected, turn off other VPNs such as Tailscale, then try again.")
+        return L("只用蜂窝网络时，iOS 27 会拒绝这个连接。请打开飞行模式（Wi-Fi 保持关闭），连接 LocalDevVPN，再开启 JIT；开启后可以关掉飞行模式，JIT 会一直保持到 App 关闭。连上任意 Wi-Fi（个人热点也行）也可以。关掉 Tailscale 等其他 VPN。",
+                 "On cellular only, iOS 27 refuses this connection. Turn on Airplane Mode (leave Wi-Fi off), connect LocalDevVPN, then enable JIT; afterwards turn Airplane Mode off again: JIT stays on until the app is closed. Joining any Wi-Fi (a hotspot works) also works. Turn off other VPNs such as Tailscale.")
     }
 }
 
@@ -627,8 +627,8 @@ enum JITOwnVPNAdvice {
     static func text(for check: WinJITRequest.ConnectionCheck) -> String {
         switch check {
         case .cannotConnect:
-            return L("通过你的 VPN 连不上本机。请确认 VPN 已连接，地址填的是 VPN 服务器转回本机的那个（反射地址），并且服务器上的反射规则在生效，然后重试。",
-                     "Apple VM couldn't connect to this device through your VPN. Check that the VPN is connected, that the address is the one its server routes back to this device (the reflector address), and that the reflector is running on the server, then try again.")
+            return L("通过你的 VPN 连不上本机。请确认 VPN 已连接，地址填的是 VPN 服务器转回本机的那个（反射地址），并且服务器上的反射规则在生效，然后重试。只用蜂窝网络时，iOS 27 不管走哪个 VPN 都会拒绝：请先连上 Wi-Fi。",
+                     "Apple VM couldn't connect to this device through your VPN. Check that the VPN is connected, that the address is the one its server routes back to this device (the reflector address), and that the reflector is running on the server, then try again. On cellular only, iOS 27 refuses it whatever the VPN: join a Wi-Fi first.")
         case .noAnswer:
             return L("通过你的 VPN 连上了，但本机的 RemotePairing 服务没有回应（连接被关闭、没有回音，或回应的是别的服务）。iOS 可能不在 VPN 的接口上回应它，或者这个端口是别的服务。请改用 LocalDevVPN。",
                      "Connected through your VPN, but this device's RemotePairing service did not answer (the connection was closed, nothing came back, or another service replied). iOS may not answer it on the VPN's interface, or that port is another service. Use LocalDevVPN instead.")

@@ -31,7 +31,9 @@ The design and most of the code come from [Henge](https://github.com/Leviidev/He
   enable JIT. StikJIT reaches the device's debug service at 10.7.0.1 through it. Or, instead, a VPN
   of your own whose server routes an address back to this device (see
   [Using your own VPN instead of LocalDevVPN](#using-your-own-vpn-instead-of-localdevvpn)).
-- Wi-Fi for the pairing on the device. Enabling JIT works on cellular too (see Troubleshooting).
+- Wi-Fi for the pairing on the device. Enabling JIT needs Wi-Fi or Airplane Mode too: on cellular, iOS 27
+  refuses the connection (see Troubleshooting). Once JIT is on it stays on until Apple VM is closed, whatever
+  the network does afterwards.
 - Apple VM installed **with its app extension** and signed with `get-task-allow`: by Xcode
   (docs/building.md, section 4b), or by SideStore/AltStore from the IPA. Not inside LiveContainer
   (below).
@@ -253,9 +255,13 @@ includes it, or `::/0`) and accept the IPv4 source the reflected packets arrive 
   address the reflected packets come from. **"Connected through your VPN, but RemotePairing did not
   answer"**: the server reflects, but iOS closed the connection or did not answer RemotePairing there
   (or the port is another service): use LocalDevVPN.
-- **On cellular only**, LocalDevVPN can show Connected while iOS sends the connection over the
-  mobile network. Apple VM retries twice by itself. If it still fails, turn Cellular Data off in
-  Control Center, wait 2 seconds, turn it on again; or join any Wi-Fi once (a hotspot works).
+- **On cellular only**, enabling JIT fails, with LocalDevVPN and with your own VPN alike: on an iPhone
+  with iOS 27 (tested on 27.2.1), iOS refuses connections to its own services (RemotePairing, lockdownd)
+  when the VPN's tunnel runs over the mobile network, the same way it treats a listener that refuses
+  cellular. What works without Wi-Fi: turn on **Airplane Mode** (Wi-Fi stays off), connect LocalDevVPN,
+  enable JIT, then turn Airplane Mode off again: JIT stays on until Apple VM is closed. Joining any Wi-Fi
+  (a hotspot works) also works. (Turning only Cellular Data off has not been tested.) Apple VM still
+  retries an unreachable device twice on cellular, which helped on earlier iOS versions.
 - **"This device closed the connection"**: the device no longer accepts the pairing (it was
   replaced by a newer pairing, or reset). Pair again.
 - **"needs Local Network access"**: Settings › Apps › Apple VM › Local Network.
