@@ -2493,6 +2493,28 @@ static void winios_after(double seconds, dispatch_block_t block) {
     hv_winvm_send_ctrl_alt_del();
 }
 
+- (nullable NSString *)captureScreenNow {
+    if (!_vmRunning) return nil;
+    NSString *docs = [self documentsPath];
+    NSDateFormatter *f = [NSDateFormatter new];
+    f.locale = [NSLocale localeWithLocaleIdentifier:@"en_US_POSIX"];
+    f.dateFormat = @"yyyyMMdd-HHmmss";
+    NSString *name = [NSString stringWithFormat:@"screen-%@.png", [f stringFromDate:[NSDate date]]];
+    NSString *path = [docs stringByAppendingPathComponent:name];
+    if (hv_winvm_save_png(path.fileSystemRepresentation) != 0) {
+        fprintf(stderr, "winvm: screen capture: failed\n");
+        return nil;
+    }
+    NSString *latest = [docs stringByAppendingPathComponent:@"latest_screen.png"];
+    [[NSFileManager defaultManager] removeItemAtPath:latest error:nil];
+    [[NSFileManager defaultManager] copyItemAtPath:path toPath:latest error:nil];
+    WinIOSGraphicsMode g = [self graphicsMode];
+    fprintf(stderr, "winvm: screen capture: %s (%ux%u, display driver %s): the raw scanout, compare with an iPhone screenshot "
+            "taken at the same moment\n", name.UTF8String, [self framebufferWidth], [self framebufferHeight],
+            g.negotiated3D ? "3D" : g.driverOK ? "2D" : "firmware or basic");
+    return name;
+}
+
 - (void)pressPowerButton {
     if (!_vmRunning) return;
     hv_winvm_power_button();

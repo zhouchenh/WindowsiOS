@@ -682,6 +682,7 @@ private struct SettingsSheet: View {
     @Environment(\.horizontalSizeClass) private var horizontalSizeClass
     @State private var page: SettingsPage? = nil
     @State private var columns: NavigationSplitViewVisibility = .all
+    @State private var captureNote: String? = nil // the status page's raw screen capture
 
     var body: some View {
         NavigationSplitView(columnVisibility: $columns) {
@@ -937,6 +938,23 @@ private struct SettingsSheet: View {
             }
 
             DisplayStatusSection() // what the display does and costs: DisplaySettings.swift
+
+            // For display bugs (missing text, stale rectangles): the machine's own picture, to compare with an
+            // iPhone screenshot of the same moment. A bad capture points at Windows' 3D, a good one at the app.
+            Section {
+                Button(L("立即截取原始画面", "Capture the screen now (raw)"), systemImage: "camera.viewfinder") {
+                    captureNote = WinIOSBridge.shared.captureScreenNow().map {
+                        L("已保存 \($0)（也在 latest_screen.png），并记在 winvm.log 里。", "Saved \($0) (also latest_screen.png) and marked in winvm.log.")
+                    } ?? L("没能截取：虚拟机没在运行？", "Nothing captured: is the machine running?")
+                }
+                .disabled(!vm.isVMRunning)
+                if let captureNote { Text(captureNote).font(.footnote).foregroundStyle(.secondary) }
+            } header: {
+                Text(L("画面诊断", "Screen diagnosis"))
+            } footer: {
+                Text(L("画面出问题时（文字不见、残影）：先用 iPhone 截屏，再点这里，再截一次屏。原始画面也坏，说明是 Windows 的 3D；原始画面正常，说明是 App 显示的问题。文件在“文件”App 的 Apple VM 文件夹里，分享日志时一起带上。",
+                       "When the picture is wrong (missing text, stale rectangles): take an iPhone screenshot, tap this, then take another screenshot. A bad raw capture points at Windows' 3D; a good one at how the app shows it. The files are in the Files app's Apple VM folder and go with the shared logs."))
+            }
 
             // What iOS reported for the chrome, to check the layout on a device (also in winvm.log, "chrome:").
             Section {

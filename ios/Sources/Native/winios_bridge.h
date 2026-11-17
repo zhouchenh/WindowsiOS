@@ -153,6 +153,10 @@ extern NSNotificationName const WinIOSDisplayWillReshapeNotification;
 - (void)sendAltTab;
 - (void)sendEscape;
 - (void)pressPowerButton;
+/// Debug: Windows' screen as the machine has it (the scanout, not what iOS shows), saved now as
+/// Documents/latest_screen.png and a timestamped Documents/screen-<time>.png, with a marker line in winvm.log.
+/// Returns the timestamped file name, or nil when nothing could be captured.
+- (nullable NSString *)captureScreenNow;
 - (void)flushDisks;
 - (void)stopVM;
 /* Refresh rate of the machine's screen (global, any time). */
