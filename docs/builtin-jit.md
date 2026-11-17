@@ -258,9 +258,10 @@ includes it, or `::/0`) and accept the IPv4 source the reflected packets arrive 
 - **On cellular only**, enabling JIT fails, with LocalDevVPN and with your own VPN alike: on an iPhone
   with iOS 27 (tested on 27.2.1), iOS refuses connections to its own services (RemotePairing, lockdownd)
   when the VPN's tunnel runs over the mobile network, the same way it treats a listener that refuses
-  cellular. What works without Wi-Fi: turn on **Airplane Mode** (Wi-Fi stays off), connect LocalDevVPN,
-  enable JIT, then turn Airplane Mode off again: JIT stays on until Apple VM is closed. Joining any Wi-Fi
-  (a hotspot works) also works. (Turning only Cellular Data off has not been tested.) Apple VM still
+  cellular. Wi-Fi itself is fine: join any Wi-Fi (a hotspot works). With no Wi-Fi around, turn on
+  **Airplane Mode** so nothing goes over cellular (Wi-Fi may be on in Airplane Mode), connect LocalDevVPN,
+  enable JIT, then turn Airplane Mode off again: JIT stays on until Apple VM is closed. (Turning only
+  Cellular Data off has not been tested.) Apple VM still
   retries an unreachable device twice on cellular, which helped on earlier iOS versions.
 - **"This device closed the connection"**: the device no longer accepts the pairing (it was
   replaced by a newer pairing, or reset). Pair again.

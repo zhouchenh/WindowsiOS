@@ -596,8 +596,8 @@ enum JITConnectionProblem: Equatable {
             return L("连不上本机。请连接 LocalDevVPN，然后重试。",
                      "Apple VM couldn't reach this device. Connect LocalDevVPN, then try again.")
         }
-        return L("只用蜂窝网络时，iOS 27 会拒绝这个连接。请打开飞行模式（Wi-Fi 保持关闭），连接 LocalDevVPN，再开启 JIT；开启后可以关掉飞行模式，JIT 会一直保持到 App 关闭。连上任意 Wi-Fi（个人热点也行）也可以。关掉 Tailscale 等其他 VPN。",
-                 "On cellular only, iOS 27 refuses this connection. Turn on Airplane Mode (leave Wi-Fi off), connect LocalDevVPN, then enable JIT; afterwards turn Airplane Mode off again: JIT stays on until the app is closed. Joining any Wi-Fi (a hotspot works) also works. Turn off other VPNs such as Tailscale.")
+        return L("只用蜂窝网络时，iOS 27 会拒绝这个连接（Wi-Fi 没有问题）。请连上任意 Wi-Fi（个人热点也行）；附近没有 Wi-Fi 时，打开飞行模式让连接不走蜂窝（飞行模式下也可以开 Wi-Fi），连接 LocalDevVPN，再开启 JIT；开启后可以关掉飞行模式，JIT 会一直保持到 App 关闭。关掉 Tailscale 等其他 VPN。",
+                 "On cellular only, iOS 27 refuses this connection (Wi-Fi is fine). Join any Wi-Fi (a hotspot works). With no Wi-Fi around, turn on Airplane Mode so nothing goes over cellular (Wi-Fi may be on in it), connect LocalDevVPN, then enable JIT; afterwards turn Airplane Mode off again: JIT stays on until the app is closed. Turn off other VPNs such as Tailscale.")
     }
 }
 
