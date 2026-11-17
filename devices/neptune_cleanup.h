@@ -16,8 +16,11 @@ void hv_npt_cleanup_submit(void);
 void hv_npt_cleanup_poll(void);
 void hv_npt_cleanup_describe(char *buffer, size_t length);
 
-/* Pause between backend calls when iOS disallows GPU work. An already entered
- * backend call cannot be cancelled. Independent workers serve registration
+/* Pause new GPU submissions, final device destruction and leftover COM
+ * Releases when iOS disallows GPU work. Passive device snapshot/event/status
+ * reads continue on monotonic retry deadlines and report sampled paused-ready
+ * jobs without parking the device lane. An already entered backend call cannot
+ * be cancelled. Independent workers serve registration
  * batches and device retirement, so a blocked leftover Release cannot delay
  * normal device retirement. The batch FIFO holds at most eight batches; its
  * five-second watchdog counts allowed time after dequeue. Device counter
@@ -46,7 +49,8 @@ struct HvNptDeviceOps {
     /* Submit an EMPTY buffer on that exact initializer queue. The returned
      * ticket owns a native reference. Status: 1=successfully completed,
      * 0=pending, -1=failed (never evidence that earlier work retired).
-     * Calls run outside the lifetime lock, only while GPU work is allowed. */
+     * Calls run outside the lifetime lock. Only begin/commit require foreground
+     * permission; status and ticket release are passive and may run away. */
     void *(*barrier_begin)(void *queue);
     int (*barrier_status)(void *ticket);
     void (*barrier_release)(void *ticket);

@@ -57,6 +57,7 @@ struct FakeDevice {
     _Atomic unsigned destroy_entered, block_destroy, fail_destroy, transient_refs;
     _Atomic unsigned barrier_entered, barrier_polls, barrier_released, barrier_status;
     _Atomic unsigned barrier_nil, block_barrier, block_barrier_poll, barrier_poll_entered, pause_on_barrier_success;
+    _Atomic unsigned barrier_release_entered, block_barrier_release;
     FakeDevice *hidden;
 };
 _Static_assert(offsetof(FakeDevice, pub) == 8, "fake public counter");
@@ -128,7 +129,6 @@ static void *fake_barrier_begin(void *p) {
 }
 static int fake_barrier_status(void *p) {
     FakeDevice *d = p;
-    assert(hv_npt_cleanup_gpu_allowed());
     atomic_fetch_add(&d->barrier_poll_entered, 1);
     while (atomic_load(&d->block_barrier_poll)) pause_ms();
     atomic_fetch_add(&d->barrier_polls, 1);
@@ -137,7 +137,10 @@ static int fake_barrier_status(void *p) {
     return status == 1 ? 1 : status == 2 ? -1 : 0;
 }
 static void fake_barrier_release(void *p) {
-    atomic_fetch_add(&((FakeDevice *)p)->barrier_released, 1);
+    FakeDevice *d = p;
+    atomic_fetch_add(&d->barrier_release_entered, 1);
+    while (atomic_load(&d->block_barrier_release)) pause_ms();
+    atomic_fetch_add(&d->barrier_released, 1);
 }
 static const struct HvNptDeviceOps ops = {
     .query_interface=fake_qi, .snapshot=fake_snapshot, .event_value=fake_event,
@@ -265,8 +268,9 @@ static void resurrection_during_getter(void) {
 }
 static void many_zero_epochs(void) {
     setup(); hv_npt_cleanup_set_active(0); FakeDevice *d = device();
+    enter(); /* Keep the five transitions ahead of the background device lane. */
     for (unsigned i = 0; i < 5; i++) { assert(hv_npt_device_release(d) == 0); if (i < 4) assert(hv_npt_device_addref(d) == 1); }
-    assert(count_load(&d->pub) == 0 && count_load(&d->priv) == 5);
+    assert(count_load(&d->pub) == 0 && count_load(&d->priv) == 5); leave();
     hv_npt_cleanup_set_active(1); await_value(&d->destroyed, 1); await_idle();
     assert(atomic_load(&d->destroyed) == 1);
 }
@@ -343,7 +347,7 @@ static void queue_limits(void) {
     for (unsigned i = 0; i <= NPT_BATCH_LIMIT; i++) { o[i] = object(1, NULL); submit(o[i], 1); }
     FakeDevice *d[81];
     for (unsigned i = 0; i < 81; i++) { d[i] = device(); hv_npt_device_release(d[i]); }
-    enter(); assert(waiting_batches == NPT_BATCH_LIMIT && waiting_devices == 81);
+    enter(); assert(waiting_batches == NPT_BATCH_LIMIT && (waiting_devices + (device_current && device_current->pin ? 1u : 0u)) == 81);
     assert(quarantined_batches == 1 && quarantined_pins == 0); leave();
     hv_npt_cleanup_set_active(1); await_idle();
     assert(!atomic_load(&o[0]->releases) && atomic_load(&d[0]->destroyed));
@@ -364,7 +368,7 @@ static void retry_does_not_evict_devices(void) {
         if (requeued) break;
         pause_ms();
     }
-    enter(); assert(!device_current && waiting_devices == 81 && !quarantined_pins); leave();
+    enter(); assert((waiting_devices + (device_current && device_current->pin ? 1u : 0u)) == 81 && !quarantined_pins); leave();
     atomic_store(&pending->init_done, 1); hv_npt_cleanup_set_active(1); await_idle();
     assert(atomic_load(&pending->destroyed) && atomic_load(&first->destroyed));
 }
@@ -538,8 +542,166 @@ static void slow_getter_return_recovers_unwired_gate(void) {
     enter(); assert(!quarantined_pins && slow_calls == 1); leave();
 }
 
+static Job *queued_device_locked(FakeDevice *d) {
+    for (Job *j = device_waiting; j; j = j->next) if (j->device == d) return j;
+    return NULL;
+}
+static void hold_device_backoff(FakeDevice *d) {
+    for (unsigned i = 0; i < 3000; i++) {
+        enter(); Job *j = queued_device_locked(d);
+        if (j) { j->next_poll = NPT_NOW_NS() + UINT64_C(10000000000); leave(); return; }
+        leave(); pause_ms();
+    }
+    assert(!"device did not queue for controlled ordering");
+}
+static void await_private(FakeDevice *d, uint32_t expected) {
+    for (unsigned i = 0; i < 3000; i++) {
+        if (count_load(&d->priv) == expected) return;
+        pause_ms();
+    }
+    assert(!"private epoch pin not consumed");
+}
+static void await_paused_ready(FakeDevice *d) {
+    for (unsigned i = 0; i < 3000; i++) {
+        enter(); Job *j = queued_device_locked(d);
+        if (!j && device_current && device_current->device == d) j = device_current;
+        int ready = j && j->paused_ready;
+        leave(); if (ready) return; pause_ms();
+    }
+    assert(!"ready device did not wait for foreground");
+}
+static void await_goal(FakeDevice *d, uint64_t goal) {
+    for (unsigned i = 0; i < 3000; i++) {
+        enter(); Job *j = queued_device_locked(d);
+        int found = j && j->snapshot.initializer_goal == goal && !j->barrier_completed;
+        leave(); if (found) return; pause_ms();
+    }
+    assert(!"new initializer goal not sampled");
+}
+static void newer_epoch_runs_first(FakeDevice *d, uint64_t goal) {
+    hold_device_backoff(d);
+    void *alias; assert(!hv_npt_device_query_interface(d, NULL, &alias));
+    atomic_store(&d->init_goal, goal);
+    hv_npt_device_release(d);
+    await_private(d, 1);
+    enter(); Job *old = queued_device_locked(d);
+    assert(old && old->id == 1 && next_id == 2);
+    leave(); /* Epoch 2 consumed its pin while epoch 1 was in backoff. */
+}
+static void pending_barrier_does_not_cover_new_goal(void) {
+    setup(); FakeDevice *d = stalled_device();
+    advance(UINT64_C(6000000000)); await_value(&d->barrier_polls, 1);
+    newer_epoch_runs_first(d, 7);
+    atomic_store(&d->barrier_status, 1); advance(UINT64_C(11000000000));
+    await_value(&d->barrier_released, 1); await_goal(d, 7);
+    assert(!atomic_load(&d->destroyed) && atomic_load(&d->barrier_entered) == 1);
+    advance(UINT64_C(6000000000)); await_value(&d->destroyed, 1); await_idle();
+    assert(atomic_load(&d->init_done) == 4 && atomic_load(&d->barrier_entered) == 2);
+    assert(atomic_load(&d->barrier_released) == 2);
+}
+static void completed_barrier_does_not_cover_new_goal(void) {
+    setup(); FakeDevice *d = stalled_device();
+    atomic_store(&d->barrier_status, 1); atomic_store(&d->pause_on_barrier_success, 1);
+    advance(UINT64_C(6000000000)); await_paused_ready(d);
+    newer_epoch_runs_first(d, 7);
+    advance(UINT64_C(11000000000)); await_goal(d, 7);
+    enter(); Job *old = queued_device_locked(d);
+    assert(old && !old->paused_ready && !old->barrier_completed && !old->barrier_goal);
+    leave();
+    assert(!atomic_load(&d->destroyed) && atomic_load(&d->barrier_entered) == 1);
+    hv_npt_cleanup_set_active(1); advance(UINT64_C(6000000000));
+    await_value(&d->destroyed, 1); await_idle();
+    assert(atomic_load(&d->barrier_entered) == 2);
+}
+static void barrier_covers_unchanged_goal_after_resurrection(void) {
+    setup(); FakeDevice *d = stalled_device();
+    advance(UINT64_C(6000000000)); await_value(&d->barrier_polls, 1);
+    newer_epoch_runs_first(d, 5);
+    atomic_store(&d->barrier_status, 1); advance(UINT64_C(11000000000));
+    await_value(&d->destroyed, 1); await_idle();
+    assert(atomic_load(&d->barrier_entered) == 1 && atomic_load(&d->barrier_released) == 1);
+}
+static FakeDevice *pending_ticket(void) {
+    FakeDevice *d = stalled_device();
+    advance(UINT64_C(6000000000)); await_value(&d->barrier_polls, 1);
+    return d;
+}
+static void quarantine_ticket(unsigned failure) {
+    setup(); FakeDevice *d = pending_ticket();
+    if (failure == 0) atomic_store(&d->fail_event, 1);
+    else if (failure == 1) atomic_store(&d->fail_snapshot, 1);
+    else { enter(); __atomic_store_n(&d->pub, 1, __ATOMIC_SEQ_CST); leave(); }
+    advance(NPT_RETRY_MAX_NS); await_idle();
+    assert(!atomic_load(&d->destroyed) && count_load(&d->priv) == 1);
+    assert(atomic_load(&d->barrier_released) == 1);
+    enter(); assert(quarantined_pins == 1 && quarantine && !quarantine->barrier); leave();
+    for (unsigned i = 0; i < 10; i++) hv_npt_cleanup_poll();
+    assert(atomic_load(&d->barrier_released) == 1);
+}
+static void quarantine_ticket_event_error(void) { quarantine_ticket(0); }
+static void quarantine_ticket_invalid_snapshot(void) { quarantine_ticket(1); }
+static void quarantine_ticket_invalid_counts(void) { quarantine_ticket(2); }
+static void blocked_quarantine_release_transfers_ownership(void) {
+    setup(); FakeDevice *d = pending_ticket();
+    atomic_store(&d->block_barrier_release, 1); atomic_store(&d->fail_snapshot, 1);
+    advance(NPT_RETRY_MAX_NS); await_value(&d->barrier_release_entered, 1);
+    /* Main thread takes the mutex while worker is blocked in native release. */
+    enter();
+    assert(device_current && !device_current->barrier && device_current->pin == 1);
+    assert(!quarantined_pins);
+    leave();
+    char text[1024]; hv_npt_cleanup_describe(text, sizeof(text));
+    assert(strstr(text, "release initializer barrier"));
+    advance(UINT64_C(6000000000));
+    for (unsigned i = 0; i < 10; i++) hv_npt_cleanup_poll();
+    assert(atomic_load(&d->barrier_release_entered) == 1 && !atomic_load(&d->barrier_released));
+    atomic_store(&d->block_barrier_release, 0); await_idle();
+    enter(); assert(quarantined_pins == 1 && !quarantine->barrier); leave();
+    assert(atomic_load(&d->barrier_released) == 1 && !atomic_load(&d->destroyed));
+}
+static void background_polling_does_not_park_lane(void) {
+    setup(); hv_npt_cleanup_set_active(0);
+    FakeDevice *a = device(), *b = device();
+    atomic_store(&a->init_goal, 1); atomic_store(&a->init_done, 1);
+    atomic_store(&b->init_goal, 2); atomic_store(&b->init_done, 1);
+    FakeObject *batch = object(1, NULL); submit(batch, 1);
+    hv_npt_device_release(a); hv_npt_device_release(b);
+    await_paused_ready(a); await_value(&b->event_entered, 1);
+    enter(); uint64_t active_before = active_clock(); leave();
+    atomic_store(&b->init_done, 2); advance(NPT_RETRY_MAX_NS);
+    await_paused_ready(b); hold_device_backoff(a); hold_device_backoff(b);
+    enter();
+    assert(active_clock() == active_before);
+    char text[1024]; hv_npt_cleanup_describe(text, sizeof(text));
+    assert(strstr(text, "paused_ready=2"));
+    leave();
+    assert(!atomic_load(&a->destroyed) && !atomic_load(&b->destroyed));
+    assert(!atomic_load(&a->barrier_entered) && !atomic_load(&b->barrier_entered));
+    assert(!atomic_load(&batch->releases));
+    hv_npt_cleanup_set_active(1); advance(UINT64_C(11000000000));
+    await_value(&a->destroyed, 1); await_value(&b->destroyed, 1); await_value(&batch->releases, 1); await_idle();
+}
+static void background_polls_existing_barrier_only(void) {
+    setup(); FakeDevice *d = pending_ticket();
+    hv_npt_cleanup_set_active(0); atomic_store(&d->barrier_status, 1);
+    advance(NPT_RETRY_MAX_NS); await_paused_ready(d);
+    assert(atomic_load(&d->barrier_released) == 1 && atomic_load(&d->barrier_entered) == 1);
+    assert(!atomic_load(&d->destroyed));
+    hv_npt_cleanup_set_active(1); advance(NPT_RETRY_MAX_NS);
+    await_value(&d->destroyed, 1); await_idle();
+}
+
 int main(void) {
     struct { const char *name; void (*run)(void); } cases[] = {
+        {"old pending barrier does not cover newer goal", pending_barrier_does_not_cover_new_goal},
+        {"old completed barrier does not cover newer goal", completed_barrier_does_not_cover_new_goal},
+        {"old barrier still covers unchanged goal", barrier_covers_unchanged_goal_after_resurrection},
+        {"quarantine releases ticket after event error", quarantine_ticket_event_error},
+        {"quarantine releases ticket after invalid snapshot", quarantine_ticket_invalid_snapshot},
+        {"quarantine releases ticket after invalid counts", quarantine_ticket_invalid_counts},
+        {"blocked quarantine release transfers ticket once", blocked_quarantine_release_transfers_ownership},
+        {"background polling continues past ready devices", background_polling_does_not_park_lane},
+        {"background polls existing barrier without submitting", background_polls_existing_barrier_only},
         {"stale initializer event recovers after an hour", stale_event_recovers_after_hour},
         {"own errored barrier retries without deleting", failed_barrier_retries},
         {"nil barrier retries with bounded polling", nil_barrier_backoff},

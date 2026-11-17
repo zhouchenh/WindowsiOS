@@ -150,7 +150,7 @@ and result classification in a fake COM model on the host. Neither target is in
 `guest-tools` or `START.bat`.
 
 After the lead relays the user's explicit approval for this diagnostic, copy the
-executable beside `winkit/shared_init_probe.ps1` in the guest and run that launcher
+executable beside `tools/shared_init_probe.ps1` in the guest and run that launcher
 in Windows PowerShell. Keep the phone app in front and avoid concurrent GPU tests.
 The launcher writes a new local temporary text report, then prints it. No adapter,
 registry, service, display topology, or network settings are changed. The probe

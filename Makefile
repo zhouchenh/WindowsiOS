@@ -225,7 +225,8 @@ winkit-img: $(GB)/WinIOSBrowser.exe
 .PHONY: winkit-img
 
 # Manual shared-initialization diagnostic; deliberately not part of guest-tools,
-# winkit-img or START.bat. Copy this executable beside shared_init_probe.ps1.
+# winkit-img or START.bat. Manually copy this executable and tools/shared_init_probe.ps1
+# to the same guest folder when running the approved diagnostic.
 SHARED_PROBE_KERNEL32 = GetStdHandle WriteFile CreateThread CloseHandle GetTickCount64 Sleep ExitProcess
 $(GB)/shared_probe_kernel32.lib: Makefile | $(GB)
 	{ echo 'LIBRARY kernel32.dll'; echo 'EXPORTS'; for f in $(SHARED_PROBE_KERNEL32); do echo "$$f"; done; } > $(GB)/shared_probe_kernel32.def
