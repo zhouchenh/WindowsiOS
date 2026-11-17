@@ -20,6 +20,7 @@
 #include "net_slirp.h"
 #include "share.h"
 #include "virtio_gpu3d.h"
+#include "dxmt_shared_init.h"
 
 static HvMachine m;
 static HvCpu cpus[HV_MAX_CPUS];
@@ -164,6 +165,7 @@ void hv_winvm_gpu_mode(int *capable, int *offered3d, int *negotiated3d, int *dri
 }
 
 void hv_winvm_gpu_set_background(int on) {
+    hv_dxmt_shared_init_set_draining(on);
     hv_virtio_gpu_set_background(board.gpu, on);
 }
 
@@ -179,6 +181,7 @@ uint64_t hv_winvm_display_serial(int *is_texture) {
 }
 
 void hv_winvm_display_set_paused(int paused) {
+    hv_dxmt_shared_init_set_gpu_allowed(!paused);
     HvFbDisplay *fb = atomic_load_explicit(&display_fb, memory_order_acquire);
     hv_fb_metal_set_paused(fb, paused);
 }

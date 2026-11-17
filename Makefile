@@ -14,7 +14,7 @@ ENGINE = $(CORE) $(HOST)
 DEV = $(B)/acpi.o $(B)/acpi_battery.o $(B)/fb_display.o $(B)/fb_metal.o $(B)/fdt.o $(B)/fw_cfg.o $(B)/gicv3.o $(B)/hda.o \
       $(B)/nvme.o $(B)/pcie.o $(B)/pflash.o $(B)/pl011.o $(B)/pl031.o $(B)/pl061.o $(B)/timer.o \
       $(B)/virtio.o $(B)/virtio_blk.o $(B)/virtio_input.o $(B)/virtio_net.o $(B)/virtio_snd.o $(B)/virtio_gpu.o $(B)/virtio_gpu3d.o \
-      $(B)/usb_touch.o $(B)/winvirt.o $(B)/xhci.o $(B)/neptune_hook.o $(B)/neptune_cleanup.o $(B)/neptune_device.o
+      $(B)/usb_touch.o $(B)/winvirt.o $(B)/xhci.o $(B)/neptune_hook.o $(B)/neptune_cleanup.o $(B)/neptune_device.o $(B)/dxmt_shared_init.o
 
 VM_HOST = $(B)/winvm.o $(B)/net_slirp.o $(B)/dns_proxy.o $(B)/share.o $(B)/audio_mac.o $(B)/hvsparse.o
 
@@ -132,6 +132,8 @@ $(B)/test_fb_capture: tests/test_fb_capture.m devices/fb_metal.m devices/fb_disp
 		-framework QuartzCore -framework CoreGraphics -framework ImageIO -o $@
 test-fb-capture: $(B)/test_fb_capture
 	ASAN_OPTIONS=detect_leaks=0 $(B)/test_fb_capture
+test-dxmt-shared-init:
+	python3 tests/test_dxmt_shared_init.py
 
 $(B)/hvsparse: tools/hvsparse_main.c host/hvsparse.c host/hvsparse.h | $(B)
 	$(CC) $(CFLAGS) tools/hvsparse_main.c host/hvsparse.c -o $@
@@ -180,7 +182,7 @@ ios-lib: $(IB)/libwinvm.a
 clean:
 	rm -rf $(B)
 
-.PHONY: all test-core test-dns test-net test-neptune test-fb-capture ios-lib clean
+.PHONY: all test-core test-dns test-net test-neptune test-fb-capture test-dxmt-shared-init ios-lib clean
 
 # ---- Windows guest tools: build/guest/WinIOSBrowser.exe (the OAuth bridge, see docs/oauth-bridge.md) ----
 # Freestanding AArch64 Win32: no CRT, only kernel32/ws2_32 imports. Needs Homebrew llvm and lld.

@@ -31,6 +31,7 @@
 #include "neptune_hook.h"
 #include "neptune_cleanup.h"
 #include "neptune_device.h"
+#include "dxmt_shared_init.h"
 
 /* ---- protocol ---- */
 #define F_VIRGL (1ull << 0)
@@ -364,6 +365,8 @@ static double teardown_time_ms(void) {
     return (double)ts.tv_sec * 1000.0 + (double)ts.tv_nsec / 1000000.0;
 }
 
+static int shared_init_install_fatal;
+static _Atomic int shared_init_installed;
 static void *open_fw(const char *dir, const char *rel, int global) {
     char p[PATH_MAX];
     snprintf(p, sizeof p, "%s/%s", dir, rel);
@@ -375,6 +378,10 @@ static void *open_fw(const char *dir, const char *rel, int global) {
 static int load_libs(HvVgpu3d *s) {
     if (cleanup_install_fatal) {
         snprintf(s->why, sizeof s->why, "Neptune cleanup installation failed; restart required");
+        return -1;
+    }
+    if (shared_init_install_fatal) {
+        snprintf(s->why, sizeof s->why, "DXMT shared-init rollback failed; restart required");
         return -1;
     }
     const char *dir = getenv("HV_GPU3D_FRAMEWORKS");
@@ -524,6 +531,14 @@ static int load_libs(HvVgpu3d *s) {
         }
     }
     WARN("Neptune cleanup: %s\n", cleanup_status());
+    int shared_installed = hv_dxmt_install_shared_init(dxmt_symbol);
+    WARN("DXMT shared initialization: %s\n", hv_dxmt_shared_init_status());
+    if (shared_installed < 0) {
+        shared_init_install_fatal = 1;
+        snprintf(s->why, sizeof s->why, "DXMT shared-init rollback failed; device creation refused");
+        return -1;
+    }
+    if (shared_installed) atomic_store(&shared_init_installed, 1);
     LOG("shm_open rebound in virglrenderer: %d slots (files in %s)\n", rb, shm_dir);
     return 0;
 }
@@ -1680,10 +1695,12 @@ int hv_vgpu3d_describe(HvVgpu3d *s, char *buf, unsigned len) {
     pthread_mutex_unlock(&s->mu);
     char cleanup[512];
     hv_npt_cleanup_describe(cleanup, sizeof cleanup);
+    char shared[384] = "shared-init=off";
+    if (atomic_load(&shared_init_installed)) hv_dxmt_shared_init_describe(shared, sizeof shared);
     return snprintf(buf, len,
                     "on cleanup=%s capsets=%u ctxs=%llu cmds=%llu submits=%llu (%lluKB) blobs=%llu maps=%llu fences=%llu "
                     "(ring %llu global %llu) errors=%llu submit_errors=%llu live_ctxs=%u (neptune %u, peak %u) scanout=%u %ux%u%s "
-                    "resets=%llu (skipped %llu) hostmem@%#llx drain=%s trips=%llu drained=%llu (ring %llu global %llu, this trip %llu, oldest %llums) %s",
+                    "resets=%llu (skipped %llu) hostmem@%#llx drain=%s trips=%llu drained=%llu (ring %llu global %llu, this trip %llu, oldest %llums) %s %s",
                     cleanup_status(), s->ncapsets, (unsigned long long)s->ctxs, (unsigned long long)s->cmds,
                     (unsigned long long)s->submits, (unsigned long long)(s->submit_bytes >> 10),
                     (unsigned long long)s->blobs, (unsigned long long)s->maps, (unsigned long long)s->fences,
@@ -1696,7 +1713,7 @@ int hv_vgpu3d_describe(HvVgpu3d *s, char *buf, unsigned len) {
                     drain_on ? "on" : "off", (unsigned long long)s->drain_trips,
                     (unsigned long long)(s->drained_ring + s->drained_global), (unsigned long long)s->drained_ring,
                     (unsigned long long)s->drained_global, (unsigned long long)s->drained_trip,
-                    (unsigned long long)(s->drain_max_age_ns / 1000000ull), cleanup);
+                    (unsigned long long)(s->drain_max_age_ns / 1000000ull), cleanup, shared);
 }
 
 void hv_vgpu3d_set_cleanup_active(int active) {

@@ -85,12 +85,46 @@ presenter. No new RDP connection or display-topology change is needed here.
 
 ## Candidate validation
 
-The shared-initialization candidate must remain opt-in until the paired capture
-and device probe establish its effect. A useful ordering probe creates a shared
+The candidate is **off by default**. Set `HV_DXMT_SHARED_INIT=1` in `env.txt` and
+restart the app to enable it for a lead-coordinated comparison. Remove the line
+and restart for the baseline. UUID, instruction and original vtable-slot guards
+restrict it to the inspected DXMT. It changes two data slots before device
+creation, leaving the existing `patch_dxmt.py` upload guards untouched. An
+incomplete rollback refuses backend creation for the rest of the process.
+
+Successful shared DEFAULT/IMMUTABLE Texture2D creation completes the initializer
+before returning the resource. The caller cannot observe the result pointer
+during that wait. Event polling has a two-second deadline **after** the native
+initializer flush returns. Original creation and that flush may themselves
+block in Metal, so this is not an end-to-end timeout. Logs and 3D status expose
+active flush/poll counts and the elapsed continuous flush-busy interval; that
+interval is not the age of the oldest concurrent call.
+
+GPU-disallowed or background-drain states bypass the extra flush/wait and retain
+the original creation result. A lifecycle transition while polling also bypasses
+the mitigation. Such results are logged as skipped, not synchronized. A genuine
+foreground timeout/error retains the unpublished texture and a device reference,
+returns failure, and latches failure for later affected foreground creations.
+This prevents repeated retry allocations from growing the quarantine indefinitely;
+already-entered concurrent creations may each retain one result.
+
+This branch feeds the independent permission and drain gates from
+`hv_winvm_display_set_paused` and `hv_winvm_gpu_set_background`. When integrating
+with the Neptune cleanup branch, add
+`hv_dxmt_shared_init_set_gpu_allowed(allowed)` inside
+`hv_winvm_set_gpu_allowed(allowed)`, alongside the cleanup gate. The bridge then
+supplies permission on DidEnterBackground/DidBecomeActive. A plain background
+trip that pauses the whole VM cannot create more guest textures.
+
+Keep the candidate opt-in until paired capture and a device probe establish its
+effect. A useful ordering probe creates a shared
 texture on A, writes and reads it on B, then submits unrelated work on A and
 reads the shared texture again. The second read must preserve B's pixels. Run
 both zero-initialized and supplied-data creation cases, and include A8 and BGRA
-textures. A normal upload round-trip alone cannot expose this export race.
+textures. Include an explicit producer Flush before export and a control that
+forces real producer GPU completion: an empty immediate-context Flush currently
+need not submit pending initializer work. A normal upload round-trip alone cannot
+expose this export race.
 
 Host tests and source inspection do not substitute for those phone results.
 Keep the no-op/default behavior as the comparison and record whether missing
@@ -101,3 +135,6 @@ Run `make test-fb-capture` for strict GPU failure cases, CPU capture, cropped
 RGBA conversion, and the conditional late-producer cache test. When Metal is
 available, it also checks every pixel of a two-by-two private-texture readback.
 The tests use ASan/UBSan and do not run the Windows VM.
+Run `make test-dxmt-shared-init` for the candidate's guard, lifecycle, publication,
+timeout and rollback tests. Those use synthetic backend operations; a pass does
+not establish the two-device race or its correction on the phone.
