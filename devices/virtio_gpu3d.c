@@ -345,6 +345,9 @@ static int rebind_shm(void *any_symbol_in_image) {
 
 /* ---- loading ---- */
 static const char *cleanup_disabled;
+/* A failed rollback poisons this process even if a later attempt changes the
+   environment to disable cleanup. No backend may see a partially hooked ABI. */
+static int cleanup_install_fatal;
 
 static const char *cleanup_status(void) {
     return cleanup_disabled ? cleanup_disabled : hv_npt_hook_status();
@@ -365,6 +368,10 @@ static void *open_fw(const char *dir, const char *rel, int global) {
 }
 
 static int load_libs(HvVgpu3d *s) {
+    if (cleanup_install_fatal) {
+        snprintf(s->why, sizeof s->why, "DXMT lifetime hook rollback failed; restart required");
+        return -1;
+    }
     const char *dir = getenv("HV_GPU3D_FRAMEWORKS");
     if (!dir || !*dir) {
         snprintf(s->why, sizeof s->why, "HV_GPU3D_FRAMEWORKS not set");
@@ -475,6 +482,7 @@ static int load_libs(HvVgpu3d *s) {
         int installed = hv_npt_install_device_hooks(dxmt_symbol);
         WARN("DXMT device lifetime: %s\n", hv_npt_device_hook_status());
         if (installed < 0) {
+            cleanup_install_fatal = 1;
             snprintf(s->why, sizeof s->why, "DXMT lifetime hook rollback failed; device creation refused");
             return -1;
         }
