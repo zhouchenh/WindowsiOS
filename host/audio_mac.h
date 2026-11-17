@@ -19,6 +19,10 @@ int hv_audio_keepalive(void);
 /* Starts the output again when it should run (keep-alive, or Windows playing): after an interruption ended or the
  * app came back to the front (recreate 0), or after a media services reset (recreate 1: made again). */
 int hv_audio_restart_output(int recreate);
+/* The machine is paused (the app in the background without server mode, or the guard): the output unit stops even
+ * while Windows has a stream open (its CPUs are parked before it could stop it), so iOS can suspend the app.
+ * Unpaused, it starts again if Windows plays or the keep-alive is on. */
+void hv_audio_set_machine_paused(int paused);
 int hv_audio_output_running(void);
 /* While paused, the microphone is not opened (iOS shows its indicator while it is): Windows' capture stream hears
  * nothing. Unpaused, a stream Windows has open starts again. */

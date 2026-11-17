@@ -2,7 +2,7 @@
 # WinKit: the app switches Windows between host 3D and plain 2D graphics without restarting Windows (the app's
 # Settings > Network > Graphics, or More > Graphics; server mode uses it to keep Windows running in the background).
 # The app offers the display device 3D or 2D from its next driver start and writes http://10.0.2.4/gpu_mode.txt
-# ("seq=<n>" and "mode=3d" or "mode=2d"). A task here (WinKit Graphics, as SYSTEM) sees each new request and
+# ("seq=<n>" and "mode=3d" or "mode=2d"; seq=0, written when the machine starts, is no request). A task here (WinKit Graphics, as SYSTEM) sees each new request and
 # restarts only the display adapter (pnputil /restart-device), which then starts in the mode offered, and reports
 # to the app (gpu_mode_applied.txt). Run by winkit.ps1 (START.bat); can be run on its own, elevated (also over SSH
 # as an administrator). Safe to run again. Windows PowerShell 5.1.
@@ -34,9 +34,28 @@ function Report($wc, $seq, $mode, $result, $detail) {
     try { [void]$wc.UploadString("$u/gpu_mode_applied.txt", 'PUT', $text) } catch {}
 }
 
+# The seq of the request last reported (gpu_mode_applied.txt), '' if none or unreadable.
+function LastReported($wc) {
+    try {
+        foreach ($l in ($wc.DownloadString("$u/gpu_mode_applied.txt") -split "`r?`n")) {
+            if ($l -match '^\s*seq=(\d+)') { return $Matches[1] }
+        }
+    } catch {}
+    return ''
+}
+
+# A failed download: only a real 404 (no file) means "nothing asked"; anything else (the network or the share not
+# up yet at boot) says nothing. Windows PowerShell wraps the WebException.
+function Is404($err) {
+    $e = $err.Exception
+    while ($e -and -not ($e -is [Net.WebException])) { $e = $e.InnerException }
+    return ($e -and $e.Response -and ([int]$e.Response.StatusCode -eq 404))
+}
+
 if ($Watch) {
     # The task's loop (SYSTEM). The request read first is from before this start: Windows' display driver started
-    # with whatever the device offered then, so it is only reported, never applied again.
+    # with whatever the device offered then, so it is only reported, never applied again. $seen stays $null until
+    # the share has answered (a file, a 404, or seq=0: nothing asked).
     $wc = New-Object Net.WebClient
     $seen = $null
     while ($true) {
@@ -46,10 +65,15 @@ if ($Watch) {
                 if ($l -match '^\s*seq=(\d+)') { $seq = $Matches[1] }
                 elseif ($l -match '^\s*mode=(3d|2d)') { $mode = $Matches[1] }
             }
-            if ($seq -and $mode) {
-                if ($null -eq $seen) {
+            if ($seq -eq '0') {
+                # the app's own at-start line: nothing asked since the machine started
+                $seen = '0'
+            } elseif ($seq -and $mode -and $seq -ne $seen) {
+                if ($seq -eq (LastReported $wc)) {
+                    # reported already (this task was restarted): never applied or reported again
+                } elseif ($null -eq $seen) {
                     Report $wc $seq $mode 'at-start' 'Windows started with the mode offered then'
-                } elseif ($seq -ne $seen) {
+                } else {
                     $g = Gpu
                     if (-not $g) {
                         Report $wc $seq $mode 'no-device' 'no VirtIO GPU (PCI\VEN_1AF4&DEV_1050) in Windows'
@@ -68,11 +92,11 @@ if ($Watch) {
                     }
                 }
                 $seen = $seq
-            } elseif ($null -eq $seen) {
-                $seen = ''
+            } elseif ($null -eq $seen -and -not $seq) {
+                $seen = '' # a file with no request in it
             }
         } catch {
-            if ($null -eq $seen) { $seen = '' } # nothing asked yet (no file), or the share is not up yet
+            if ($null -eq $seen -and (Is404 $_)) { $seen = '' } # no file: nothing asked yet
         }
         Start-Sleep -Seconds 2
     }

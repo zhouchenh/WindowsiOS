@@ -198,6 +198,8 @@ struct HvVgpu3d {
     FenceEv *events;
 
     /* worker only */
+    int used; /* the renderer did work (a command, a cursor read-back) since its last reset */
+    uint64_t resets, resets_skipped;
     Parked *fenceq;
     uint32_t nparked_global;
     /* Live contexts and their capsets, for the log: whether Windows' contexts come and go as they should
@@ -1178,8 +1180,23 @@ static void complete_fences(HvVgpu3d *s, const FenceEv *f) {
 
 /* A driver reset: every context and resource goes (virgl_renderer_reset). The renderer itself stays, idle, so the
    next 3D driver start (after a switch back, hv_virtio_gpu_set_3d) finds it ready: it is never torn down and made
-   again within one run of the app. This runs Metal work: switches happen in the foreground only. */
+   again within one run of the app. A real reset runs Metal work; see below for when it is skipped. */
 static void renderer_reset(HvVgpu3d *s) {
+    /* A renderer that did nothing since its last reset has nothing to drop, so the reset is skipped: after a switch
+       to 2D, Windows (and so its driver resets: a restart, Windows Update, a TDR) can run in the background, where
+       no Metal work may happen. The first reset after real 3D use still runs, and that one follows a 3D driver, so
+       it happens in the foreground (the switch itself restarts the adapter). */
+    uint32_t nres = 0;
+    for (int i = 0; i < MAX_RES3D; i++)
+        if (s->res[i].id) nres++;
+    HvVgpu3dUse use = {.used = s->used, .live_ctxs = s->nlive, .resources = nres, .scanout = s->scanout_res || s->scanout_handle,
+                       .parked = s->nparked_global + (s->fenceq != NULL)};
+    if (!hv_vgpu3d_reset_needed(&use)) {
+        s->resets_skipped++;
+        return;
+    }
+    s->resets++;
+    s->used = 0;
     clear_scanout(s);
     for (int i = 0; i < MAX_RES3D; i++)
         if (s->res[i].id) unmap_blob(s, &s->res[i]);
@@ -1287,7 +1304,10 @@ static void *worker(void *arg) {
             ev = n;
         }
         if (s->nparked_global) V.virgl_renderer_poll(); /* global fences retire from here */
-        if (cursor_pending) fetch_cursor(s, cursor_res);
+        if (cursor_pending) {
+            s->used = 1;
+            fetch_cursor(s, cursor_res);
+        }
 
         /* take what the driver queued */
         for (;;) {
@@ -1314,6 +1334,7 @@ static void *worker(void *arg) {
             }
             if (s->cmds <= 200) LOG("cmd #%llu %#x ctx %u flags %#x\n", (unsigned long long)s->cmds, p->h.type, p->h.ctx_id, p->h.flags);
             int answered = 0;
+            s->used = 1;
             /* not under g->mu: process() may wait for every CPU (sync_tlbs), and a CPU may be waiting for g->mu */
             uint32_t err = process(s, &p->e, &p->h, epoch, req + HDR, n - HDR, &answered);
             if (answered) {
@@ -1472,7 +1493,7 @@ int hv_vgpu3d_describe(HvVgpu3d *s, char *buf, unsigned len) {
     return snprintf(buf, len,
                     "on capsets=%u ctxs=%llu cmds=%llu submits=%llu (%lluKB) blobs=%llu maps=%llu fences=%llu "
                     "(ring %llu global %llu) errors=%llu submit_errors=%llu live_ctxs=%u (neptune %u, peak %u) scanout=%u %ux%u%s "
-                    "hostmem@%#llx",
+                    "resets=%llu (skipped %llu) hostmem@%#llx",
                     s->ncapsets, (unsigned long long)s->ctxs, (unsigned long long)s->cmds,
                     (unsigned long long)s->submits, (unsigned long long)(s->submit_bytes >> 10),
                     (unsigned long long)s->blobs, (unsigned long long)s->maps, (unsigned long long)s->fences,
@@ -1481,5 +1502,5 @@ int hv_vgpu3d_describe(HvVgpu3d *s, char *buf, unsigned len) {
                     s->scanout_res, s->sc_w,
                     s->sc_h,
                     s->scanout_handle || (s->g && s->g->fb && s->g->fb->ovr_tex) ? " metal" : "",
-                    (unsigned long long)s->win_pa);
+                    (unsigned long long)s->resets, (unsigned long long)s->resets_skipped, (unsigned long long)s->win_pa);
 }

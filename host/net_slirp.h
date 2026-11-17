@@ -32,7 +32,7 @@ extern uint64_t hv_net_tx_frames, hv_net_rx_frames;
                              local, and global unless the rule's no_global6 or HV_NET_LAN_GLOBAL6=0; never link-local,
                              never cellular), followed as they change, and loopback */
 #define HV_FWD_VPN 2      /* every address of the active VPN interface (utun...): IPv4, and IPv6 unique local and
-                             global (not link-local), followed when they change */
+                             global unless the rule's no_global6 (not link-local), followed when they change */
 
 typedef struct HvFwdRule {
     char id[48];   /* letters, digits, '-', '_', '.'; empty: one is made up */
@@ -42,8 +42,10 @@ typedef struct HvFwdRule {
     int guest_port;
     int scope; /* HV_FWD_LOOPBACK, HV_FWD_LAN or HV_FWD_VPN */
     int enabled;
-    int no_global6; /* HV_FWD_LAN: leave the local network's global IPv6 addresses out (JSON "ipv6Global": false).
-                       A global address may be reachable from the internet where the router lets IPv6 in. */
+    int no_global6; /* HV_FWD_LAN and HV_FWD_VPN: leave the interface's global IPv6 addresses out (JSON
+                       "ipv6Global": false). A global address may be reachable from the internet unless the router
+                       or the VPN server filters it. A saved rule without the key (from before it was a choice)
+                       loads with it set. */
 } HvFwdRule;
 
 /* The file the machine's forwards are kept in (JSON, see net_slirp.c). Loads it, replacing the saved forwards
@@ -86,6 +88,16 @@ char *hv_net_fwd_addresses_json(void);
    listen leaves out the IPv4 loopback an IPv6-only VPN keeps as the relays' way in. */
 struct ifaddrs;
 char *hv_net_fwd_plan_json(const struct ifaddrs *ifa, const HvFwdRule *r);
+/* An IPv6 address's flags (XNU's IN6_IFF_*), as SIOCGIFAFLAG_IN6 reads them; 0 when it cannot be read. Forwards
+   never take an address that cannot be bound (tentative, duplicated, detached, or kept for CLAT46) and put deprecated
+   ones last. For tests: fn replaces the lookup (NULL: the real one). */
+#define HV_IN6_IFF_TENTATIVE 0x0002
+#define HV_IN6_IFF_DUPLICATED 0x0004
+#define HV_IN6_IFF_DETACHED 0x0008
+#define HV_IN6_IFF_DEPRECATED 0x0010
+#define HV_IN6_IFF_CLAT46 0x1000
+struct in6_addr;
+void hv_net_set_addr6_flags_fn(int (*fn)(const char *ifname, const struct in6_addr *a));
 /* One forward from JSON (the keys hv_net_fwd_list_json uses; missing ones keep *r's values). 0, or -1. */
 int hv_net_fwd_parse_rule(const char *json, size_t len, HvFwdRule *r);
 

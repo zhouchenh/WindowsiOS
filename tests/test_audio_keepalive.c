@@ -6,6 +6,8 @@
    - Windows' stream stopping leaves a kept-alive unit running; with the keep-alive off it stops, unless Windows
      still plays; Windows opening another format makes the unit again, still running after Windows stops.
    - Restart after an interruption, and a media services reset (the unit made again), keep it running.
+   - A paused machine stops the output even while Windows' stream is open; nothing starts it until it resumes,
+     when it runs again if Windows plays or the keep-alive is on.
    - Shutdown turns the keep-alive off and frees the unit; without an attached HDA the keep-alive fails.
    No output device (a headless Mac): skipped. */
 #include "audio_mac.h"
@@ -87,6 +89,35 @@ int main(void) {
     check("restart after an interruption", hv_audio_restart_output(0) == 0 && hv_audio_output_running());
     check("media services reset: made again and running", hv_audio_restart_output(1) == 0 && hv_audio_output_running() &&
                                                           pulled_within(1500));
+
+    /* A paused machine (the guard, or the app in the background without server mode): the output stops even while
+       Windows has its stream open (its CPUs are parked before it could stop it), so iOS can suspend the app. */
+    check("Windows plays (kept alive)", be->start_out(be->opaque, 2, 48000) == 0 && hv_audio_output_running());
+    hv_audio_set_machine_paused(1);
+    check("machine paused while Windows plays: stopped", !hv_audio_output_running());
+    hv_audio_set_keepalive(0);
+    hv_audio_set_keepalive(1);
+    check("paused: the keep-alive does not start it", !hv_audio_output_running() && hv_audio_keepalive());
+    check("paused: a restart (interruption ended, app in front) does not start it",
+          hv_audio_restart_output(0) == 0 && !hv_audio_output_running());
+    check("paused: a media services reset does not start it", hv_audio_restart_output(1) == 0 && !hv_audio_output_running());
+    hv_audio_set_machine_paused(0);
+    check("resumed: running again (Windows still plays)", hv_audio_output_running() && pulled_within(1500));
+    hv_audio_set_keepalive(0);
+    check("resumed, keep-alive off, Windows plays: still running", hv_audio_output_running());
+    hv_audio_set_machine_paused(1);
+    be->stop_out(be->opaque); /* not what happens (the CPUs are parked), but harmless */
+    be->start_out(be->opaque, 2, 44100); /* nor this: Windows opening a stream while paused starts nothing */
+    check("paused: Windows opening a stream starts nothing", !hv_audio_output_running());
+    hv_audio_set_machine_paused(0);
+    check("resumed: Windows' stream starts (its 44.1 kHz)", hv_audio_output_running() && pulled_within(1500));
+    be->stop_out(be->opaque);
+    check("Windows stops, keep-alive off: stopped", !hv_audio_output_running());
+    hv_audio_set_machine_paused(1);
+    hv_audio_set_machine_paused(0);
+    check("paused and resumed with nothing wanted: nothing runs", !hv_audio_output_running());
+    hv_audio_set_keepalive(1);
+    check("keep-alive on again: running", hv_audio_output_running());
 
     hv_audio_pause_capture(1); /* nothing open: only the flag (the microphone is not touched here) */
     hv_audio_pause_capture(0);

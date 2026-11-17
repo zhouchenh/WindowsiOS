@@ -187,8 +187,9 @@ extern NSNotificationName const WinIOSDisplayWillReshapeNotification;
 - (NSString *)portForwardsJSON NS_SWIFT_NAME(portForwardsJSON());
 /// Adds a saved forward, or replaces the one with this id. nil when done, else why not (in English).
 /// protocols: 1 TCP, 2 UDP, 3 both. scope: 0 this device only, 1 local network, 2 VPN.
-/// ipv6Global: a local network forward also listens on the network's global IPv6 addresses (which the internet may
-/// reach where the router lets IPv6 in); unique local ones are always taken. Ignored for the other scopes.
+/// ipv6Global: a local network or VPN forward also listens on the interface's global IPv6 addresses (which the
+/// internet may reach unless the router or the VPN server filters it); unique local ones are always taken. Ignored
+/// for this device only.
 - (nullable NSString *)savePortForwardWithID:(NSString *)forwardID
                                         name:(NSString *)name
                                    protocols:(NSInteger)protocols
@@ -238,8 +239,14 @@ typedef struct WinIOSGraphicsMode {
 @property (nonatomic, readonly) WinIOSBackgroundBlocker backgroundBlocker;
 /// No picture: the Metal layer is unbound (the presenter stops) and Windows' size is frozen as it is.
 @property (nonatomic) BOOL headless;
-/// The screen stays on while Windows runs (iOS auto-lock off). YES by default.
+/// The screen stays on while Windows runs (iOS auto-lock off). YES by default. Whatever this says, it also stays on
+/// while Windows runs and could not keep running in the background (no server mode, host 3D, a switch pending, a
+/// debugger, Linux).
 @property (nonatomic) BOOL keepScreenOn;
+/// Evaluates the screen's auto-lock again (after the background blocker changed).
+- (void)updateIdleTimer;
+/// The guest's CPUs are stopped now (the background pause or the guard).
+@property (nonatomic, readonly) BOOL machinePaused;
 /// Paused by the app's guard (critical temperature or battery), apart from the background pause.
 @property (nonatomic, readonly) BOOL guardPaused;
 - (void)setGuardPaused:(BOOL)paused reason:(NSString *)reason;

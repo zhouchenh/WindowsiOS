@@ -31,7 +31,8 @@ struct PortForward: Identifiable, Decodable, Equatable {
     var message: String
     var warning: String
     var listen: [String]
-    /// Local network: also the network's global IPv6 addresses (missing from older engines: on).
+    /// Local network and VPN: also the interface's global IPv6 addresses (missing: off, as rules saved before it
+    /// was a choice load).
     var ipv6Global: Bool?
     var ipv4: ForwardFamily?
     var ipv6: ForwardFamily?
@@ -102,17 +103,74 @@ enum ForwardScope: Int, CaseIterable, Identifiable {
         case .vpn: return "VPN"
         }
     }
-    var detail: String {
+    /// A new forward's "IPv6 global addresses": on for the VPN (a WireGuard VPN may give the phone only a global IPv6
+    /// address besides IPv4), off for the local network (a Wi-Fi's global address may be reachable from the internet).
+    var defaultIPv6Global: Bool { self == .vpn }
+
+    /// Who can reach it, with the forward's own "IPv6 global addresses" choice.
+    func detail(global6: Bool) -> String {
         switch self {
         case .device:
             return L("只有这台\(PortForwardText.device)上的 App 能连接（例如 iOS 上的远程桌面 App 连 localhost）。",
                      "Only apps on this \(PortForwardText.device) can connect (for example a Remote Desktop app here, to localhost).")
         case .localNetwork:
-            return L("同一 Wi-Fi 或有线网络、或这台\(PortForwardText.device)个人热点上的设备能连接，IPv4 和 IPv6 都行。蜂窝网络连不进来。",
-                     "Devices on the same Wi-Fi or wired network, or on this \(PortForwardText.device)'s Personal Hotspot, can connect, over IPv4 and IPv6. Not over cellular.")
+            return global6
+                ? L("同一 Wi-Fi 或有线网络、或这台\(PortForwardText.device)个人热点上的设备能连接，IPv4 和 IPv6 都行。也在 IPv6 全局地址上监听：路由器放行入站 IPv6 时，互联网上（包括蜂窝网络上）的设备也可能连进来。",
+                    "Devices on the same Wi-Fi or wired network, or on this \(PortForwardText.device)'s Personal Hotspot, can connect, over IPv4 and IPv6. It also listens on global IPv6 addresses: where the router lets incoming IPv6 through, devices on the internet (cellular included) may reach it too.")
+                : L("同一 Wi-Fi 或有线网络、或这台\(PortForwardText.device)个人热点上的设备能连接：IPv4 和 IPv6 本地地址（fd00::/8）。不在 IPv6 全局地址上监听，所以互联网连不进来（路由器把端口转发过来的情况除外）。",
+                    "Devices on the same Wi-Fi or wired network, or on this \(PortForwardText.device)'s Personal Hotspot, can connect: over IPv4 and local IPv6 addresses (fd00::/8). It does not listen on global IPv6 addresses, so the internet can't reach it (unless the router forwards a port to it).")
         case .vpn:
-            return L("只有 VPN（例如 WireGuard）里的设备能连接，IPv4 和 IPv6（VPN 的全部地址）都行；VPN 地址变了会自动跟上。",
-                     "Only devices on your VPN (for example WireGuard) can connect, over IPv4 and IPv6 (every address the VPN gives this \(PortForwardText.device)). Follows the VPN's addresses when they change.")
+            return global6
+                ? L("VPN（例如 WireGuard）里的设备能连接，IPv4 和 IPv6（VPN 给这台\(PortForwardText.device)的全部地址）都行；VPN 地址变了会自动跟上。VPN 给的 IPv6 全局地址可能从互联网直接连到，除非 VPN 服务器挡住入站连接。",
+                    "Devices on your VPN (for example WireGuard) can connect, over IPv4 and IPv6 (every address the VPN gives this \(PortForwardText.device)). Follows the VPN's addresses when they change. A global IPv6 address from the VPN may be reachable from the internet unless the VPN server filters incoming connections.")
+                : L("只有 VPN（例如 WireGuard）里的设备能连接：VPN 的 IPv4 和 IPv6 本地地址（fd00::/8），不用它的 IPv6 全局地址；VPN 地址变了会自动跟上。",
+                    "Only devices on your VPN (for example WireGuard) can connect: over the VPN's IPv4 and local IPv6 addresses (fd00::/8), not its global IPv6 ones. Follows the VPN's addresses when they change.")
+        }
+    }
+}
+
+/// Under the scope picker (the editor and Server mode's Remote Desktop helper): the "IPv6 global addresses" switch
+/// for the local network and VPN scopes, what it means, and who can try to sign in.
+struct ForwardScopeExtras: View {
+    let scope: ForwardScope
+    @Binding var ipv6Global: Bool
+    /// The forward leads to Remote Desktop (or anything with a sign-in).
+    var signIn: Bool = true
+
+    var body: some View {
+        if scope != .device {
+            Toggle(L("IPv6 全局地址", "IPv6 global addresses"), isOn: $ipv6Global)
+            Label {
+                Text(text).font(.footnote)
+            } icon: {
+                Image(systemName: ipv6Global ? "globe" : "house").foregroundStyle(ipv6Global ? .orange : .secondary)
+            }
+            if signIn {
+                Label {
+                    Text(L("谁能连上这个端口，谁就能尝试登录 Windows。互联网能连到时，这个端口是公开的：请给 Windows 账户设一个强密码，用完就关掉这个转发，只在你信任的网络上使用。",
+                           "Anyone who can reach this port can try to sign in to Windows; where the internet can reach it, it is a public sign-in. Give your Windows account a strong password, turn the forward off when you're done, and use it only on networks you trust."))
+                        .font(.footnote)
+                } icon: {
+                    Image(systemName: "exclamationmark.shield.fill").foregroundStyle(.orange)
+                }
+            }
+        }
+    }
+
+    private var text: String {
+        switch (scope, ipv6Global) {
+        case (.vpn, true):
+            return L("也在 VPN 的 IPv6 全局地址上监听。自建 WireGuard 等 VPN 常给手机一个公网 IPv6 地址：VPN 服务器不过滤入站连接时，互联网上的设备也能连到这个端口。关掉后只用 VPN 的 IPv4 和 IPv6 本地地址。",
+                     "Also listens on the VPN's global IPv6 addresses. A VPN such as your own WireGuard often gives the phone a public IPv6 address: unless the VPN server filters incoming connections, devices on the internet can reach this port too. Off: only the VPN's IPv4 and local IPv6 addresses.")
+        case (.vpn, false):
+            return L("只在 VPN 的 IPv4 和 IPv6 本地地址（fd00::/8）上监听。VPN 只给了 IPv6 全局地址时，IPv6 就连不进来。",
+                     "Listens on the VPN's IPv4 and local IPv6 addresses (fd00::/8) only. If the VPN gives this device only a global IPv6 address, IPv6 can't connect.")
+        case (_, true):
+            return L("也在 Wi-Fi 的 IPv6 全局地址上监听。路由器放行入站 IPv6 时（很多家用路由器默认挡住，但不是全部），互联网上的设备也可能连到这个端口。只想让局域网连，就关掉它：IPv4 和 IPv6 本地地址（fd00::/8）照样能用。",
+                     "Also listens on the Wi-Fi's global IPv6 addresses. Where the router lets incoming IPv6 through (many home routers block it, not all), devices on the internet may reach this port too. Turn it off to keep it to the local network: IPv4 and the local IPv6 addresses (fd00::/8) still work.")
+        default:
+            return L("只在 IPv4 和 IPv6 本地地址（fd00::/8）上监听。很多家庭网络只有 IPv6 全局地址：那时局域网里的设备只能用 IPv4 连。",
+                     "Listens on IPv4 and the local IPv6 addresses (fd00::/8) only. Many home networks only have global IPv6 addresses: devices there then connect over IPv4.")
         }
     }
 }
@@ -132,8 +190,8 @@ struct PortForwardDraft: Identifiable {
     var scope: ForwardScope
     var enabled: Bool
     var session: Bool
-    /// Local network: listen on the global IPv6 addresses too (on by default).
-    var ipv6Global: Bool = true
+    /// Local network and VPN: listen on the global IPv6 addresses too (a new forward: the scope's default).
+    var ipv6Global: Bool = false
 
     init(_ rule: PortForward) {
         id = rule.id
@@ -145,7 +203,7 @@ struct PortForwardDraft: Identifiable {
         scope = ForwardScope(json: rule.scope)
         enabled = rule.enabled
         session = rule.session
-        ipv6Global = rule.ipv6Global ?? true
+        ipv6Global = rule.ipv6Global ?? false
     }
 
     init(name: String, proto: ForwardProtocol, hostPort: Int, guestPort: Int) {
@@ -362,9 +420,11 @@ struct PortForwardingSection: View {
             }
             if model.needsAddresses {
                 let lanRules = model.rules.filter { $0.enabled && $0.scope == "lan" }
+                let vpnRules = model.rules.filter { $0.enabled && $0.scope == "vpn" }
                 AddressRows(lan: model.lan, vpn: model.vpn, showLAN: !lanRules.isEmpty,
-                            showVPN: model.rules.contains { $0.enabled && $0.scope == "vpn" },
-                            showGlobal6: lanRules.contains { $0.ipv6Global ?? true })
+                            showVPN: !vpnRules.isEmpty,
+                            showGlobal6: lanRules.contains { $0.ipv6Global ?? false },
+                            showVPNGlobal6: vpnRules.contains { $0.ipv6Global ?? false })
             }
         } header: {
             Text(L("端口转发", "Port forwarding"))
@@ -463,6 +523,9 @@ private struct PortForwardRow: View {
                 return L("没有连接 VPN，连上后自动打开", "No VPN is connected. Opens when one connects.")
             case "no_address":
                 return L("地址已失效，会自动重试", "The address went away. Retrying.")
+            case "vpn_global6":
+                return L("VPN 只给了 IPv6 全局地址，而这个转发不用全局地址：编辑它，打开“IPv6 全局地址”。",
+                         "The VPN only has global IPv6 addresses, which this forward leaves out: edit it and turn on IPv6 global addresses.")
             default:
                 return rule.message.isEmpty ? L("打不开", "Couldn't open") : rule.message
             }
@@ -514,6 +577,8 @@ struct AddressRows: View {
     var showVPN: Bool = true
     /// The local network's global IPv6 addresses (some local network forward listens on them).
     var showGlobal6: Bool = true
+    /// The VPN's global IPv6 addresses (some VPN forward listens on them).
+    var showVPNGlobal6: Bool = true
     var port: Int? = nil
     var showLoopback: Bool = false
     var title: String = L("从其他设备连接到", "From another device, connect to")
@@ -540,7 +605,12 @@ struct AddressRows: View {
                 if vpn.isEmpty {
                     Text(L("没有连接 VPN", "No VPN connected")).font(.callout).foregroundStyle(.secondary)
                 } else {
-                    ForEach(vpn, id: \.self) { a in row("VPN (\(a.interface))", a) }
+                    let shown = vpn.filter { showVPNGlobal6 || !$0.isGlobal6 }
+                    if shown.isEmpty {
+                        Text(L("VPN 只有 IPv6 全局地址，这个转发不用它们", "The VPN has only global IPv6 addresses, which this forward leaves out"))
+                            .font(.callout).foregroundStyle(.secondary)
+                    }
+                    ForEach(shown, id: \.self) { a in row("VPN (\(a.interface))" + (a.isGlobal6 ? L("（全局）", " (global)") : ""), a) }
                 }
             }
         }
@@ -616,35 +686,18 @@ private struct PortForwardEditor: View {
                         ForEach(ForwardScope.allCases) { s in
                             VStack(alignment: .leading, spacing: 2) {
                                 Text(s.title)
-                                Text(s.detail).font(.caption).foregroundStyle(.secondary)
+                                Text(s.detail(global6: s == draft.scope ? draft.ipv6Global : s.defaultIPv6Global))
+                                    .font(.caption).foregroundStyle(.secondary)
                             }
                             .tag(s)
                         }
                     }
                     .pickerStyle(.inline)
                     .labelsHidden()
-                    if draft.scope == .localNetwork {
-                        Toggle(L("IPv6 全局地址", "IPv6 global addresses"), isOn: $draft.ipv6Global)
-                        Label {
-                            Text(draft.ipv6Global
-                                 ? L("也在 Wi-Fi 的 IPv6 全局地址上监听。路由器放行入站 IPv6 时（很多家用路由器默认挡住，但不是全部），互联网上的设备也可能连到这个端口。只想让局域网连，就关掉它：IPv4 和 IPv6 本地地址（fd00::/8）照样能用。",
-                                     "Also listens on the Wi-Fi's global IPv6 addresses. Where the router lets incoming IPv6 through (many home routers block it, not all), devices on the internet may reach this port too. Turn it off to keep it to the local network: IPv4 and the local IPv6 addresses (fd00::/8) still work.")
-                                 : L("只在 IPv4 和 IPv6 本地地址（fd00::/8）上监听。很多家庭网络只有 IPv6 全局地址：那时局域网里的设备只能用 IPv4 连。",
-                                     "Listens on IPv4 and the local IPv6 addresses (fd00::/8) only. Many home networks only have global IPv6 addresses: devices there then connect over IPv4."))
-                                .font(.footnote)
-                        } icon: {
-                            Image(systemName: draft.ipv6Global ? "globe" : "house").foregroundStyle(draft.ipv6Global ? .orange : .secondary)
-                        }
+                    .onChange(of: draft.scope) { _, scope in
+                        if draft.isNew { draft.ipv6Global = scope.defaultIPv6Global } // a new forward: the scope's default
                     }
-                    if draft.scope != .device {
-                        Label {
-                            Text(L("谁能连上这个端口，谁就能尝试登录 Windows。请给 Windows 账户设一个强密码，用完就关掉这个转发。只在你信任的网络上使用。",
-                                   "Anyone who can reach this port can try to sign in to Windows. Give your Windows account a strong password, turn the forward off when you're done, and use it only on networks you trust."))
-                                .font(.footnote)
-                        } icon: {
-                            Image(systemName: "exclamationmark.shield.fill").foregroundStyle(.orange)
-                        }
-                    }
+                    ForwardScopeExtras(scope: draft.scope, ipv6Global: $draft.ipv6Global)
                 } header: {
                     Text(L("谁能连接", "Who can connect"))
                 }

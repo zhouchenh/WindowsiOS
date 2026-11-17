@@ -354,21 +354,35 @@ static const AVAudioSessionCategoryOptions kWinIOSAudioOptions = AVAudioSessionC
    guard holds it (critical temperature or battery). Each has its own flag: one ending does not resume the other. */
 - (void)applyPause {
     if (!_vmRunning) return;
-    hv_winvm_set_paused(_pausedInBackground || _guardPaused);
+    BOOL paused = _pausedInBackground || _guardPaused;
+    hv_winvm_set_paused(paused);
+    /* the output unit stops even if Windows had a stream open (its CPUs are parked before it could stop it), and
+       starts again on resume when Windows plays or the keep-alive wants it */
+    hv_audio_set_machine_paused(paused);
     [self applyAudioKeepAlive];
 }
 
 /* The silent output keeps the app running in the background: only while Windows runs, so a paused machine lets iOS
-   suspend the app as before. */
+   suspend the app as before (hv_audio_set_machine_paused keeps it off then, whatever Windows had open). */
 - (void)applyAudioKeepAlive {
     if (!_vmRunning) return;
     BOOL want = _audioKeepAlive && !_pausedInBackground && !_guardPaused;
     if (want != (hv_audio_keepalive() != 0)) hv_audio_set_keepalive(want);
 }
 
+/* Auto-lock would send the app to the background: the screen stays on whenever Windows runs and could not go on
+   running there (host 3D or a switch pending, a debugger, Linux, or server mode off), and when Keep screen on is
+   set. Evaluated again on every change of these (graphics switches and driver restarts: also from the diag tick). */
 - (void)applyIdleTimer {
-    UIApplication.sharedApplication.idleTimerDisabled = _vmRunning && _keepScreenOn;
+    BOOL bgOK = _runInBackground && !winios_machine_is_linux() && self.backgroundBlocker == WinIOSBackgroundBlockerNothing;
+    BOOL keep = _vmRunning && (_keepScreenOn || !bgOK);
+    UIApplication *app = UIApplication.sharedApplication;
+    if (app.idleTimerDisabled == keep) return;
+    app.idleTimerDisabled = keep;
+    fprintf(stderr, "winvm: screen %s\n", keep ? (_keepScreenOn ? "kept on" : "kept on (Windows cannot run in the background now)")
+                                           : "may lock (server mode: Windows keeps running in the background)");
 }
+- (void)updateIdleTimer { [self applyIdleTimer]; }
 
 - (void)endBackgroundGrace {
     if (_bgGrace == UIBackgroundTaskInvalid) return;
@@ -385,12 +399,17 @@ static const AVAudioSessionCategoryOptions kWinIOSAudioOptions = AVAudioSessionC
     [self endBackgroundGrace];
     _bgGrace = [[UIApplication sharedApplication] beginBackgroundTaskWithName:@"winvm.background"
                                                             expirationHandler:^{ [self endBackgroundGrace]; }];
-    BOOL keep = (_runInBackground && self.backgroundBlocker == WinIOSBackgroundBlockerNothing) || getenv("WINIOS_RUN_IN_BACKGROUND");
+    WinIOSBackgroundBlocker blocker = self.backgroundBlocker;
+    BOOL keep = (_runInBackground && !winios_machine_is_linux() && blocker == WinIOSBackgroundBlockerNothing) ||
+                getenv("WINIOS_RUN_IN_BACKGROUND");
     if (!keep) {
         _pausedInBackground = YES;
         [self applyPause];
         fprintf(stderr, "winvm: paused (app in the background%s)\n",
-                _runInBackground ? [NSString stringWithFormat:@"; server mode blocked: %ld", (long)self.backgroundBlocker].UTF8String : "");
+                !_runInBackground ? ""
+                : blocker == WinIOSBackgroundBlockerSwitchPending
+                    ? "; server mode blocked: the graphics switch to 2D is not done yet (it goes on when the app is back)"
+                    : [NSString stringWithFormat:@"; server mode blocked: %ld", (long)blocker].UTF8String);
     } else {
         hv_audio_pause_capture(1); /* no microphone (and no indicator) while away */
         [self applyAudioKeepAlive];
@@ -511,6 +530,7 @@ static BOOL winios_battery_setting(void) {
 - (void)setRunInBackground:(BOOL)on {
     _runInBackground = on;
     fprintf(stderr, "winvm: server mode %s\n", on ? "on" : "off");
+    [self applyIdleTimer];
 }
 
 - (BOOL)audioKeepAlive { return _audioKeepAlive; }
@@ -521,6 +541,7 @@ static BOOL winios_battery_setting(void) {
 
 - (BOOL)audioOutputRunning { return hv_audio_output_running() != 0; }
 - (BOOL)runningInBackground { return _vmRunning && _inBackground && !_pausedInBackground; }
+- (BOOL)machinePaused { return _vmRunning && (_pausedInBackground || _guardPaused); }
 
 - (WinIOSGraphicsMode)graphicsMode {
     WinIOSGraphicsMode g = {0};
@@ -590,6 +611,7 @@ static BOOL winios_battery_setting(void) {
         if (why) *why = no;
         return -1;
     }
+    [self applyIdleTimer]; /* 3D offered again: the screen stays on */
     if (!restart) return 0;
     _gpuSwitchSeq = MAX(_gpuSwitchSeq + 1, (int64_t)([[NSDate date] timeIntervalSince1970] * 10.0));
     NSString *dir = [[self documentsPath] stringByAppendingPathComponent:@"Shared"];
@@ -1738,6 +1760,15 @@ static NSString *winios_unpack_resource(NSString *name, NSString *dst) {
         _started3D = capable != 0; /* what really started: the renderer may have failed to load */
         fprintf(stderr, "winvm: host 3D %s at start%s\n", _started3D ? "on" : "off",
                 _started3D && !linuxGuest ? " (2D/3D can be switched while Windows runs)" : "");
+        if (!linuxGuest) {
+            /* WinKit's graphics task: no request yet in this run (seq=0). A request left from an earlier run would
+               otherwise read as new to a task that could not read the share at first (gpu_switch.ps1). */
+            NSString *shared = [[self documentsPath] stringByAppendingPathComponent:@"Shared"];
+            [[NSFileManager defaultManager] createDirectoryAtPath:shared withIntermediateDirectories:YES attributes:nil error:nil];
+            NSString *text = [NSString stringWithFormat:@"seq=0\r\nmode=%@\r\n", _started3D ? @"3d" : @"2d"];
+            [text writeToFile:[shared stringByAppendingPathComponent:@"gpu_mode.txt"] atomically:YES
+                     encoding:NSASCIIStringEncoding error:nil];
+        }
     }
 
     /* display sizing: env.txt is loaded now (HV_DISPLAY_LEGACY), so plan again from the view's size */
@@ -1928,7 +1959,10 @@ static void winios_type_run(NSString *text) {
         }
     }
     [self writeDiagnosticsSnapshot];
-    if (_vmRunning) dispatch_async(dispatch_get_main_queue(), ^{ [self refreshAppliedDisplay]; }); /* display hook */
+    if (_vmRunning) dispatch_async(dispatch_get_main_queue(), ^{
+        [self refreshAppliedDisplay]; /* display hook */
+        [self applyIdleTimer];        /* a display driver that restarted by itself changes what may run in the background */
+    });
     /* battery backstop: iOS coalesces its battery notifications, and may hold them while the app runs in the
        background (WINIOS_RUN_IN_BACKGROUND); a push that changed nothing costs nothing */
     if (_vmRunning) dispatch_async(dispatch_get_main_queue(), ^{ [self pushBattery]; });

@@ -33,6 +33,8 @@ static unsigned hda_out_ch, hda_out_rate;
 static HvHda *attached_hda;  /* the render callback's source (hv_audio_attach_hda) */
 static int keepalive;        /* hv_audio_set_keepalive */
 static int guest_out;        /* Windows has its output stream running (between start_out and stop_out) */
+static unsigned guest_out_ch = 2, guest_out_rate = 48000; /* its format */
+static int machine_paused;   /* hv_audio_set_machine_paused: the output stays off whatever else wants it */
 static int guest_in, capture_paused; /* the same for the microphone, and hv_audio_pause_capture */
 
 static OSStatus hda_out_render(void *ref, AudioUnitRenderActionFlags *flags, const AudioTimeStamp *ts,
@@ -93,13 +95,33 @@ static int ensure_out_locked(HvHda *hda, unsigned channels, unsigned rate_hz) {
     return hda_out_running ? 0 : -1;
 }
 
+static void stop_out_locked(void) {
+    if (hda_out_unit && hda_out_running) {
+        AudioOutputUnitStop(hda_out_unit);
+        hda_out_running = 0;
+    }
+}
+
+/* audio_mu held: the output runs while Windows plays or the keep-alive wants it, never while the machine is paused. */
+static int out_wanted_locked(void) { return !machine_paused && (keepalive || guest_out); }
+
+/* audio_mu held: starts the output in the format Windows opened, else the one the unit has, else 2 ch / 48 kHz. */
+static int start_wanted_locked(void) {
+    if (!attached_hda) return -1;
+    if (guest_out) return ensure_out_locked(attached_hda, guest_out_ch, guest_out_rate);
+    if (hda_out_unit) return ensure_out_locked(attached_hda, hda_out_ch, hda_out_rate);
+    return ensure_out_locked(attached_hda, 2, 48000);
+}
+
 static int hda_start_out(void *opaque, unsigned channels, unsigned rate_hz) {
     HvHda *hda = (HvHda *)opaque;
     if (channels < 1 || channels > 2) channels = 2;
     if (rate_hz < 8000 || rate_hz > 192000) rate_hz = 48000;
     pthread_mutex_lock(&audio_mu);
     guest_out = 1;
-    int ok = ensure_out_locked(hda, channels, rate_hz); /* a kept-alive unit of another format is made again */
+    guest_out_ch = channels, guest_out_rate = rate_hz;
+    /* a kept-alive unit of another format is made again; a paused machine starts it when it resumes */
+    int ok = machine_paused ? 0 : ensure_out_locked(hda, channels, rate_hz);
     pthread_mutex_unlock(&audio_mu);
     return ok;
 }
@@ -108,10 +130,7 @@ static void hda_stop_out(void *opaque) {
     (void)opaque;
     pthread_mutex_lock(&audio_mu);
     guest_out = 0;
-    if (hda_out_unit && hda_out_running && !keepalive) { /* kept alive: it plays silence on */
-        AudioOutputUnitStop(hda_out_unit);
-        hda_out_running = 0;
-    }
+    if (!out_wanted_locked()) stop_out_locked(); /* kept alive: it plays silence on */
     pthread_mutex_unlock(&audio_mu);
 }
 
@@ -244,6 +263,7 @@ void hv_audio_shutdown(void) {
     pthread_mutex_lock(&audio_mu);
     keepalive = 0; /* no silent unit keeps the app alive with no machine running */
     guest_out = guest_in = 0;
+    machine_paused = 0;
     capture_paused = 0;
     dispose_out_locked();
     dispose_in_locked();
@@ -254,18 +274,27 @@ int hv_audio_set_keepalive(int on) {
     pthread_mutex_lock(&audio_mu);
     keepalive = on != 0;
     int rc = 0;
-    if (keepalive) {
-        if (!attached_hda) rc = -1;
-        else if (hda_out_unit) rc = ensure_out_locked(attached_hda, hda_out_ch, hda_out_rate);
-        else rc = ensure_out_locked(attached_hda, 2, 48000);
-    } else if (!guest_out && hda_out_unit && hda_out_running) {
-        AudioOutputUnitStop(hda_out_unit);
-        hda_out_running = 0;
-    }
+    if (keepalive && !attached_hda) rc = -1;
+    else if (out_wanted_locked()) rc = start_wanted_locked();
+    else stop_out_locked();
+    int running = hda_out_running, paused = machine_paused;
+    pthread_mutex_unlock(&audio_mu);
+    fprintf(stderr, "winvm: audio: keep-alive %s (output %s%s)\n", on ? "on" : "off", running ? "running" : "stopped",
+            paused ? ", machine paused" : "");
+    return rc;
+}
+
+void hv_audio_set_machine_paused(int paused) {
+    pthread_mutex_lock(&audio_mu);
+    int was = machine_paused, rc = 0;
+    machine_paused = paused != 0;
+    if (machine_paused) stop_out_locked();
+    else if (out_wanted_locked()) rc = start_wanted_locked();
     int running = hda_out_running;
     pthread_mutex_unlock(&audio_mu);
-    fprintf(stderr, "winvm: audio: keep-alive %s (output %s)\n", on ? "on" : "off", running ? "running" : "stopped");
-    return rc;
+    if (was != machine_paused)
+        fprintf(stderr, "winvm: audio: machine %s: output %s%s\n", machine_paused ? "paused" : "resumed",
+                running ? "running" : "stopped", rc ? " (could not start it)" : "");
 }
 
 int hv_audio_keepalive(void) {
@@ -282,13 +311,14 @@ int hv_audio_restart_output(int recreate) {
         /* after a media services reset every unit is invalid: made again from scratch */
         unsigned ch = hda_out_unit ? hda_out_ch : 2, rate = hda_out_unit ? hda_out_rate : 48000;
         dispose_out_locked();
-        if ((keepalive || guest_out) && attached_hda) rc = ensure_out_locked(attached_hda, ch, rate);
-    } else if (hda_out_unit && (keepalive || guest_out)) {
+        if (guest_out) ch = guest_out_ch, rate = guest_out_rate;
+        if (out_wanted_locked() && attached_hda) rc = ensure_out_locked(attached_hda, ch, rate);
+    } else if (hda_out_unit && out_wanted_locked()) {
         /* an interruption stopped it behind our back: start it again (starting a running unit does nothing) */
         rc = AudioOutputUnitStart(hda_out_unit) == noErr ? 0 : -1;
         hda_out_running = rc == 0;
-    } else if (keepalive && attached_hda) {
-        rc = ensure_out_locked(attached_hda, 2, 48000);
+    } else if (out_wanted_locked() && attached_hda) {
+        rc = start_wanted_locked();
     }
     int running = hda_out_running;
     pthread_mutex_unlock(&audio_mu);

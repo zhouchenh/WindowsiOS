@@ -450,7 +450,7 @@ static int scenario_rules(void) {
     check("saved forward listening on 127.0.0.1 and [::1]", wait_for("saved", what, 3000));
     check("saved forward: IPv4 and IPv6 each listening",
           has("saved", "\"ipv4\":{\"state\":\"listening\",\"message\":\"\"},\"ipv6\":{\"state\":\"listening\""));
-    check("saved forward: IPv6 global addresses on by default", has("saved", "\"ipv6Global\":true"));
+    check("saved forward from before the choice (no ipv6Global): global IPv6 stays off", has("saved", "\"ipv6Global\":false"));
     check("saved forward: TCP over IPv4", tcp_echo("127.0.0.1", p_saved));
     check("saved forward: TCP over IPv6", tcp_echo("::1", p_saved));
 
@@ -576,6 +576,22 @@ static int scenario_rules(void) {
     check("... and opened once it is free", wait_for("busy", "\"state\":\"listening\"", 6000));
     check("... and works", tcp_echo("127.0.0.1", p_busy));
 
+    /* An IPv6 address that failed while IPv4 opened: the forward listens, and the timer tries the IPv6 relay again
+       (as for an address still tentative when the forward opened). */
+    int p_half = free_port();
+    sl = make_addr(&ss, "::1", p_half);
+    int holder6 = socket(AF_INET6, SOCK_STREAM, 0);
+    if (bind(holder6, (struct sockaddr *)&ss, sl) || listen(holder6, 1)) exit(2);
+    put(rule("half", HV_FWD_TCP, p_half, 7, HV_FWD_LOOPBACK));
+    check("IPv6 relay in use: IPv4 listens, IPv6 says so",
+          wait_for("half", "\"ipv6\":{\"state\":\"error\"", 2000) && has("half", "\"state\":\"listening\"") &&
+              tcp_echo("127.0.0.1", p_half));
+    close(holder6);
+    check("... the IPv6 relay opens once the address is free (periodic retry)",
+          wait_for("half", "\"ipv6\":{\"state\":\"listening\"", 6000));
+    check("... and works over both", tcp_echo("::1", p_half) && tcp_echo("127.0.0.1", p_half));
+    hv_net_fwd_remove("half", 0);
+
     /* Opened again (as after the app comes back from the background): still working. */
     hv_net_fwd_reopen();
     check("reopen: synced", hv_net_fwd_sync(3000) == 0);
@@ -634,6 +650,11 @@ static int scenario_rules(void) {
                                                   strstr(text, "\"id\": \"busy\"") && strstr(text, "\"id\": \"vpn\""));
         check("store: TCP+UDP and the scope", strstr(text, "\"protocol\": \"tcp+udp\"") && strstr(text, "\"scope\": \"lan\""));
         check("store: a forward without global IPv6 says so", strstr(text, "\"ipv6Global\": false") != NULL);
+        check("store: a forward with global IPv6 says so too (always written)", strstr(text, "\"ipv6Global\": true") != NULL);
+        const char *sv = strstr(text, "\"id\": \"saved\"");
+        const char *sv_end = sv ? strchr(sv, '}') : NULL;
+        const char *sv_g6 = sv ? strstr(sv, "\"ipv6Global\": false") : NULL;
+        check("store: the old rule is written with global IPv6 off", sv && sv_end && sv_g6 && sv_g6 < sv_end);
         check("store: the turned-off one is kept, off", strstr(text, "\"id\": \"both\"") && strstr(text, "\"enabled\": false"));
         check("store: removed and session forwards are not", !strstr(text, "\"id\": \"udp\"") && !strstr(text, "session-"));
         check("store: the name kept as UTF-8", strstr(text, "Saved \xc3\xa9") != NULL);

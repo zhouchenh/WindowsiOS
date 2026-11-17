@@ -188,7 +188,7 @@ struct SessionView: View {
 
             // Server mode, headless: the card covers the Windows view, which stays in place at its size (so Windows
             // keeps its resolution) with its Metal layer unbound (the bridge's headless).
-            if vm.isVMRunning && server.enabled && server.headless {
+            if vm.isVMRunning && server.headlessActive { // never for Linux (no server mode there)
                 HeadlessCard()
                     .frame(width: canvas.visibleRect.width, height: canvas.visibleRect.height)
                     .offset(x: canvas.visibleRect.minX, y: canvas.visibleRect.minY)

@@ -40,11 +40,13 @@ final class ServerModeController: ObservableObject {
     @Published var headless: Bool = UserDefaults.standard.bool(forKey: "winios.serverHeadless") {
         didSet { UserDefaults.standard.set(headless, forKey: "winios.serverHeadless"); applyToBridge() }
     }
-    /// Off by default in server mode: the locked phone is just "the background", where Windows keeps running.
+    /// Off by default in server mode: the locked phone is just "the background", where Windows keeps running. The
+    /// screen stays on anyway while Windows could not run in the background (the bridge's applyIdleTimer).
     @Published var keepScreenOn: Bool = UserDefaults.standard.bool(forKey: "winios.serverKeepScreenOn") {
         didSet { UserDefaults.standard.set(keepScreenOn, forKey: "winios.serverKeepScreenOn"); applyToBridge() }
     }
-    /// Switch back to 3D by itself when the app comes back to the front (after this session's switch to 2D).
+    /// Switch back to 3D by itself when the app comes back to the front from the background (after this session's
+    /// switch to 2D).
     @Published var autoBackTo3D: Bool = UserDefaults.standard.bool(forKey: "winios.serverAuto3D") {
         didSet { UserDefaults.standard.set(autoBackTo3D, forKey: "winios.serverAuto3D") }
     }
@@ -61,11 +63,20 @@ final class ServerModeController: ObservableObject {
     @Published private(set) var graphics = WinIOSGraphicsMode()
     @Published private(set) var guardPaused = false
     @Published private(set) var guardReason = ""
+    /// The guard's condition holds now (critical temperature or battery): why, else empty. In the foreground it is
+    /// only shown; the pause itself happens in the background.
+    @Published private(set) var guardWarning = ""
+    /// The user resumed Windows from the guard: no pause again until conditions are back to normal.
+    @Published private(set) var resumedByUser = false
+    /// Seconds a graphics switch has waited while Windows ran (time paused does not count).
+    @Published private(set) var switchElapsed = 0
     @Published private(set) var audioRunning = false
     @Published private(set) var graphicsPhase: GraphicsSwitchPhase = .idle
     @Published private(set) var runningSince: Date?
     /// This session switched to 2D (what "back to 3D" undoes).
     private(set) var switchedTo2D = false
+    /// The app really went to the background since that switch (not just a trip to Control Center or an alert).
+    private var backgroundSince2D = false
 
     private var bridge: WinIOSBridge { WinIOSBridge.shared }
     private var timer: Timer?
@@ -73,12 +84,20 @@ final class ServerModeController: ObservableObject {
     private var thermalSink: AnyCancellable?
     private var switchSeq: Int64 = 0
     private var switchFrom = WinIOSGraphicsMode()
-    private var guestAnsweredAt: Date?
+    private var switchTo3D = false
+    private var switchRunSecs: Double = 0     // time the guest ran since the request
+    private var guestAnsweredRun: Double?     // switchRunSecs when Windows answered
+    private var lastTick = Date()
+    /// The switch timed out: a late success still turns into done.
+    private var lateWatch = false
 
     private init() {
         let nc = NotificationCenter.default
         observers.append(nc.addObserver(forName: UIApplication.didBecomeActiveNotification, object: nil, queue: .main) { _ in
             Task { @MainActor in ServerModeController.shared.appBecameActive() }
+        })
+        observers.append(nc.addObserver(forName: UIApplication.didEnterBackgroundNotification, object: nil, queue: .main) { _ in
+            Task { @MainActor in ServerModeController.shared.appEnteredBackground() }
         })
         observers.append(nc.addObserver(forName: UIDevice.batteryLevelDidChangeNotification, object: nil, queue: .main) { _ in
             Task { @MainActor in ServerModeController.shared.checkGuard() }
@@ -92,17 +111,23 @@ final class ServerModeController: ObservableObject {
     }
 
     /// Pushes the settings to the bridge (also before Windows starts).
+    /// Also when the machine changes: Linux has no server mode and no headless.
     func applyToBridge() {
         let b = bridge
-        b.runInBackground = enabled
-        b.audioKeepAlive = enabled
-        b.keepScreenOn = !enabled || keepScreenOn
-        b.headless = enabled && headless
-        if enabled { UIDevice.current.isBatteryMonitoringEnabled = true }
+        let on = enabled && !isLinux
+        b.runInBackground = on
+        b.audioKeepAlive = on
+        b.keepScreenOn = keepScreenOn // and on anyway while Windows could not run in the background (the bridge)
+        b.headless = on && headless
+        if on { UIDevice.current.isBatteryMonitoringEnabled = true }
+        if !on && b.guardPaused { b.setGuardPaused(false, reason: "server mode off") } // its guard goes with it
+        if !on { resumedByUser = false; guardWarning = "" }
         refresh()
     }
 
-    var headlessActive: Bool { enabled && headless && bridge.isVMRunning }
+    /// The Arch Linux machine (always 3D): no server mode, no headless.
+    var isLinux: Bool { UserDefaults.standard.string(forKey: "winios.machine") == "Arch" }
+    var headlessActive: Bool { enabled && headless && !isLinux && bridge.isVMRunning }
     var isVMRunning: Bool { bridge.isVMRunning }
     var isLiveContainer: Bool { getenv("LC_HOME_PATH") != nil }
 
@@ -110,9 +135,16 @@ final class ServerModeController: ObservableObject {
         let b = bridge
         let running = b.isVMRunning
         if running && runningSince == nil { runningSince = Date() }
-        if !running { runningSince = nil; if graphicsPhase.busy { graphicsPhase = .idle } }
+        if !running {
+            runningSince = nil
+            lateWatch = false
+            if graphicsPhase.busy { graphicsPhase = .idle }
+        }
         let bl = b.backgroundBlocker
-        if bl != blocker { blocker = bl }
+        if bl != blocker {
+            blocker = bl
+            b.updateIdleTimer() // e.g. a switch finished: the screen may lock now (or must stay on)
+        }
         let g = b.graphicsMode()
         if !Self.same(g, graphics) { graphics = g }
         if b.guardPaused != guardPaused { guardPaused = b.guardPaused }
@@ -126,8 +158,17 @@ final class ServerModeController: ObservableObject {
     }
 
     private func tick() {
+        let now = Date()
+        // a switch waits only while Windows runs: time paused (in the background or by the guard) does not count, nor
+        // time the app was suspended (no ticks then: a gap counts as one tick at most)
+        if graphicsPhase.busy && bridge.isVMRunning && !bridge.machinePaused {
+            switchRunSecs += min(max(now.timeIntervalSince(lastTick), 0), 1.5)
+            let e = Int(switchRunSecs.rounded())
+            if e != switchElapsed { switchElapsed = e }
+        }
+        lastTick = now
         refresh()
-        if graphicsPhase.busy { pollSwitch() }
+        if graphicsPhase.busy || lateWatch { pollSwitch() }
         if enabled { checkGuard() }
     }
 
@@ -136,6 +177,12 @@ final class ServerModeController: ObservableObject {
     var statusText: String {
         if !bridge.isVMRunning { return L("Windows 没有在运行", "Windows is not running") }
         if guardPaused { return L("已暂停：", "Paused: ") + guardReason }
+        if enabled && !guardWarning.isEmpty {
+            return resumedByUser
+                ? L("\(guardWarning)：你选择了继续运行，到后台也不会暂停，直到情况恢复正常。",
+                    "\(guardWarning): you resumed Windows, so it is not paused in the background until conditions are back to normal.")
+                : L("\(guardWarning)：App 到后台时 Windows 会暂停。", "\(guardWarning): Windows pauses when the app goes to the background.")
+        }
         switch blocker {
         case .nothing:
             return enabled ? L("App 到后台后 Windows 继续运行", "Windows keeps running when the app is in the background")
@@ -160,26 +207,38 @@ final class ServerModeController: ObservableObject {
         return d.batteryState == .unplugged && d.batteryLevel >= 0 && d.batteryLevel <= 0.05
     }
 
+    /// The guard is for server mode's background running: it pauses Windows only while the app is in the
+    /// background. In the foreground it only shows the state (statusText); a pause from the background stays until
+    /// conditions are back to normal with the app in front, or the user resumes, which sticks until then.
     func checkGuard() {
-        guard enabled, bridge.isVMRunning else { return }
+        guard enabled, !isLinux, bridge.isVMRunning else { return }
         let thermal = DeviceStatus.shared.thermalState
         let hot = thermal == .critical
         let empty = batteryCritical()
-        if !bridge.guardPaused && (hot || empty) {
-            guardReason = hot ? L("设备严重过热", "the device is critically hot")
-                              : L("电池电量严重不足", "the battery is critically low")
-            bridge.setGuardPaused(true, reason: guardReason)
+        let reason = hot ? L("设备严重过热", "The device is critically hot")
+                   : empty ? L("电池电量严重不足", "The battery is critically low") : ""
+        if reason != guardWarning { guardWarning = reason }
+        let normal = !hot && thermal != .serious && !empty
+        if normal && resumedByUser { resumedByUser = false }
+        let state = UIApplication.shared.applicationState
+        if !bridge.guardPaused && !reason.isEmpty && state == .background && !resumedByUser {
+            guardReason = reason
+            bridge.setGuardPaused(true, reason: reason)
             notify(L("Windows 已暂停", "Windows paused"),
-                   body: L("服务器模式：\(guardReason)。打开 App 后可以继续。", "Server mode: \(guardReason). Open the app to resume it."))
-        } else if bridge.guardPaused && !hot && thermal != .serious && !empty && UIApplication.shared.applicationState == .active {
+                   body: L("服务器模式：\(reason)。打开 App：情况恢复正常后自动继续，也可以点“继续运行 Windows”。",
+                           "Server mode: \(reason). Open the app: Windows resumes by itself once conditions are back to normal, or tap Resume Windows."))
+        } else if bridge.guardPaused && normal && state == .active {
             // cooled down (or charging) and the app is in front: on again by itself
             bridge.setGuardPaused(false, reason: "conditions back to normal")
         }
         refresh()
     }
 
+    /// Sticks: the guard does not pause Windows again until conditions are back to normal.
     func resumeFromGuard() {
-        bridge.setGuardPaused(false, reason: "resumed by the user")
+        resumedByUser = !guardWarning.isEmpty
+        bridge.setGuardPaused(false, reason: resumedByUser ? "resumed by the user (the guard holds off until conditions are normal)"
+                                                         : "resumed by the user")
         refresh()
     }
 
@@ -205,8 +264,12 @@ final class ServerModeController: ObservableObject {
             return
         }
         switchSeq = seq
-        guestAnsweredAt = nil
-        if !to3D { switchedTo2D = true }
+        switchTo3D = to3D
+        switchRunSecs = 0
+        switchElapsed = 0
+        guestAnsweredRun = nil
+        lateWatch = false
+        if !to3D { switchedTo2D = true; backgroundSince2D = false }
         graphicsPhase = .waiting(to3D: to3D, started: Date(), guestAnswered: false)
         UIImpactFeedbackGenerator(style: .light).impactOccurred()
     }
@@ -218,6 +281,8 @@ final class ServerModeController: ObservableObject {
             return (why as String?) ?? ""
         }
         switchedTo2D = true
+        backgroundSince2D = false
+        lateWatch = false
         refresh()
         if bridge.requestWindowsRestart() {
             return L("Windows 正在重启，回来时不带 3D（直到 App 关闭；3D 设置本身保持打开）。",
@@ -247,15 +312,29 @@ final class ServerModeController: ObservableObject {
     }
 
     private func pollSwitch() {
-        guard case let .waiting(to3D, started, answered) = graphicsPhase else { return }
+        let to3D = switchTo3D
+        var answered = true
+        if case let .waiting(_, _, a) = graphicsPhase { answered = a } else if !lateWatch { return }
         let g = bridge.graphicsMode()
         let report = guestReport()
         let acked = report["seq"] == String(switchSeq)
-        if acked && guestAnsweredAt == nil { guestAnsweredAt = Date() }
-        if acked && !answered { graphicsPhase = .waiting(to3D: to3D, started: started, guestAnswered: true) }
+        if acked && guestAnsweredRun == nil { guestAnsweredRun = switchRunSecs }
+        if acked && !answered, case let .waiting(t, started, _) = graphicsPhase {
+            graphicsPhase = .waiting(to3D: t, started: started, guestAnswered: true)
+        }
         let hostDone = g.resets > switchFrom.resets && g.driverOK && g.negotiated3D == to3D
         let mode = to3D ? "3D" : "2D"
-        let secs = Int(Date().timeIntervalSince(started).rounded())
+        let secs = Int(switchRunSecs.rounded())
+        if lateWatch {
+            // after a timeout only a late success changes what is shown
+            if hostDone {
+                lateWatch = false
+                graphicsPhase = .done(L("Windows 现在是 \(mode) 了（比预期晚）。", "Windows is on \(mode) now (later than expected)."))
+                UINotificationFeedbackGenerator().notificationOccurred(.success)
+                refresh()
+            }
+            return
+        }
         if hostDone && (acked || secs > 20) {
             graphicsPhase = .done(L("Windows 现在是 \(mode)（显卡重启用了 \(secs) 秒，没有重启 Windows）。",
                                     "Windows is on \(mode) now (its display adapter restarted in \(secs) s; Windows did not restart)."))
@@ -276,7 +355,7 @@ final class ServerModeController: ObservableObject {
             refresh()
             return
         }
-        if acked, let at = guestAnsweredAt, Date().timeIntervalSince(at) > 15 {
+        if acked, let at = guestAnsweredRun, switchRunSecs - at > 15 {
             let status = report["status"] ?? "?"
             let problem = report["problem"] ?? "0"
             let name = report["name"] ?? L("显卡", "the display adapter")
@@ -290,18 +369,36 @@ final class ServerModeController: ObservableObject {
         }
         if secs > 60 {
             graphicsPhase = .failed(acked
-                ? L("Windows 应答了，但显卡 60 秒内没有以 \(mode) 启动。可以再试一次。", "Windows answered, but its display adapter did not start on \(mode) within 60 s. You can try again.")
-                : L("Windows 60 秒内没有应答。WinKit 的显卡切换任务可能还没装：在 Windows 里运行一次 START.bat。显卡设备从现在起提供 \(mode)：Windows 重启显卡或重启后生效。",
-                    "Windows did not answer within 60 s. WinKit's graphics task may be missing: run START.bat in Windows once. The display device offers \(mode) from now on: it applies when Windows restarts its display adapter, or restarts."))
+                ? L("Windows 应答了，但显卡在它运行的 60 秒内没有以 \(mode) 启动。可以再试一次；之后如果成功了，这里会更新。",
+                    "Windows answered, but its display adapter did not start on \(mode) within 60 s of Windows running. You can try again; if it still succeeds later, this updates.")
+                : L("Windows 在运行的 60 秒内没有应答。WinKit 的显卡切换任务可能还没装：在 Windows 里运行一次 START.bat。显卡设备从现在起提供 \(mode)：Windows 重启显卡或重启后生效；之后如果成功了，这里会更新。",
+                    "Windows did not answer within 60 s of running. WinKit's graphics task may be missing: run START.bat in Windows once. The display device offers \(mode) from now on: it applies when Windows restarts its display adapter, or restarts; if it still succeeds later, this updates."))
+            lateWatch = true // a late success still reports done
             refresh()
         }
+    }
+
+    private func appEnteredBackground() {
+        if switchedTo2D { backgroundSince2D = true }
+        refresh()
+        if enabled && !isLinux && bridge.isVMRunning && (graphicsPhase.busy || blocker == .switchPending) {
+            // the bridge has paused Windows (and logged why): the switch goes on when the app is back
+            FileHandle.standardError.write(Data("winvm: server mode: in the background with the graphics switch pending: Windows paused until the app is back\n".utf8))
+            notify(L("Windows 已暂停", "Windows paused"),
+                   body: L("切到 2D 还没完成，所以 Windows 在后台暂停了。打开 App 让它完成，之后就能在后台运行。",
+                           "The switch to 2D was not finished, so Windows is paused in the background. Open the app to let it finish; then it can run in the background."))
+        }
+        checkGuard() // a critical state pauses Windows now that the app is away
     }
 
     private func appBecameActive() {
         checkGuard() // cooled down meanwhile: on again
         refresh()
-        // optional: back to 3D once the app is in front again (only after this session's switch to 2D)
-        if enabled && autoBackTo3D && switchedTo2D && graphics.capable && !graphics.offered3D && !graphicsPhase.busy {
+        // optional: back to 3D once the app is in front again, only after this session's switch to 2D and a real
+        // trip to the background since (not Control Center, a banner or an alert: those only make the app inactive)
+        let wasAway = backgroundSince2D
+        backgroundSince2D = false
+        if enabled && autoBackTo3D && switchedTo2D && wasAway && graphics.capable && !graphics.offered3D && !graphicsPhase.busy {
             DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) { [weak self] in
                 guard let self, UIApplication.shared.applicationState == .active else { return }
                 self.switchGraphics(to3D: true)
@@ -410,6 +507,7 @@ struct ServerModeSection: View {
     @ObservedObject private var status = DeviceStatus.shared
     @StateObject private var forwards = PortForwardingModel()
     @State private var scope: ForwardScope = .vpn
+    @State private var ipv6Global = ForwardScope.vpn.defaultIPv6Global
     @State private var addError: String?
     @State private var jobNote: String?
     @State private var fallbackNote: String?
@@ -423,6 +521,23 @@ struct ServerModeSection: View {
     }
 
     var body: some View {
+        if server.isLinux {
+            // Arch Linux always runs host 3D: no server mode, no headless (and no Remote Desktop)
+            Section {
+                Text(L("Arch Linux 一直用主机 3D：没有服务器模式和无画面模式。App 到后台时 Linux 会暂停。",
+                       "Arch Linux always uses host 3D: there is no server mode or headless mode. Linux pauses when the app goes to the background."))
+                    .font(.footnote)
+                    .foregroundStyle(.secondary)
+            } header: {
+                Text(L("服务器模式", "Server mode"))
+            }
+        } else {
+            windowsBody
+        }
+    }
+
+    @ViewBuilder
+    private var windowsBody: some View {
         Section {
             Toggle(isOn: $server.enabled) {
                 VStack(alignment: .leading, spacing: 2) {
@@ -456,8 +571,8 @@ struct ServerModeSection: View {
         } header: {
             Text(L("服务器模式", "Server mode"))
         } footer: {
-            Text(L("打开后，没有主机 3D 时 App 到后台（或锁屏）Windows 继续运行：远程桌面和端口转发照常应答。靠持续播放静音让 iOS 不挂起 App。耗电、发热；建议接上电源。设备严重过热或电量严重不足时会暂停 Windows 并发通知；低电量模式在上面显示。",
-                   "On: without host 3D, Windows keeps running while the app is in the background or the phone is locked, and Remote Desktop and port forwards keep answering. iOS keeps the app running because it keeps playing silence. It uses power and heat; keep the phone charging. At a critical temperature or a critically low battery Windows is paused and you get a notification; Low Power Mode is shown above."))
+            Text(L("打开后，没有主机 3D 时 App 到后台（或锁屏）Windows 继续运行：远程桌面和端口转发照常应答。靠持续播放静音让 iOS 不挂起 App。耗电、发热；建议接上电源。在后台时，设备严重过热或电量严重不足会暂停 Windows 并发通知（在前台只显示状态）；低电量模式在上面显示。Windows 不能在后台运行时（用着主机 3D 等），屏幕保持常亮。",
+                   "On: without host 3D, Windows keeps running while the app is in the background or the phone is locked, and Remote Desktop and port forwards keep answering. iOS keeps the app running because it keeps playing silence. It uses power and heat; keep the phone charging. In the background, a critical temperature or a critically low battery pauses Windows and you get a notification (in the front it is only shown); Low Power Mode is shown above. While Windows could not run in the background (host 3D and so on), the screen stays on."))
         }
 
         GraphicsSwitchSection()
@@ -518,13 +633,17 @@ struct ServerModeSection: View {
                     }
                 }
                 AddressRows(lan: forwards.lan, vpn: forwards.vpn, showLAN: rule.scope == "lan", showVPN: rule.scope == "vpn",
-                            showGlobal6: rule.ipv6Global ?? true, port: rule.hostPort, showLoopback: true,
+                            showGlobal6: rule.ipv6Global ?? false, showVPNGlobal6: rule.ipv6Global ?? false,
+                            port: rule.hostPort, showLoopback: true,
                             title: L("远程桌面连接到", "Connect Remote Desktop to"))
                 testRows(rule)
             } else {
                 Picker(L("谁能连接", "Who can connect"), selection: $scope) {
                     ForEach(ForwardScope.allCases) { Text($0.title).tag($0) }
                 }
+                .onChange(of: scope) { _, s in ipv6Global = s.defaultIPv6Global }
+                Text(scope.detail(global6: ipv6Global)).font(.footnote).foregroundStyle(.secondary)
+                ForwardScopeExtras(scope: scope, ipv6Global: $ipv6Global)
                 Button(L("添加远程桌面转发", "Add a Remote Desktop forward"), systemImage: "plus.circle") { addForward() }
                 if let addError { Text(addError).font(.footnote).foregroundStyle(.red) }
             }
@@ -600,6 +719,7 @@ struct ServerModeSection: View {
         var d = PortForwardDraft(name: preset.name, proto: preset.proto, hostPort: preset.hostPort,
                                  guestPort: server.rdpGuestPort)
         d.scope = scope
+        d.ipv6Global = ipv6Global // shown with its warning above
         addError = forwards.save(d)
     }
 
@@ -640,7 +760,7 @@ struct GraphicsSwitchSection: View {
                     }
                     phaseRow
                     if server.enabled {
-                        Toggle(L("回到前台时自动切回 3D", "Back to 3D when the app returns to the front"), isOn: $server.autoBackTo3D)
+                        Toggle(L("从后台回到前台时自动切回 3D", "Back to 3D when the app returns from the background"), isOn: $server.autoBackTo3D)
                     }
                 } else {
                     Text(L("这次 Windows 启动时没有开主机 3D，现在是 2D。要能随时切换：在“显示”里打开 3D 加速，重启一次 Windows。",
@@ -670,15 +790,15 @@ struct GraphicsSwitchSection: View {
         switch server.graphicsPhase {
         case .idle:
             EmptyView()
-        case let .waiting(to3D, started, answered):
+        case let .waiting(to3D, _, answered):
             HStack(spacing: 8) {
                 ProgressView()
-                TimelineView(.periodic(from: started, by: 1)) { ctx in
-                    Text((answered ? L("Windows 正在重启显卡", "Windows is restarting its display adapter")
-                                   : L("等 Windows 应答", "Waiting for Windows")) +
-                         " → \(to3D ? "3D" : "2D") · \(Int(ctx.date.timeIntervalSince(started)))s")
-                        .font(.footnote)
-                }
+                // the time Windows ran since the request (paused time does not count)
+                Text((answered ? L("Windows 正在重启显卡", "Windows is restarting its display adapter")
+                               : L("等 Windows 应答", "Waiting for Windows")) +
+                     " → \(to3D ? "3D" : "2D") · \(server.switchElapsed)s" +
+                     (server.isVMRunning && WinIOSBridge.shared.machinePaused ? L("（已暂停）", " (paused)") : ""))
+                    .font(.footnote)
             }
         case .done(let t):
             Label(t, systemImage: "checkmark.circle.fill").font(.footnote).foregroundStyle(.green)
@@ -762,24 +882,31 @@ struct ServerModeMenuItems: View {
     let isLinux: Bool
 
     var body: some View {
-        Section(L("服务器", "Server")) {
-            Toggle(L("服务器模式", "Server mode"), systemImage: "server.rack", isOn: $server.enabled)
-            if server.enabled {
-                Toggle(L("无画面", "Headless"), systemImage: "rectangle.slash", isOn: $server.headless)
+        if !isLinux { // Arch Linux always runs host 3D: no server mode, no headless, no graphics switch
+            Section(L("服务器", "Server")) {
+                items
             }
-            if !isLinux && server.isVMRunning && server.graphics.capable {
-                Picker(selection: Binding(
-                    get: { server.graphics.offered3D },
-                    set: { server.switchGraphics(to3D: $0) }
-                )) {
-                    Text("3D").tag(true)
-                    Text("2D").tag(false)
-                } label: {
-                    Label(L("图形：", "Graphics: ") + (server.graphics.offered3D ? "3D" : "2D"), systemImage: "cube")
-                }
-                .pickerStyle(.menu)
-                .disabled(server.graphicsPhase.busy)
+        }
+    }
+
+    @ViewBuilder
+    private var items: some View {
+        Toggle(L("服务器模式", "Server mode"), systemImage: "server.rack", isOn: $server.enabled)
+        if server.enabled {
+            Toggle(L("无画面", "Headless"), systemImage: "rectangle.slash", isOn: $server.headless)
+        }
+        if server.isVMRunning && server.graphics.capable {
+            Picker(selection: Binding(
+                get: { server.graphics.offered3D },
+                set: { server.switchGraphics(to3D: $0) }
+            )) {
+                Text("3D").tag(true)
+                Text("2D").tag(false)
+            } label: {
+                Label(L("图形：", "Graphics: ") + (server.graphics.offered3D ? "3D" : "2D"), systemImage: "cube")
             }
+            .pickerStyle(.menu)
+            .disabled(server.graphicsPhase.busy)
         }
     }
 }

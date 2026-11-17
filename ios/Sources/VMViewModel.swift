@@ -164,7 +164,10 @@ final class VMViewModel: ObservableObject {
     /// (needs the WinKit hook inside Windows); the on-screen keyboard opens by itself.
     /// The machine the launch page starts: "Win11" or "Arch" (Arch Linux ARM). Each has its own folder.
     @Published var machine: String = UserDefaults.standard.string(forKey: "winios.machine") ?? "Win11" {
-        didSet { UserDefaults.standard.set(machine, forKey: "winios.machine") }
+        didSet {
+            UserDefaults.standard.set(machine, forKey: "winios.machine")
+            ServerModeController.shared.applyToBridge() // Linux has no server mode and no headless
+        }
     }
     var isLinux: Bool { machine == "Arch" }
     var machineTitle: String { isLinux ? "Arch Linux" : "Windows 11" }

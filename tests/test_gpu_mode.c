@@ -213,8 +213,40 @@ static void override_ownership(void) {
     check("another scanout (the 2D driver's) stays", fb.ovr_host == theirs && fb.ovr_width == 2 && fb.ovr_serial == serial);
 }
 
+/* virtio_gpu3d.c's driver reset: virgl_renderer_reset (Metal work) runs only for a renderer that did something since
+   its last reset. A 2D driver's resets (which may come with the app in the background) never reach the renderer. */
+static void renderer_reset_plan(void) {
+    HvVgpu3dUse u;
+    memset(&u, 0, sizeof u);
+    check("reset plan: a fresh renderer (boot, the firmware's reset) is not reset", !hv_vgpu3d_reset_needed(&u));
+    /* the OS's 3D driver works: commands, contexts, resources, a scanout, a parked fence */
+    u.used = 1, u.live_ctxs = 2, u.resources = 40, u.scanout = 7, u.parked = 1;
+    check("reset plan: after 3D use the switch's reset runs", hv_vgpu3d_reset_needed(&u));
+    /* the reset ran: everything went, and the flag was cleared */
+    memset(&u, 0, sizeof u);
+    for (int i = 0; i < 4; i++) /* the 2D driver's resets: Windows restarts, Windows Update, a TDR, the firmware */
+        check("reset plan: 2D-only resets after it are skipped", !hv_vgpu3d_reset_needed(&u));
+    HvVgpu3dUse one;
+    memset(&one, 0, sizeof one);
+    one.used = 1;
+    check("reset plan: a command alone (e.g. a context that failed) is enough", hv_vgpu3d_reset_needed(&one));
+    memset(&one, 0, sizeof one);
+    one.live_ctxs = 1;
+    check("reset plan: a live context alone", hv_vgpu3d_reset_needed(&one));
+    memset(&one, 0, sizeof one);
+    one.resources = 1;
+    check("reset plan: a resource alone", hv_vgpu3d_reset_needed(&one));
+    memset(&one, 0, sizeof one);
+    one.scanout = 1;
+    check("reset plan: a scanout alone", hv_vgpu3d_reset_needed(&one));
+    memset(&one, 0, sizeof one);
+    one.parked = 1;
+    check("reset plan: a parked fence alone", hv_vgpu3d_reset_needed(&one));
+}
+
 int main(void) {
     with_renderer();
+    renderer_reset_plan();
     without_renderer();
     override_ownership();
     printf("gpu mode: %s (%d failures)\n", failures ? "FAILED" : "ok", failures);
