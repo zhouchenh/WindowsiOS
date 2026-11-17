@@ -17,8 +17,12 @@ void hv_npt_cleanup_poll(void);
 void hv_npt_cleanup_describe(char *buffer, size_t length);
 
 /* Pause between backend calls when iOS disallows GPU work. An already entered
- * backend call cannot be cancelled. The five-second watchdog counts only time
- * allowed here; the waiting FIFO holds at most eight batches. */
+ * backend call cannot be cancelled. Independent workers serve registration
+ * batches and device retirement, so a blocked leftover Release cannot delay
+ * normal device retirement. The batch FIFO holds at most eight batches; its
+ * five-second watchdog counts allowed time after dequeue. Device counter
+ * waits remain retryable without an age/count limit. Only an entered native
+ * getter/finalizer has a five-second allowed-time watchdog. */
 void hv_npt_cleanup_set_active(int active);
 
 struct HvNptDeviceSnapshot {

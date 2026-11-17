@@ -36,7 +36,7 @@ static void await_value(_Atomic unsigned *p, unsigned value) {
 }
 static void await_idle(void) {
     for (unsigned i = 0; i < 3000; i++) {
-        enter(); int idle = !waiting && !current; leave();
+        enter(); int idle = !waiting && !current && !device_waiting && !device_current; leave();
         if (idle) return;
         pause_ms();
     }
@@ -50,7 +50,7 @@ struct FakeDevice {
     uint32_t pub, priv;
     _Atomic uint64_t main_goal, main_done, init_goal, init_done;
     _Atomic unsigned destroyed, event_entered, block_event, fail_event, fail_snapshot;
-    _Atomic unsigned destroy_entered, block_destroy, fail_destroy;
+    _Atomic unsigned destroy_entered, block_destroy, fail_destroy, transient_refs;
     FakeDevice *hidden;
 };
 _Static_assert(offsetof(FakeDevice, pub) == 8, "fake public counter");
@@ -94,6 +94,20 @@ static int fake_destroy(void *p) {
     atomic_fetch_add(&d->destroy_entered, 1);
     while (atomic_load(&d->block_destroy)) pause_ms();
     if (atomic_load(&d->fail_destroy)) return 0;
+    if (atomic_load(&d->transient_refs)) {
+        void *alias = NULL;
+        assert(hv_npt_device_addref(d) == 1);
+        assert(count_load(&d->priv) == NPT_PRIVATE_SENTINEL + 1);
+        assert(hv_npt_device_release(d) == 0);
+        assert(count_load(&d->priv) == NPT_PRIVATE_SENTINEL);
+        assert(!hv_npt_device_query_interface(d, NULL, &alias) && alias == d);
+        assert(count_load(&d->priv) == NPT_PRIVATE_SENTINEL + 1);
+        assert(hv_npt_device_release(d) == 0);
+        assert(count_load(&d->priv) == NPT_PRIVATE_SENTINEL);
+        assert(!hv_npt_device_query_interface(d, d, &alias));
+        assert(hv_npt_device_release(d) == 0);
+        assert(count_load(&d->priv) == NPT_PRIVATE_SENTINEL);
+    }
     if (d->hidden) hv_npt_device_release(d->hidden);
     atomic_fetch_add(&d->destroyed, 1);
     return 1;
@@ -163,17 +177,31 @@ static void delayed_main_and_initializer(void) {
     atomic_store(&d->init_done, 7); hv_npt_cleanup_poll();
     await_value(&d->destroyed, 1); await_idle();
 }
-static void failed_signal_retains(void) {
+static void long_counter_wait_remains_retryable(void) {
     setup(); FakeDevice *d = device();
+    atomic_store(&d->main_goal, 10); atomic_store(&d->main_done, 9);
     atomic_store(&d->init_goal, 1);
-    hv_npt_device_release(d); await_value(&d->event_entered, 1);
-    advance(NPT_TIMEOUT_NS); await_idle();
+    hv_npt_device_release(d);
+    for (int i = 0; i < 20; i++) pause_ms();
+    advance(UINT64_C(6000000000)); /* lifecycle gate intentionally unwired */
     assert(!atomic_load(&d->destroyed));
-    assert(count_load(&d->priv) == 1);
-    enter(); assert(quarantined_pins == 1); leave();
+    enter(); assert(!quarantined_pins); leave();
+    atomic_store(&d->main_done, 10); hv_npt_cleanup_poll();
+    await_value(&d->event_entered, 1);
+    /* Advance between getters: no single entered call is being stalled. */
+    int advanced = 0;
+    for (unsigned i = 0; i < 3000 && !advanced; i++) {
+        enter();
+        if (!device_current) { atomic_fetch_add(&fake_time, UINT64_C(6000000000)); advanced = 1; }
+        leave();
+        if (!advanced) pause_ms();
+    }
+    assert(advanced); hv_npt_cleanup_poll();
+    for (int i = 0; i < 20; i++) pause_ms();
+    enter(); assert(!quarantined_pins); leave();
+    assert(count_load(&d->priv) == 1 && !atomic_load(&d->destroyed));
     atomic_store(&d->init_done, 1); hv_npt_cleanup_poll();
-    for (int i = 0; i < 10; i++) pause_ms();
-    assert(!atomic_load(&d->destroyed));
+    await_value(&d->destroyed, 1); await_idle();
 }
 static void getter_error_retains(void) {
     setup(); FakeDevice *d = device();
@@ -216,7 +244,7 @@ static void blocked_getter_background(void) {
     atomic_store(&d->init_goal, 1); atomic_store(&d->init_done, 1); atomic_store(&d->block_event, 1);
     hv_npt_device_release(d); await_value(&d->event_entered, 1);
     hv_npt_cleanup_set_active(0); advance(NPT_TIMEOUT_NS * 100);
-    enter(); assert(current && !current->expired); leave();
+    enter(); assert(device_current && !device_current->expired); leave();
     hv_npt_cleanup_set_active(1); advance(NPT_TIMEOUT_NS);
     char text[512]; hv_npt_cleanup_describe(text, sizeof(text));
     assert(strstr(text, "initializer event value") && strstr(text, "device_pins=1"));
@@ -238,6 +266,23 @@ static void blocked_release_no_followup(void) {
     assert(atomic_load(&blocked->releases) == 1 && !atomic_load(&next->releases));
     enter(); assert(quarantined_refs == 1); leave();
 }
+static void blocked_batch_does_not_block_device(void) {
+    setup(); FakeObject *blocked = object(1, NULL);
+    atomic_store(&blocked->block, 1); submit(blocked, 1);
+    await_value(&blocked->entered, 1);
+    advance(NPT_TIMEOUT_NS);
+    FakeDevice *d = device(); hv_npt_device_release(d);
+    await_value(&d->destroyed, 1);
+    assert(!atomic_load(&blocked->releases));
+    enter(); assert(current && current->expired && !quarantined_pins); leave();
+    atomic_store(&blocked->block, 0); await_idle();
+}
+static void destructor_transient_references_do_not_enqueue(void) {
+    setup(); FakeDevice *d = device(); atomic_store(&d->transient_refs, 1);
+    hv_npt_device_release(d); await_value(&d->destroyed, 1); await_idle();
+    enter(); assert(next_id == 1 && !quarantined_pins && retired_devices == 1); leave();
+    assert(count_load(&d->pub) == 0 && count_load(&d->priv) == NPT_PRIVATE_SENTINEL);
+}
 static void destructor_outside_mutex(void) {
     setup(); FakeDevice *a = device(), *b = device();
     atomic_store(&a->block_destroy, 1);
@@ -246,7 +291,7 @@ static void destructor_outside_mutex(void) {
     assert(hv_npt_device_addref(b) == 2); assert(hv_npt_device_release(b) == 1);
     hv_npt_cleanup_set_active(0); advance(NPT_TIMEOUT_NS * 10);
     hv_npt_cleanup_set_active(1); advance(NPT_TIMEOUT_NS);
-    enter(); assert(current->destroying && !current->pin); leave();
+    enter(); assert(device_current->destroying && !device_current->pin); leave();
     atomic_store(&a->block_destroy, 0); await_value(&a->destroyed, 1); await_idle();
     enter(); assert(!quarantined_pins); leave();
     hv_npt_device_release(b); await_value(&b->destroyed, 1); await_idle();
@@ -264,32 +309,32 @@ static void queue_limits(void) {
     setup(); hv_npt_cleanup_set_active(0);
     FakeObject *o[NPT_BATCH_LIMIT + 1];
     for (unsigned i = 0; i <= NPT_BATCH_LIMIT; i++) { o[i] = object(1, NULL); submit(o[i], 1); }
-    FakeDevice *d[NPT_DEVICE_LIMIT + 1];
-    for (unsigned i = 0; i <= NPT_DEVICE_LIMIT; i++) { d[i] = device(); hv_npt_device_release(d[i]); }
-    enter(); assert(waiting_batches == NPT_BATCH_LIMIT && waiting_devices == NPT_DEVICE_LIMIT);
-    assert(quarantined_batches == 1 && quarantined_pins == 1); leave();
+    FakeDevice *d[81];
+    for (unsigned i = 0; i < 81; i++) { d[i] = device(); hv_npt_device_release(d[i]); }
+    enter(); assert(waiting_batches == NPT_BATCH_LIMIT && waiting_devices == 81);
+    assert(quarantined_batches == 1 && quarantined_pins == 0); leave();
     hv_npt_cleanup_set_active(1); await_idle();
-    assert(!atomic_load(&o[0]->releases) && !atomic_load(&d[0]->destroyed));
-    assert(atomic_load(&o[NPT_BATCH_LIMIT]->releases) && atomic_load(&d[NPT_DEVICE_LIMIT]->destroyed));
+    assert(!atomic_load(&o[0]->releases) && atomic_load(&d[0]->destroyed));
+    assert(atomic_load(&o[NPT_BATCH_LIMIT]->releases) && atomic_load(&d[80]->destroyed));
 }
-static void retry_obeys_queue_limit(void) {
+static void retry_does_not_evict_devices(void) {
     setup(); FakeDevice *pending = device();
     atomic_store(&pending->init_goal, 1); atomic_store(&pending->block_event, 1);
     hv_npt_device_release(pending); await_value(&pending->event_entered, 1);
     hv_npt_cleanup_set_active(0);
     FakeDevice *first = NULL;
-    for (unsigned i = 0; i < NPT_DEVICE_LIMIT; i++) {
+    for (unsigned i = 0; i < 80; i++) {
         FakeDevice *d = device(); if (!i) first = d; hv_npt_device_release(d);
     }
     atomic_store(&pending->block_event, 0);
     for (unsigned i = 0; i < 3000; i++) {
-        enter(); int requeued = current == NULL; leave();
+        enter(); int requeued = device_current == NULL; leave();
         if (requeued) break;
         pause_ms();
     }
-    enter(); assert(!current && waiting_devices == NPT_DEVICE_LIMIT && quarantined_pins == 1); leave();
+    enter(); assert(!device_current && waiting_devices == 81 && !quarantined_pins); leave();
     atomic_store(&pending->init_done, 1); hv_npt_cleanup_set_active(1); await_idle();
-    assert(atomic_load(&pending->destroyed) && !atomic_load(&first->destroyed));
+    assert(atomic_load(&pending->destroyed) && atomic_load(&first->destroyed));
 }
 static void allocation_failures(void) {
     setup(); FakeDevice *d = device(); atomic_store(&fail_alloc, 1);
@@ -302,8 +347,9 @@ static void allocation_failures(void) {
 static void thread_failure(void) {
     setup(); FakeDevice *d = device(); atomic_store(&fail_thread, 1);
     hv_npt_device_release(d);
-    enter(); assert(quarantined_pins == 1 && !worker_started); leave();
+    enter(); assert(!quarantined_pins && !device_worker_started && waiting_devices == 1); leave();
     assert(count_load(&d->priv) == 1 && !atomic_load(&d->destroyed));
+    hv_npt_cleanup_poll(); await_value(&d->destroyed, 1); await_idle();
 }
 static void unverified_and_malformed(void) {
     assert(hv_npt_cleanup_set_device_ops(&ops));
@@ -351,7 +397,7 @@ int main(void) {
     struct { const char *name; void (*run)(void); } cases[] = {
         {"hidden graph, aliases, registrations, tombstone", healthy_hidden_graph},
         {"main and initializer retire independently", delayed_main_and_initializer},
-        {"missing initializer signal quarantines", failed_signal_retains},
+        {"long main and initializer waits stay retryable", long_counter_wait_remains_retryable},
         {"initializer getter error quarantines", getter_error_retains},
         {"invalid native snapshot quarantines", invalid_snapshot_retains},
         {"QI resurrection during getter", resurrection_during_getter},
@@ -359,12 +405,14 @@ int main(void) {
         {"blocked getter watchdog pauses in background", blocked_getter_background},
         {"queued background time does not age", paused_queue_does_not_age},
         {"blocked Release stops subsequent calls", blocked_release_no_followup},
+        {"blocked batch does not block device retirement", blocked_batch_does_not_block_device},
+        {"destructor transient AddRef and QI do not enqueue", destructor_transient_references_do_not_enqueue},
         {"deleting destructor runs outside mutex", destructor_outside_mutex},
         {"failed finalizer retains sealed device", failed_finalizer_retains_sealed_device},
-        {"bounded batch and device queues", queue_limits},
-        {"retry keeps pending device queue bounded", retry_obeys_queue_limit},
+        {"bounded batch queue and retryable device backlog", queue_limits},
+        {"retry does not evict device backlog", retry_does_not_evict_devices},
         {"allocation failure retains refs", allocation_failures},
-        {"thread failure retains pin", thread_failure},
+        {"device thread creation failure is retryable", thread_failure},
         {"unverified backend cannot release", unverified_and_malformed},
         {"malformed registration remains retained", malformed_record_retains},
         {"backend TLS completion markers", thread_local_markers},

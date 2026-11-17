@@ -26,7 +26,6 @@
 #include <time.h>
 
 #define NPT_BATCH_LIMIT 8u
-#define NPT_DEVICE_LIMIT 64u
 #define NPT_TIMEOUT_NS UINT64_C(5000000000)
 #define NPT_PRIVATE_SENTINEL UINT32_C(0x80000000)
 #define NPT_LOG(...) do { fprintf(stderr, "winvm: 3d: Neptune cleanup: "); \
@@ -54,7 +53,7 @@ struct Job {
     NptRecord *records;
     void *device;
     uint64_t id, objects, refs, start, call_start, initializer_done;
-    int started, expired, pin, destroying, sealed;
+    int started, expired, pin, destroying, sealed, native_call;
     const char *reason, *call;
     struct HvNptDeviceSnapshot snapshot;
 };
@@ -68,10 +67,12 @@ static NptRecord *unbatched_quarantine;
 static uint64_t collecting_objects, collecting_refs;
 static unsigned collecting_batches;
 static Job *waiting, *waiting_tail, *current, *quarantine;
+static Job *device_waiting, *device_waiting_tail, *device_current;
 static unsigned waiting_batches, waiting_devices;
+static unsigned device_highwater;
 static uint64_t quarantined_batches, quarantined_objects, quarantined_refs;
 static uint64_t quarantined_pins, failed_finalizers, retired_devices, released_refs, next_id;
-static int allowed = 1, clock_started, worker_started, operations_started, backend_verified;
+static int allowed = 1, clock_started, worker_started, device_worker_started, operations_started, backend_verified;
 static uint64_t active_total, active_since;
 static struct HvNptDeviceOps device_ops;
 
@@ -106,12 +107,17 @@ static uint32_t count_load(uint32_t *p) { return __atomic_load_n(p, __ATOMIC_SEQ
 static const char *kind(Job *j) { return j->device ? "device" : "batch"; }
 
 static void expire_locked(Job *j) {
-    if (j && !j->expired && active_clock() - j->start >= NPT_TIMEOUT_NS) {
+    /* A device whose GPU counters are still pending must remain retryable,
+     * however long the wait (including an unwired lifecycle gate/suspension).
+     * Its watchdog applies only to one entered native call, never queue age. */
+    if (!j || (j->device && !j->native_call)) return;
+    uint64_t elapsed = active_clock() - (j->device ? j->call_start : j->start);
+    if (!j->expired && elapsed >= NPT_TIMEOUT_NS) {
         j->expired = 1;
         j->reason = "active-time deadline";
         NPT_LOG("%s %" PRIu64 " deadline: elapsed=%" PRIu64 "ms call=%s "
                 "refs=%" PRIu64 " pin=%d%s; entered call is not cancelled",
-                kind(j), j->id, (active_clock() - j->start) / UINT64_C(1000000),
+                kind(j), j->id, elapsed / UINT64_C(1000000),
                 j->call ? j->call : "between calls", j->refs, j->pin,
                 j->destroying ? " (destructor already entered)" : "");
     }
@@ -124,14 +130,16 @@ static int gate_locked(Job *j) {
     }
     return !j->expired;
 }
-static int call_enter(Job *j, const char *name) {
+static int call_enter(Job *j, const char *name, int native_call) {
     enter();
     int ok = gate_locked(j);
-    if (ok) { j->call = name; j->call_start = active_clock(); }
+    if (ok) { j->call = name; j->call_start = active_clock(); j->native_call = native_call; }
     leave();
     return ok;
 }
-static void call_leave(Job *j) { enter(); j->call = NULL; leave(); }
+static void call_leave(Job *j) {
+    enter(); expire_locked(j); j->call = NULL; j->native_call = 0; leave();
+}
 static void fail_locked(Job *j, const char *reason) { if (!j->reason) j->reason = reason; }
 
 static void quarantine_locked(Job *j, const char *reason) {
@@ -150,26 +158,32 @@ static void quarantine_locked(Job *j, const char *reason) {
 
 static void append_locked(Job *j) {
     j->next = NULL;
-    if (waiting_tail) waiting_tail->next = j; else waiting = j;
-    waiting_tail = j;
-    if (j->device) waiting_devices++; else waiting_batches++;
+    Job **head = j->device ? &device_waiting : &waiting;
+    Job **tail = j->device ? &device_waiting_tail : &waiting_tail;
+    if (*tail) (*tail)->next = j; else *head = j;
+    *tail = j;
+    if (j->device) {
+        waiting_devices++;
+        if (waiting_devices > device_highwater) {
+            device_highwater = waiting_devices;
+            if (device_highwater == 65 || (device_highwater > 65 && !(device_highwater & (device_highwater - 1))))
+                NPT_LOG("pending device highwater=%u; GPU retirement remains retryable", device_highwater);
+        }
+    } else waiting_batches++;
 }
 static void remove_locked(Job *j, Job *previous) {
-    if (previous) previous->next = j->next; else waiting = j->next;
-    if (waiting_tail == j) waiting_tail = previous;
+    Job **head = j->device ? &device_waiting : &waiting;
+    Job **tail = j->device ? &device_waiting_tail : &waiting_tail;
+    if (previous) previous->next = j->next; else *head = j->next;
+    if (*tail == j) *tail = previous;
     if (j->device) waiting_devices--; else waiting_batches--;
     j->next = NULL;
 }
-static void limit_queue_locked(int devices) {
-    unsigned count = devices ? waiting_devices : waiting_batches;
-    if (count <= (devices ? NPT_DEVICE_LIMIT : NPT_BATCH_LIMIT)) return;
-    Job *previous = NULL;
-    for (Job *j = waiting; j; previous = j, j = j->next) {
-        if (!!j->device != devices) continue;
-        remove_locked(j, previous);
-        quarantine_locked(j, "waiting queue limit");
-        break;
-    }
+static void limit_batch_queue_locked(void) {
+    if (waiting_batches <= NPT_BATCH_LIMIT) return;
+    Job *j = waiting;
+    remove_locked(j, NULL);
+    quarantine_locked(j, "waiting queue limit");
 }
 
 static int release_batch(Job *j) {
@@ -185,7 +199,7 @@ static int release_batch(Job *j) {
             return 0;
         }
         while (r->object && r->regs) {
-            if (!call_enter(j, "Release registration")) return 0;
+            if (!call_enter(j, "Release registration", 1)) return 0;
             /* The entered call owns this reference now, even if its destructor
              * blocks. Quarantine/describe count only references still ours. */
             enter(); r->regs--; j->refs--; leave();
@@ -204,7 +218,7 @@ static int release_batch(Job *j) {
  * the same mutex; an old epoch can drop its pin without destroying that owner.
  * Only the LAST private pin requires a stable queue-retirement snapshot. */
 static int retire_device(Job *j) {
-    if (!call_enter(j, "snapshot retirement")) return 0;
+    if (!call_enter(j, "snapshot retirement", 0)) return 0;
     enter();
     expire_locked(j);
     if (j->expired) { j->call = NULL; leave(); return 0; }
@@ -229,14 +243,15 @@ static int retire_device(Job *j) {
     if (j->snapshot.main_done < j->snapshot.main_goal) return 2;
     uint64_t event_value = 0;
     if (j->snapshot.initializer_goal) {
-        if (!j->snapshot.event || !call_enter(j, "initializer event value")) return 0;
+        if (!j->snapshot.event || !call_enter(j, "initializer event value", 1)) return 0;
         valid = device_ops.event_value && device_ops.event_value(j->snapshot.event, &event_value);
         call_leave(j);
-        enter(); j->initializer_done = event_value; leave();
+        enter(); j->initializer_done = event_value; int expired = j->expired; leave();
+        if (expired) return 0;
         if (!valid) { enter(); fail_locked(j, "initializer event read failed"); leave(); return 0; }
         if (event_value < j->snapshot.initializer_goal) return 2;
     }
-    if (!call_enter(j, "quiesce and delete device")) return 0;
+    if (!call_enter(j, "prepare device deletion", 0)) return 0;
     enter();
     /* No mutex was held across the event getter. A new public-zero epoch may
      * have appeared meanwhile, in which case its separate pin owns new work. */
@@ -255,37 +270,40 @@ static int retire_device(Job *j) {
     /* Same sentinel as the pinned ComObjectWithInitialRef::ReleasePrivate. */
     __atomic_fetch_add(private_count(j->device), NPT_PRIVATE_SENTINEL, __ATOMIC_SEQ_CST);
     j->destroying = 1; j->sealed = 1;
+    j->call = "quiesce and delete device";
+    j->call_start = active_clock(); j->native_call = 1;
     leave();
     int destroyed = device_ops.destroy(j->device);
     enter();
+    expire_locked(j);
     if (destroyed) { retired_devices++; j->sealed = 0; }
     else fail_locked(j, "native finalizer failed; sealed device retained");
-    j->destroying = 0; j->call = NULL;
+    j->destroying = 0; j->call = NULL; j->native_call = 0;
     leave();
     return !!destroyed;
 }
 
-static void *cleanup_worker(void *unused) {
-    (void)unused;
+static void *cleanup_worker(void *lane) {
+    int devices = (int)(uintptr_t)lane;
     for (;;) {
         enter();
-        while (!waiting || !allowed) pthread_cond_wait(&changed, &lock);
-        Job *j = waiting;
+        while (!(devices ? device_waiting : waiting) || !allowed) pthread_cond_wait(&changed, &lock);
+        Job *j = devices ? device_waiting : waiting;
         remove_locked(j, NULL);
         if (!j->started) { j->started = 1; j->start = active_clock(); }
-        current = j;
+        if (devices) device_current = j; else current = j;
         uint64_t objects = j->objects, refs = j->refs;
         leave();
         int result = j->device ? retire_device(j) : release_batch(j);
         enter();
-        current = NULL;
+        if (devices) device_current = NULL; else current = NULL;
         if (!result) quarantine_locked(j, "cleanup could not complete");
         if (result == 2) {
             expire_locked(j);
             if (j->expired) { quarantine_locked(j, "active-time deadline"); result = 0; }
-            else { append_locked(j); limit_queue_locked(1); }
+            else append_locked(j);
         }
-        if (result == 2 && !waiting_batches) {
+        if (result == 2) {
             /* Read-only polling; wake early for lifecycle changes/new work. */
             struct timespec until;
             clock_gettime(CLOCK_REALTIME, &until);
@@ -308,28 +326,33 @@ static void *cleanup_worker(void *unused) {
     return NULL;
 }
 
-static void start_worker_locked(void) {
-    if (worker_started) return;
+static void start_worker_locked(int devices) {
+    int *started = devices ? &device_worker_started : &worker_started;
+    if (*started || !(devices ? device_waiting : waiting)) return;
     pthread_t thread;
     pthread_attr_t attr;
     int err = pthread_attr_init(&attr);
     if (!err) {
         err = pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
-        if (!err) err = pthread_create(&thread, &attr, cleanup_worker, NULL);
+        if (!err) err = pthread_create(&thread, &attr, cleanup_worker, (void *)(uintptr_t)devices);
         pthread_attr_destroy(&attr);
     }
     if (err) {
+        if (devices) {
+            NPT_LOG("device worker creation failed (%d); pending devices remain retryable", err);
+            return;
+        }
         while (waiting) {
             Job *j = waiting; remove_locked(j, NULL);
             quarantine_locked(j, "worker creation failed");
         }
-    } else worker_started = 1;
+    } else *started = 1;
 }
 static void enqueue_locked(Job *j) {
     j->id = ++next_id;
     append_locked(j);
-    limit_queue_locked(!!j->device);
-    start_worker_locked();
+    if (!j->device) limit_batch_queue_locked();
+    start_worker_locked(!!j->device);
     pthread_cond_broadcast(&changed);
 }
 
@@ -351,6 +374,14 @@ uint32_t hv_npt_device_release(void *device) {
     enter(); operations_started = 1;
     uint32_t count = __atomic_fetch_sub(public_count(device), 1, __ATOMIC_SEQ_CST) - 1;
     if (!count) {
+        /* Deletion has already consumed the final private pin and installed
+         * the original sentinel. Destructor callbacks may transiently QI or
+         * AddRef this same object. Balance that epoch exactly as the original
+         * ReleasePrivate does; never enqueue a pointer about to be freed. */
+        if (count_load(private_count(device)) >= NPT_PRIVATE_SENTINEL) {
+            __atomic_fetch_sub(private_count(device), 1, __ATOMIC_SEQ_CST);
+            leave(); return count;
+        }
         /* Keep the private reference that the original Release would drop.
          * Failure to allocate bookkeeping must leak it, never destroy early. */
         Job *j = calloc(1, sizeof(*j));
@@ -395,7 +426,8 @@ void hv_npt_cleanup_submit(void) {
     leave();
 }
 void hv_npt_cleanup_poll(void) {
-    enter(); expire_locked(current); pthread_cond_broadcast(&changed); leave();
+    enter(); expire_locked(current); expire_locked(device_current);
+    start_worker_locked(1); pthread_cond_broadcast(&changed); leave();
 }
 void hv_npt_cleanup_set_active(int active) {
     enter();
@@ -404,18 +436,18 @@ void hv_npt_cleanup_set_active(int active) {
         active_total = value; active_since = NPT_NOW_NS(); allowed = !!active;
         NPT_LOG("%s; watchdog counts allowed time only", allowed ? "resumed" : "paused");
     }
-    pthread_cond_broadcast(&changed); leave();
+    start_worker_locked(1); pthread_cond_broadcast(&changed); leave();
 }
 int hv_npt_cleanup_set_device_ops(const struct HvNptDeviceOps *ops) {
     enter();
-    int ok = !operations_started && !worker_started && ops && ops->query_interface
+    int ok = !operations_started && !worker_started && !device_worker_started && ops && ops->query_interface
              && ops->snapshot && ops->event_value && ops->destroy;
     if (ok) device_ops = *ops;
     leave(); return ok;
 }
 void hv_npt_cleanup_set_backend_verified(int verified) {
     enter();
-    if (!worker_started && !operations_started) backend_verified = !!verified;
+    if (!worker_started && !device_worker_started && !operations_started) backend_verified = !!verified;
     leave();
 }
 void hv_npt_cleanup_describe(char *buffer, size_t length) {
@@ -426,24 +458,30 @@ void hv_npt_cleanup_describe(char *buffer, size_t length) {
     for (Job *j = waiting; j; j = j->next) { objects += j->objects; refs += j->refs; }
     if (current) {
         if (current->expired) {
-            if (current->device) qp += current->pin;
-            else { qb++; qo += current->objects; qr += current->refs; }
-        } else if (current->device) pins += current->pin;
-        else { batches++; objects += current->objects; refs += current->refs; }
+            qb++; qo += current->objects; qr += current->refs;
+        } else { batches++; objects += current->objects; refs += current->refs; }
+    }
+    if (device_current) {
+        if (device_current->expired) qp += device_current->pin;
+        else pins += device_current->pin;
     }
     snprintf(buffer, length, "cleanup %s pending=%u/%" PRIu64 "/%" PRIu64
              " devices=%" PRIu64 " quarantined=%" PRIu64 "/%" PRIu64 "/%" PRIu64
              " device_pins=%" PRIu64 " failed_finalizers=%" PRIu64
-             " finalizing=%d released=%" PRIu64 " retired=%" PRIu64
-             " job=%" PRIu64 " active_ms=%" PRIu64 " call=%s call_ms=%" PRIu64
+             " finalizing=%d released=%" PRIu64 " retired=%" PRIu64 " highwater=%u"
+             " batch_job=%" PRIu64 " active_ms=%" PRIu64 " call=%s call_ms=%" PRIu64
+             " device_job=%" PRIu64 " call=%s call_ms=%" PRIu64
              " main=%" PRIu64 "/%" PRIu64 " initializer=%" PRIu64 "/%" PRIu64,
              allowed ? "active" : "paused", batches, objects, refs, pins, qb, qo, qr, qp,
-             failed_finalizers, current ? current->destroying : 0,
-             released_refs, retired_devices, current ? current->id : 0,
+             failed_finalizers, device_current ? device_current->destroying : 0,
+             released_refs, retired_devices, device_highwater, current ? current->id : 0,
              current ? (active_clock() - current->start) / UINT64_C(1000000) : 0,
              current && current->call ? current->call : "none",
              current && current->call ? (active_clock() - current->call_start) / UINT64_C(1000000) : 0,
-             current ? current->snapshot.main_done : 0, current ? current->snapshot.main_goal : 0,
-             current ? current->initializer_done : 0, current ? current->snapshot.initializer_goal : 0);
+             device_current ? device_current->id : 0,
+             device_current && device_current->call ? device_current->call : "none",
+             device_current && device_current->native_call ? (active_clock() - device_current->call_start) / UINT64_C(1000000) : 0,
+             device_current ? device_current->snapshot.main_done : 0, device_current ? device_current->snapshot.main_goal : 0,
+             device_current ? device_current->initializer_done : 0, device_current ? device_current->snapshot.initializer_goal : 0);
     leave();
 }
