@@ -41,9 +41,12 @@ The guarded DXMT hooks preserve the public/private reference-count transitions.
 At public count zero, cleanup retains the private reference that the original
 implementation would have dropped immediately. Its worker compares main-queue
 retirement with the submitted sequence and separately checks the resource
-initializer's completion event. It submits no GPU completion probe. A nil event,
-invalid counters, error without completion, or timeout keeps the private
-reference alive and reports it as **quarantined**.
+initializer's completion event. It submits no GPU completion probe. A device
+that is only waiting for counters or an unsignaled event stays pending and is
+retried, even after a long background trip or without lifecycle wiring. Waiting
+behind other work does not permanently quarantine a normally released device.
+Invalid state and entered native calls that exceed the watchdog retain their
+owned references and report the failure.
 
 `QueryInterface`, `AddRef`, and `Release` transitions are serialized: the pinned
 `QueryInterface` contains an inlined reference increment. This prevents a device
@@ -67,10 +70,13 @@ virgl destroy/reset API only sends a render-server request; its return is not
 that boundary. The cleanup worker releases each record's owned registrations.
 Any resulting final DXMT device release follows the retirement path above.
 
-A backend destructor can itself block. The watchdog reports the current call
+A backend destructor can itself block. Separate workers handle leftover
+registration batches and device retirement, so a blocked leftover `Release`
+does not stall normally released devices. The watchdog reports an entered call
 and elapsed allowed time rather than cancelling the thread or freeing objects
-that call may still use. Timeouts and queue overflow retain remaining owned
-references. Quarantine is a safe fallback, not proof of successful reclamation.
+that call may still use. Device counter waits have no permanent expiry. Leftover
+batch timeout/queue overflow retains remaining registrations. Quarantine is a
+safe fallback, not proof of successful reclamation.
 
 ## Guarded interception
 
@@ -81,14 +87,18 @@ validated record-free and final context-free callsites. All other frees go
 directly to libc; their path does not allocate or lock. Record frees retain the
 objects in a thread-local batch; the final context free submits that batch.
 
+The renderer hook is preflighted first, including its import slot and reversible
+data-page permission change. A rejected preflight leaves device lifetimes alone.
 DXMT's concrete device vtable is checked against its expected original functions,
 then its data-page slots are redirected before Neptune can create devices.
 Only data pages are made writable, with their protection restored afterward.
 There are no writes to executable memory. Unknown images, unexpected bytes or
 refused page protection keep the original behavior and report the reason.
 Overrides in `work/3d/fw-override` receive the same runtime checks.
-If a partially installed device hook cannot be fully rolled back, backend
-creation fails instead of using a mixed lifetime implementation.
+If a partially installed hook cannot be fully rolled back, or the final record
+hook cannot install after the device hooks, backend creation fails for the
+process instead of using only part of the cleanup implementation. Status reports
+the device and record hooks separately; startup logs give each guard result.
 
 The existing guarded `scripts/patch_dxmt.py` upload-failure protection is unchanged.
 
@@ -106,6 +116,9 @@ While disallowed, queued cleanup and new backend reads wait. The watchdog clock
 pauses. A call already entered in DXMT cannot be cancelled; its references stay
 owned. The lead's Picture in Picture/background integration wires these lifecycle
 calls separately from this branch.
+This conservative gate also delays already-quiescent device destruction while
+away. An auto-2D trip therefore need not immediately reclaim all DXMT memory in
+the background; pending retirement resumes when permission returns.
 
 ## Verification on the phone
 

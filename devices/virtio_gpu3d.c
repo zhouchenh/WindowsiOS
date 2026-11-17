@@ -15,6 +15,7 @@
 #include <mach/vm_map.h>
 #include <pthread.h>
 #include <stdarg.h>
+#include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -344,13 +345,17 @@ static int rebind_shm(void *any_symbol_in_image) {
 }
 
 /* ---- loading ---- */
-static const char *cleanup_disabled;
+static _Atomic int cleanup_device_state, cleanup_record_state;
 /* A failed rollback poisons this process even if a later attempt changes the
    environment to disable cleanup. No backend may see a partially hooked ABI. */
 static int cleanup_install_fatal;
 
 static const char *cleanup_status(void) {
-    return cleanup_disabled ? cleanup_disabled : hv_npt_hook_status();
+    static _Thread_local char status[96];
+    static const char *const state[] = {"original", "installed", "uncertain"};
+    snprintf(status, sizeof status, "device=%s records=%s",
+             state[atomic_load(&cleanup_device_state)], state[atomic_load(&cleanup_record_state)]);
+    return status;
 }
 
 static double teardown_time_ms(void) {
@@ -369,7 +374,7 @@ static void *open_fw(const char *dir, const char *rel, int global) {
 
 static int load_libs(HvVgpu3d *s) {
     if (cleanup_install_fatal) {
-        snprintf(s->why, sizeof s->why, "DXMT lifetime hook rollback failed; restart required");
+        snprintf(s->why, sizeof s->why, "Neptune cleanup installation failed; restart required");
         return -1;
     }
     const char *dir = getenv("HV_GPU3D_FRAMEWORKS");
@@ -476,21 +481,46 @@ static int load_libs(HvVgpu3d *s) {
     }
     const char *defer = getenv("HV_NPT_DEFER_RELEASE");
     const char *backend = getenv("NPT_BACKEND");
-    cleanup_disabled = defer && !strcmp(defer, "0") ? "disabled by HV_NPT_DEFER_RELEASE=0"
-                       : backend && strcmp(backend, "dxmt") ? "disabled for non-DXMT backend" : NULL;
-    if (!cleanup_disabled) {
-        int installed = hv_npt_install_device_hooks(dxmt_symbol);
-        WARN("DXMT device lifetime: %s\n", hv_npt_device_hook_status());
-        if (installed < 0) {
+    const char *disabled = defer && !strcmp(defer, "0") ? "disabled by HV_NPT_DEFER_RELEASE=0"
+                           : backend && strcmp(backend, "dxmt") ? "disabled for non-DXMT backend" : NULL;
+    if (disabled) WARN("Neptune cleanup: %s; %s (installed hooks require a process restart to disable)\n",
+                       disabled, cleanup_status());
+    if (!disabled) {
+        int ready = hv_npt_preflight_free_hook((void *)V.virgl_renderer_init,
+                                               hv_npt_capture_object, hv_npt_cleanup_submit);
+        WARN("Neptune record hook preflight: %s\n", hv_npt_hook_status());
+        if (ready < 0) {
             cleanup_install_fatal = 1;
-            snprintf(s->why, sizeof s->why, "DXMT lifetime hook rollback failed; device creation refused");
+            atomic_store(&cleanup_record_state, 2);
+            snprintf(s->why, sizeof s->why, "Neptune free-hook preflight failed fatally; device creation refused");
             return -1;
         }
-        if (installed) {
-            hv_npt_cleanup_set_backend_verified(1);
-            hv_npt_install_free_hook((void *)V.virgl_renderer_init, hv_npt_capture_object, hv_npt_cleanup_submit);
-        } else {
-            cleanup_disabled = "disabled: DXMT lifetime hooks unavailable";
+        if (ready) {
+            int installed = hv_npt_install_device_hooks(dxmt_symbol);
+            WARN("DXMT device lifetime: %s\n", hv_npt_device_hook_status());
+            if (installed < 0) {
+                cleanup_install_fatal = 1;
+                atomic_store(&cleanup_device_state, 2);
+                snprintf(s->why, sizeof s->why, "DXMT lifetime hook rollback failed; device creation refused");
+                return -1;
+            }
+            if (installed) {
+                atomic_store(&cleanup_device_state, 1);
+                hv_npt_cleanup_set_backend_verified(1);
+                int captured = hv_npt_install_free_hook((void *)V.virgl_renderer_init,
+                                                        hv_npt_capture_object, hv_npt_cleanup_submit);
+                WARN("Neptune record hook: %s\n", hv_npt_hook_status());
+                if (captured != 1) {
+                    /* No devices exist yet. Do not run with only the process-wide
+                       device hooks, or retry around this refusal via env changes. */
+                    cleanup_install_fatal = 1;
+                    if (captured < 0) atomic_store(&cleanup_record_state, 2);
+                    snprintf(s->why, sizeof s->why, "Neptune capture hook not installed; device creation refused");
+                    WARN("Neptune cleanup: %s; backend refused\n", cleanup_status());
+                    return -1;
+                }
+                atomic_store(&cleanup_record_state, 1);
+            }
         }
     }
     WARN("Neptune cleanup: %s\n", cleanup_status());
@@ -1651,10 +1681,10 @@ int hv_vgpu3d_describe(HvVgpu3d *s, char *buf, unsigned len) {
     char cleanup[512];
     hv_npt_cleanup_describe(cleanup, sizeof cleanup);
     return snprintf(buf, len,
-                    "on cleanup=%s %s capsets=%u ctxs=%llu cmds=%llu submits=%llu (%lluKB) blobs=%llu maps=%llu fences=%llu "
+                    "on cleanup=%s capsets=%u ctxs=%llu cmds=%llu submits=%llu (%lluKB) blobs=%llu maps=%llu fences=%llu "
                     "(ring %llu global %llu) errors=%llu submit_errors=%llu live_ctxs=%u (neptune %u, peak %u) scanout=%u %ux%u%s "
-                    "resets=%llu (skipped %llu) hostmem@%#llx drain=%s trips=%llu drained=%llu (ring %llu global %llu, this trip %llu, oldest %llums)",
-                    cleanup_status(), cleanup, s->ncapsets, (unsigned long long)s->ctxs, (unsigned long long)s->cmds,
+                    "resets=%llu (skipped %llu) hostmem@%#llx drain=%s trips=%llu drained=%llu (ring %llu global %llu, this trip %llu, oldest %llums) %s",
+                    cleanup_status(), s->ncapsets, (unsigned long long)s->ctxs, (unsigned long long)s->cmds,
                     (unsigned long long)s->submits, (unsigned long long)(s->submit_bytes >> 10),
                     (unsigned long long)s->blobs, (unsigned long long)s->maps, (unsigned long long)s->fences,
                     (unsigned long long)s->fenced_ring, (unsigned long long)s->fenced_global,
@@ -1666,7 +1696,7 @@ int hv_vgpu3d_describe(HvVgpu3d *s, char *buf, unsigned len) {
                     drain_on ? "on" : "off", (unsigned long long)s->drain_trips,
                     (unsigned long long)(s->drained_ring + s->drained_global), (unsigned long long)s->drained_ring,
                     (unsigned long long)s->drained_global, (unsigned long long)s->drained_trip,
-                    (unsigned long long)(s->drain_max_age_ns / 1000000ull));
+                    (unsigned long long)(s->drain_max_age_ns / 1000000ull), cleanup);
 }
 
 void hv_vgpu3d_set_cleanup_active(int active) {
