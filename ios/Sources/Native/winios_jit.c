@@ -167,7 +167,7 @@ static void prealloc_ledger_exempt_ram(void) {
             if (w != MAP_FAILED) {
                 g_gpu_window = w;
                 g_gpu_window_bytes = win_mb[i] << 20;
-                WINIOS_LOG("reserved %llu MiB virtio-gpu hostmem window at %p", (unsigned long long)win_mb[i], w);
+                WINIOS_LOG("reserved %llu MiB virtio-gpu hostmem window", (unsigned long long)win_mb[i]);
                 break;
             }
         }
@@ -193,9 +193,9 @@ static void prealloc_ledger_exempt_ram(void) {
             g_guest_ram_bytes = mb << 20;
             g_prealloc_room_mb = g_cfg_3d_room_mb;
             g_prealloc_ram_cap_mb = g_cfg_ram_mb;
-            WINIOS_LOG("pre-allocated %llu MiB ledger-exempt Guest RAM at %p; %u MiB contiguous VA-fit probe passed and released "
+            WINIOS_LOG("pre-allocated %llu MiB ledger-exempt Guest RAM; %u MiB contiguous VA-fit probe passed and released "
                        "(physical total %llu MiB, physical reserve policy 2560 MiB)",
-                       (unsigned long long)mb, (void *)p, g_cfg_3d_room_mb, (unsigned long long)phys_mb);
+                       (unsigned long long)mb, g_cfg_3d_room_mb, (unsigned long long)phys_mb);
             return;
         }
     }
