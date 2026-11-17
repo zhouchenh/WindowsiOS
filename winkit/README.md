@@ -12,6 +12,7 @@
 2. **双击运行**：文件资源管理器 → **WINKIT** 盘 → 双击 `START.bat` → 权限提示点“是”。
    它会依次：装网络驱动、装 3D 驱动、通知 App 打开 3D、询问是否做后台精简（按 `y` 执行，直接回车跳过；不会关闭透明和动画效果）、
    装登录链接桥 WinIOS Browser（见下文“登录链接用 Safari 打开”，会打开“设置”让你点一下“设为默认值”），
+   设置时钟（Windows 的时间、时区跟随 iPhone，见下文“时间和时区”），
    再装（或更新）后台小助手、键盘焦点助手和剪贴板小助手（见下文）。以后有新版 WinKit，再双击一次 `START.bat` 就全部更新。
 3. **彻底关掉 App 再打开**（上滑划掉），用 StikDebug 再开一次 JIT。
    Windows 登录后一分钟内会**自动**把分辨率调成贴合屏幕、只保留一个桌面，不用再操作。
@@ -25,6 +26,24 @@
 它也负责**显示**：App 里“设置 → 显示”的显示大小、清晰度，以及折叠、展开、沉浸全屏时的画面大小，都由它实时改成 Windows 的分辨率和缩放（`WinKitDisplay.cs`，不用注销）。
 同一步还装**键盘焦点助手**（`FocusAgent.cs`）：Windows 里的文本框得到焦点时 iPhone 键盘自动弹出，键盘挡住光标时画面上移；中文、带音调的字母和表情也能直接输入。
 App 的“设置 → 输入 → 键盘”里可以关掉自动弹出和跟随光标。也可以单独安装：在 Windows 里运行 WINKIT 盘上的 `cli_setup.ps1`（右键 → 使用 PowerShell 运行，不需要管理员）；`cli_setup.ps1 -Remove` 卸载这两个助手。
+
+## 时间和时区
+
+App 给 Windows 的硬件时钟（RTC）走的是 **UTC**。`START.bat` 的“Clock”一步（`clock_setup.ps1`，需要管理员）会：
+
+- 让 Windows 把硬件时钟当 UTC 读（注册表 `RealTimeIsUniversal=1`）。没有这一项时，Windows 会把 UTC 当成本地时间显示，差几个小时。
+  **这一项开机时才读**：设好后从“开始 → 电源 → 关机”，再从 App 里重新启动（Windows 自己的“重启”不够）。在那之前时间可能还差几个小时，生效时会往回跳一次。
+- 打开 Windows 时间服务（w32time）：随 Windows 启动，每小时和 time.windows.com、pool.ntp.org 对一次时，差多少都校正。
+  iPhone 锁屏或 App 在后台时 Windows 的时钟是停着的；计划任务 **WinKit Clock**（SYSTEM）会在 App 每次回到前台时立刻对时。
+- 把 Windows 的时区设成 iPhone 的。之后由**后台小助手**跟着 iPhone 走：App 把 iPhone 的时区写进 `Shared/tz.txt`，
+  小助手几秒内用 `tzutil` 改好 Windows 的时区（不需要管理员），结果写在 `Shared/tz_applied.txt`（例如 `China Standard Time rtiu=1 w32time=Running`；`rtiu=0` 说明还没跑过新版 `START.bat`）。
+  时区换算用 Windows 自带的 ICU（`WinKitTz.cs`），找不到的时区会写成 `unmapped ...`，Windows 的时区不变。
+
+- **撤销**：管理员运行 `C:\WinKit\clock_setup.ps1 -Uninstall`（删掉 `RealTimeIsUniversal` 和 WinKit Clock 任务，时间服务保持现状）。
+- **后备方案**：万一某个 Windows 不认 `RealTimeIsUniversal`（从 App 重启后时间仍差几个小时），先运行 `clock_setup.ps1 -Uninstall`，
+  再在“文件”App 里 Windows 虚拟机的文件夹（`Machines/Win11/`）放一个名为 `rtc-localtime.on` 的空文件，从 App 重新启动：硬件时钟改走 iPhone 的本地时间（和 QEMU、UTM 的做法一样；Mac 上的 `build/winvm` 用环境变量 `HV_RTC=localtime`）。
+  **两者不能同时用**，否则时间会被换算两次。这个开关只对 Windows 有效，不放在 `env.txt` 里；Arch Linux 始终是 UTC。
+- 在一次 App 运行期间，Windows 写进硬件时钟的值会保留到下次从 App 启动，所以调整时钟相关设置后要“关机 + 从 App 启动”，不要用“重启”。
 
 ## 登录链接用 Safari 打开（OAuth 桥）
 

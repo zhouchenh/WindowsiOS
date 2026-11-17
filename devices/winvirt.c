@@ -181,6 +181,12 @@ int hv_winvirt_create(HvWinVirt *b, HvMachine *m, HvCpu *cpu, int ncpus, uint64_
     b->uart = hv_pl011_create(m, b->gic, WINVIRT_UART_PA, WINVIRT_INTID_UART);
     if (getenv("HV_SERIAL_STDERR")) b->uart->output = uart_stdout_cb;
     b->rtc = hv_pl031_create(m, b->gic, WINVIRT_RTC_PA, WINVIRT_INTID_RTC);
+    /* The RTC counts UTC for every guest: Windows is set to read it as UTC (RealTimeIsUniversal=1, by
+       WinKit's clock step and by provisioning), Linux always does. HV_RTC=localtime counts the host's local
+       time instead (QEMU's -rtc base=localtime), only for a Windows that reads the RTC as local time. */
+    const char *rtc_mode = getenv("HV_RTC");
+    b->rtc->localtime = rtc_mode && !strcmp(rtc_mode, "localtime");
+    if (b->rtc->localtime) fprintf(stderr, "winvm: RTC counts the host's local time (HV_RTC=localtime)\n");
     b->gpio = hv_pl061_create(m, b->gic, WINVIRT_GPIO_PA, WINVIRT_INTID_GPIO);
     hv_machine_add_mmio(m, WINVIRT_GED_PA, 0x1000, b, ged_read, ged_write, "acpi-ged");
 

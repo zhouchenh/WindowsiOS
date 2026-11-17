@@ -4,6 +4,8 @@
 #   the helpers that run in the signed-in session: the display helper (Windows' size and scale follow the
 #   app, WinKitDisplay.cs) and the keyboard focus agent (FocusAgent.cs), both from cli_setup.ps1, and the
 #   clipboard helper (clipboard_setup.ps1). Running it again updates all of them.
+#   The clock (clock_setup.ps1): Windows reads the app's RTC as UTC, Windows Time syncs, and the time zone
+#   follows the iPhone's (kept matched by the display helper).
 #   Optional, on their own: SSH-SETUP.bat (OpenSSH server), REMOTE-DESKTOP.bat (Remote Desktop host).
 # Run through START.bat. -Finish is what the logon task runs after the restart.
 param([switch]$Finish)
@@ -92,6 +94,11 @@ Write-Host '  Installs WinIOS Browser: links that Windows apps open (e.g. "Sign 
 Write-Host '  the iPhone, with its saved passwords, passkeys and Face ID, and the sign-in comes back to Windows.'
 try { & (Join-Path $home3d 'oauth_setup.ps1') } catch { Write-Host "  skipped: $($_.Exception.Message)" -ForegroundColor Yellow }
 
+Say 'Clock: Windows time follows the iPhone'
+# The app's RTC counts UTC: Windows reads it as UTC (RealTimeIsUniversal), Windows Time syncs hourly and
+# whenever the app comes back to the front, and the time zone is the iPhone's (the helper below keeps it so).
+try { & (Join-Path $home3d 'clock_setup.ps1') } catch { Write-Host "  clock skipped: $($_.Exception.Message)" -ForegroundColor Yellow }
+
 Say 'Helpers: display size and scale, keyboard focus, clipboard'
 # The background helper (the app's toolbar jobs, e.g. Claude Code, and the display: Windows' mode and scale
 # follow the app live) and the keyboard focus agent (the iPhone keyboard comes up in text boxes, Chinese and
@@ -112,7 +119,8 @@ if (-not $is3dOk) {
     Write-Host '     Do not use Windows'' own Restart.'
 }
 Write-Host 'BEFORE closing the app: shut Windows down from Start > Power once. That keeps the user settings made here'
-Write-Host '(user name); swiping the app away without it can lose them.' 
+Write-Host '(user name); swiping the app away without it can lose them.'
+Write-Host 'The clock is right from the next start of the app after that shut-down (Windows'' own Restart is not enough).'
 Write-Host 'Check with dxdiag: Display > "Red Hat VirtIO GPU 3D controller", Feature Levels 11_0.'
 Write-Host 'If the screen ever stays black: delete gpu3d.on from the app''s Shared folder in the Files app and restart the app.'
 Write-Host 'Optional: SSH-SETUP.bat (SSH server, key login) and REMOTE-DESKTOP.bat (Remote Desktop) in C:\WinKit, then'
