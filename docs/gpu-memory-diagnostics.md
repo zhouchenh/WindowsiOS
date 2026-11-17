@@ -22,11 +22,36 @@ DXMT staging allocations, resource ownership, or display resolution policy.
 - `virtual size (used + reserved, not free)` includes reservations. It is not
   free address space. A sampled region gap is also not guaranteed allocatable:
   the kernel can restrict an allocation to particular address ranges, and
-  other threads can change mappings during the walk.
+  other threads can change mappings during the walk. This task-wide walk does
+  not identify the particular range used by shared-file mappings or Metal.
+  Top-level submaps count as occupied and hide their internal gaps; a large
+  observed gap can coexist with a failed texture mapping.
 - `iOS allows ... more` is the process's remaining dirty-memory allowance,
   not free physical RAM or contiguous mapping capacity. Metal's recommended
   working set is advisory. Do not add Metal allocations to process footprint;
   they can overlap.
+
+`GPU mapping diagnostics:` reports installation separately for virgl and DXMT.
+The data-only import hooks require the pinned UUID, segment/import layout,
+original instruction bytes, and canonical libc targets. A safe refusal leaves
+the renderer's behavior unchanged and reports diagnostics unavailable. An
+indeterminate import rollback or page-protection restoration blocks renderer
+initialization until the app is restarted. The existing DXMT binary patches
+and cleanup guards remain in effect.
+
+`gpu-map-failure` lines identify the image, syscall stage (`open`, `ftruncate`,
+or `mmap`), saved errno, and mapping/truncation arguments. Metadata includes the
+file type/length when available, task region count and virtual size, and process
+address/data limits. `site=shared-texture` identifies the guarded DXMT texture
+callsite; `site=other` makes no texture-specific claim. No paths, file contents,
+or raw addresses are logged. The original syscall return and errno are
+preserved; there are no mapping retries or pressure-triggered resource frees.
+
+Reporting makes at most 64 single-write attempts per app process. Concurrent
+or recursive reports, and failures after that cap, are suppressed; suppression
+counts are best-effort lower bounds. A failed or short log write is not retried.
+The fixed formatting buffer and attempt limit bound work and volume, not the
+elapsed time of kernel calls or file I/O. Successful calls stay silent.
 
 The environment file is loaded once before the first JIT acquisition attempt,
 and the room override is read again at RAM allocation. The existing VM-start

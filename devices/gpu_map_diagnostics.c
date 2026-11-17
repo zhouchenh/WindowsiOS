@@ -276,7 +276,7 @@ static int install_image(uintptr_t base,int image,void *map,void *truncate)
     int changed=0;
     for(;changed<2;changed++) {
         uintptr_t expected=original[changed];
-        if(!atomic_compare_exchange_strong_explicit((_Atomic uintptr_t *)slot[changed],&expected,replacement[changed],memory_order_release,memory_order_acquire)) break;
+        if(!atomic_compare_exchange_strong_explicit((_Atomic uintptr_t *)slot[changed],&expected,replacement[changed],memory_order_acq_rel,memory_order_acquire)) break;
     }
     bool restored=vm_protect(mach_task_self(),page,vm_page_size,false,protection)==KERN_SUCCESS;
     if(changed==2 && restored) { installed[image]=true; atomic_store(&status[image],S_ON); return 1; }
@@ -286,7 +286,7 @@ static int install_image(uintptr_t base,int image,void *map,void *truncate)
     bool rolled=true;
     for(int n=changed-1;n>=0;n--) {
         uintptr_t expected=replacement[n];
-        if(!atomic_compare_exchange_strong_explicit((_Atomic uintptr_t *)slot[n],&expected,original[n],memory_order_release,memory_order_acquire)) rolled=false;
+        if(!atomic_compare_exchange_strong_explicit((_Atomic uintptr_t *)slot[n],&expected,original[n],memory_order_acq_rel,memory_order_acquire)) rolled=false;
     }
     if(vm_protect(mach_task_self(),page,vm_page_size,false,protection)!=KERN_SUCCESS || !rolled) return poison();
     return refuse(image,changed==2?S_PROTECTION:S_RACE);
