@@ -909,7 +909,7 @@ static uint32_t process(HvVgpu3d *s, const HvVirtqElem *e, const Hdr *h, uint32_
         }
         live_log(s, li >= 0 ? "destroyed" : "destroyed (not known as live)", h->ctx_id, cap, "");
         if (cap == CAPSET_NEPTUNE)
-            WARN("ctx %u Neptune teardown returned in %.1f ms; cleanup=%s (compare memory census after GPU retirement)\n",
+            WARN("ctx %u Neptune destroy request returned in %.1f ms; cleanup=%s (compare memory census after GPU retirement)\n",
                  h->ctx_id, elapsed, cleanup_status());
         return 0;
     }
@@ -1321,7 +1321,7 @@ static void renderer_reset(HvVgpu3d *s) {
     V.virgl_renderer_reset();
     s->nlive = s->nlive_npt = 0;
     if (dropped_neptune)
-        WARN("renderer reset returned in %.1f ms: %u Neptune contexts; cleanup=%s (compare memory census after GPU retirement)\n",
+        WARN("renderer reset request returned in %.1f ms: %u Neptune contexts; cleanup=%s (compare memory census after GPU retirement)\n",
              teardown_time_ms() - started, dropped_neptune, cleanup_status());
     for (int i = 0; i < MAX_RES3D; i++) {
         free(s->res[i].iov);
