@@ -4,6 +4,7 @@
  * Adapted from Henge (Leviidev/Henge, GPL-2.0-or-later).
  */
 #include "winios_jit.h"
+#include "winios_jit_budget.h"
 #include "winvirt.h"
 
 #include <TargetConditionals.h>
@@ -72,7 +73,7 @@ extern uint64_t winios_brk_probe(void);
     } while (0)
 
 /* Executable JIT pages above 0x7000000000 hang on iOS 26/27 TXM devices.
- * Reserve a 512 MiB zero-fill block in __DATA at launch so it sits inside the
+ * Reserve WINIOS_JIT_MAX_BYTES in zero-fill __DATA at launch so it sits inside the
  * low < 0x180000000 window, then deallocate it immediately before debugserver's
  * `_M<size>,rx` allocation takes the first-fit hole. */
 #define WINIOS_JIT_LOW_LIMIT 0x7000000000ull
@@ -91,16 +92,24 @@ static atomic_bool g_jit_live;
 static char g_status[256] = "Not initialized";
 
 static uint32_t g_cfg_jit_mb, g_cfg_ram_mb;
-/* Address space kept free next to guest RAM for the 3D stack (virglrenderer, DXMT, Metal buffers and
+/* Address-space fit target alongside guest RAM for the 3D stack (virglrenderer, DXMT, Metal buffers and
    heaps). 1 GB was too little with 3D on and no extended-VA entitlement: Windows' compositor at
    sign-in made Metal refuse a staging buffer and DXMT wrote through the null result (SIGSEGV in
-   MTLBuffer_updateContents). With 3D on, keep 2.5 GB free instead (guest RAM gets about 1.5 GB less). */
+   MTLBuffer_updateContents). With 3D on, probe 2.5 GB instead (guest RAM gets about 1.5 GB less).
+   The probe is unmapped immediately: it reserves neither VA nor physical memory for later use. */
 static uint32_t g_cfg_3d_room_mb = 1024;
+static bool g_cfg_3d_enabled;
+/* Allocation facts survive later configuration changes. A VM restart reuses
+ * preallocated RAM; only a fresh app process can run this fit test again. */
+static uint32_t g_prealloc_room_mb, g_prealloc_ram_cap_mb;
 
 void winios_jit_configure_3d(bool on) {
-    g_cfg_3d_room_mb = on ? 2560 : 1024;
-    const char *e = getenv("HV_3D_ROOM_MB"); /* override, in MiB (env.txt) */
-    if (e && atoi(e) >= 256) g_cfg_3d_room_mb = (uint32_t)atoi(e);
+    g_cfg_3d_enabled = on;
+    enum WinIOSRoomOverride status;
+    g_cfg_3d_room_mb = winios_jit_room_mb(on, getenv("HV_3D_ROOM_MB"), &status);
+    WINIOS_LOG("3D VA-fit target %u MiB (%s); not a physical/Metal memory reservation",
+               g_cfg_3d_room_mb, status == WINIOS_ROOM_OVERRIDE ? "HV_3D_ROOM_MB override" :
+               status == WINIOS_ROOM_INVALID ? "invalid HV_3D_ROOM_MB ignored" : "default");
 }
 
 /* Set once the debugger that gave the JIT region was told to detach (when it was asked to). */
@@ -131,8 +140,24 @@ void *winios_gpu_window(uint64_t *out_bytes) {
     return g_gpu_window;
 }
 
+void winios_jit_log_memory_config(uint64_t selected_ram_mb) {
+    WINIOS_LOG("memory-config: selected RAM %llu MiB, preallocated %llu MiB, "
+               "RAM cap configured %u MiB / at allocation %u MiB (0=automatic), JIT %zu MiB, hostmem %llu MiB; "
+               "VA-fit target configured %u MiB / passed-and-released %u MiB "
+               "(0=no successful probe; not a physical/Metal reservation)",
+               (unsigned long long)selected_ram_mb,
+               (unsigned long long)(g_guest_ram_bytes >> 20),
+               g_cfg_ram_mb, g_prealloc_ram_cap_mb, g_mapping.size >> 20,
+               (unsigned long long)(g_gpu_window_bytes >> 20),
+               g_cfg_3d_room_mb, g_prealloc_room_mb);
+}
+
 static void prealloc_ledger_exempt_ram(void) {
     if (g_guest_ram) return;
+    /* The bridge may load env.txt after the initial Swift configuration.
+     * Re-read the process environment at allocation; the caller must load
+     * that file before acquiring JIT for its override to take effect. */
+    winios_jit_configure_3d(g_cfg_3d_enabled);
     /* The virtio-gpu hostmem window first: without the extended-VA entitlement (not available to
        personal teams) the address space holds about 7 GB, and guest RAM takes whatever is left. */
     if (!g_gpu_window) {
@@ -152,14 +177,11 @@ static void prealloc_ledger_exempt_ram(void) {
     sysctlbyname("hw.memsize", &phys_mem, &len, NULL, 0);
     uint64_t phys_mb = phys_mem >> 20;
     /* Size Guest RAM to fit comfortably within iOS 36-bit user VA ceiling alongside TXM JIT RX/RW + JIT tables */
-    static const uint64_t candidates_mb[] = {16384, 14336, 12288, 10240, 8192, 7680, 7168, 6656, 6144, 5888, 5632, 5376, 5120, 4608, 4096, 3584, 3072, 2560, 2048};
-    for (size_t i = 0; i < sizeof(candidates_mb) / sizeof(candidates_mb[0]); i++) {
-        uint64_t mb = candidates_mb[i];
-        if (phys_mb > 0 && mb + 2560 > phys_mb) continue;
-        if (g_cfg_ram_mb >= 1024 && mb > g_cfg_ram_mb) continue; /* the user's cap */
+    for (uint64_t mb = winios_jit_next_ram_mb(phys_mb, g_cfg_ram_mb, UINT64_MAX); mb;
+         mb = winios_jit_next_ram_mb(phys_mb, g_cfg_ram_mb, mb)) {
         uint8_t *p = hv_alloc_no_footprint(mb << 20);
         if (p) {
-            /* Leave address space for the 3D stack (virglrenderer, DXMT, Metal heaps): see g_cfg_3d_room_mb. */
+            /* Test a contiguous VA fit for the 3D stack; this does not allocate physical backing. */
             uint64_t room_bytes = (uint64_t)g_cfg_3d_room_mb << 20;
             void *room = mmap(NULL, room_bytes, PROT_NONE, MAP_ANON | MAP_PRIVATE, -1, 0);
             if (room == MAP_FAILED) {
@@ -169,8 +191,11 @@ static void prealloc_ledger_exempt_ram(void) {
             munmap(room, room_bytes);
             g_guest_ram = p;
             g_guest_ram_bytes = mb << 20;
-            WINIOS_LOG("pre-allocated %llu MiB ledger-exempt Guest RAM at %p (%u MiB kept free for 3D)",
-                       (unsigned long long)mb, (void *)p, g_cfg_3d_room_mb);
+            g_prealloc_room_mb = g_cfg_3d_room_mb;
+            g_prealloc_ram_cap_mb = g_cfg_ram_mb;
+            WINIOS_LOG("pre-allocated %llu MiB ledger-exempt Guest RAM at %p; %u MiB contiguous VA-fit probe passed and released "
+                       "(physical total %llu MiB, physical reserve policy 2560 MiB)",
+                       (unsigned long long)mb, (void *)p, g_cfg_3d_room_mb, (unsigned long long)phys_mb);
             return;
         }
     }

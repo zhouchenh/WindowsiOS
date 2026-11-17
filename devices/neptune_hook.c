@@ -4,6 +4,7 @@
  * hook lock. See scripts/check_neptune.py for the source/ABI audit. */
 #include "neptune_hook.h"
 #include "neptune_hook_layout.h"
+#include "dxmt_data_lock.h"
 
 #include <dlfcn.h>
 #include <mach-o/dyld.h>
@@ -442,10 +443,13 @@ static int configure_free_hook(void *virgl_symbol,void (*capture)(void *),void (
 
 static int guarded_request(void *symbol,void (*capture)(void *),void (*submit)(void),bool dry_run)
 {
+    /* The virgl free and mapping imports can share a VM page. */
+    hv_dxmt_data_lock();
     pthread_mutex_lock(&install_mutex);
     int result=atomic_load_explicit(&hook_fatal,memory_order_acquire)?-1:
         configure_free_hook(symbol,capture,submit,dry_run);
     pthread_mutex_unlock(&install_mutex);
+    hv_dxmt_data_unlock();
     return result;
 }
 int hv_npt_preflight_free_hook(void *symbol,void (*capture)(void *),void (*submit)(void))

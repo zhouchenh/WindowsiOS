@@ -14,7 +14,7 @@ ENGINE = $(CORE) $(HOST)
 DEV = $(B)/acpi.o $(B)/acpi_battery.o $(B)/fb_display.o $(B)/fb_metal.o $(B)/fdt.o $(B)/fw_cfg.o $(B)/gicv3.o $(B)/hda.o \
       $(B)/nvme.o $(B)/pcie.o $(B)/pflash.o $(B)/pl011.o $(B)/pl031.o $(B)/pl061.o $(B)/timer.o \
       $(B)/virtio.o $(B)/virtio_blk.o $(B)/virtio_input.o $(B)/virtio_net.o $(B)/virtio_snd.o $(B)/virtio_gpu.o $(B)/virtio_gpu3d.o \
-      $(B)/usb_touch.o $(B)/winvirt.o $(B)/xhci.o $(B)/neptune_hook.o $(B)/neptune_cleanup.o $(B)/neptune_device.o $(B)/dxmt_shared_init.o $(B)/dxmt_data_lock.o
+      $(B)/usb_touch.o $(B)/winvirt.o $(B)/xhci.o $(B)/neptune_hook.o $(B)/neptune_cleanup.o $(B)/neptune_device.o $(B)/dxmt_shared_init.o $(B)/dxmt_data_lock.o $(B)/gpu_map_diagnostics.o
 
 VM_HOST = $(B)/winvm.o $(B)/net_slirp.o $(B)/dns_proxy.o $(B)/share.o $(B)/audio_mac.o $(B)/hvsparse.o
 
@@ -135,6 +135,15 @@ test-fb-capture: $(B)/test_fb_capture
 test-dxmt-shared-init:
 	python3 tests/test_dxmt_shared_init.py
 
+$(B)/test_winios_va_census: tests/test_winios_va_census.c ios/Sources/Native/winios_va_census.h | $(B)
+	$(CC) $(CFLAGS) -Werror -fsanitize=address,undefined -fno-sanitize-recover=all $< -o $@
+$(B)/test_winios_va_mach: tests/test_winios_va_mach.c ios/Sources/Native/winios_va_census*.h | $(B)
+	$(CC) $(CFLAGS) -Werror -fsanitize=address,undefined -fno-sanitize-recover=all $< -o $@
+test-va-census: $(B)/test_winios_va_census $(B)/test_winios_va_mach
+	$(B)/test_winios_va_census
+	$(B)/test_winios_va_mach
+.PHONY: test-va-census
+
 $(B)/hvsparse: tools/hvsparse_main.c host/hvsparse.c host/hvsparse.h | $(B)
 	$(CC) $(CFLAGS) tools/hvsparse_main.c host/hvsparse.c -o $@
 
@@ -182,7 +191,13 @@ ios-lib: $(IB)/libwinvm.a
 clean:
 	rm -rf $(B)
 
-.PHONY: all test-core test-dns test-net test-neptune test-fb-capture test-dxmt-shared-init ios-lib clean
+.PHONY: all test-core test-dns test-net test-neptune test-fb-capture test-dxmt-shared-init test-jit-budget ios-lib clean
+
+$(B)/test_winios_jit_budget: tests/test_winios_jit_budget.c ios/Sources/Native/winios_jit_budget.h | $(B)
+	$(CC) $(CFLAGS) -Werror -fsanitize=address,undefined -fno-sanitize-recover=all $< -o $@
+
+test-jit-budget: $(B)/test_winios_jit_budget
+	./$(B)/test_winios_jit_budget
 
 # ---- Windows guest tools: build/guest/WinIOSBrowser.exe (the OAuth bridge, see docs/oauth-bridge.md) ----
 # Freestanding AArch64 Win32: no CRT, only kernel32/ws2_32 imports. Needs Homebrew llvm and lld.
@@ -250,3 +265,9 @@ $(B)/test_shared_init_probe: tests/test_shared_init_probe.c tools/shared_init_pr
 test-shared-init-probe: $(B)/test_shared_init_probe
 	@for c in control control-data late-zero late-data fixed baseline event-timeout shared-error unsupported bgra-late bgra-control a8-fixed; do $< $$c || exit; done
 .PHONY: test-shared-init-probe
+
+# Failure-only GPU mmap/ftruncate diagnostics: synthetic native ABI/guard tests.
+test-gpu-map-diagnostics:
+	python3 tests/test_gpu_map_diagnostics.py
+
+.PHONY: test-gpu-map-diagnostics

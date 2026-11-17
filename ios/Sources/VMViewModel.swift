@@ -157,7 +157,7 @@ final class VMViewModel: ObservableObject {
         didSet { UserDefaults.standard.set(ramLimitMB, forKey: "winios.ramMB") }
     }
     static let jitCacheChoices = [256, 384, 512, 640, 768]
-    static let ramChoices = [2048, 3072, 4096, 6144, 8192, 10240, 12288, 14336, 16384]
+    static let ramChoices = [2048, 2560, 3072, 4096, 6144, 8192, 10240, 12288, 14336, 16384]
     /// Start Windows as soon as JIT is on. Off by default: the app stays on its start page first, so
     /// settings can be changed before Windows boots.
     /// Command line only: Windows closes its desktop shell after logon and shows a console

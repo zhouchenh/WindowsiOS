@@ -8,6 +8,7 @@
 #include <sys/sysctl.h>
 #include "share.h"
 #include "winios_jit.h"
+#include "winios_va_census_mach.h"
 #include "winvm.h"
 
 #import <AVFoundation/AVFoundation.h>
@@ -202,12 +203,15 @@ static void winios_log_memory_census(void) {
     static uint64_t last_fp, last_metal;
     static unsigned last_encode = ~0u, last_ring = ~0u;
     if (!metal) metal = MTLCreateSystemDefaultDevice();
-    task_vm_info_data_t vm;
+    task_vm_info_data_t vm = {0};
     mach_msg_type_number_t cnt = TASK_VM_INFO_COUNT;
-    uint64_t fp = 0, vsize = 0;
-    if (task_info(mach_task_self(), TASK_VM_INFO, (task_info_t)&vm, &cnt) == KERN_SUCCESS) {
+    uint64_t fp = 0, vsize = 0, va_min = 0, va_max = 0;
+    int regions = -1;
+    if (task_info(mach_task_self(), TASK_VM_INFO, (task_info_t)&vm, &cnt) == KERN_SUCCESS && cnt >= TASK_VM_INFO_REV0_COUNT) {
         vsize = vm.virtual_size;
+        regions = vm.region_count;
         if (cnt >= TASK_VM_INFO_REV1_COUNT) fp = vm.phys_footprint;
+        if (cnt >= TASK_VM_INFO_REV2_COUNT) { va_min = vm.min_address; va_max = vm.max_address; }
     }
     uint64_t avail = os_proc_available_memory();
     uint64_t mtl = metal ? metal.currentAllocatedSize : 0;
@@ -241,6 +245,12 @@ static void winios_log_memory_census(void) {
             (unsigned long long)(fp >> 20), (unsigned long long)(avail >> 20), (unsigned long long)(mtl >> 20),
             (unsigned long long)(metal ? metal.recommendedMaxWorkingSetSize >> 20 : 0), (unsigned long long)(vsize >> 20),
             total, encode, ring, queue);
+    struct WiniosVaCensus va = winios_va_mach_census(va_min, va_max);
+    fprintf(stderr, "memory: VA observation: task regions %d, walked %u (%u calls, %s, error %d), "
+                    "task-bound observed span %lluMiB, largest observed gap %lluMiB; "
+                    "not guaranteed allocatable, non-atomic; limits 2048 calls / 5ms between calls\n",
+            regions, va.regions, va.calls, winios_va_status_name(va.status), va.query_error,
+            (unsigned long long)(va.observed_span >> 20), (unsigned long long)(va.largest_gap >> 20));
 }
 
 @implementation WinIOSBridge
@@ -1412,6 +1422,12 @@ static BOOL winios_plans_equal(WinIOSDisplayPlan a, WinIOSDisplayPlan b) {
 }
 
 - (BOOL)tryAcquireJIT:(BOOL)detachAfter {
+    /* RAM and its VA-fit probe are allocated during JIT acquisition, before
+       startConfiguredVMInDirectory loads env.txt. Keep that override effective
+       at the allocation boundary; a live JIT/RAM mapping requires app restart. */
+    static dispatch_once_t envBeforeJIT;
+    if (!winios_jit_is_live())
+        dispatch_once(&envBeforeJIT, ^{ winios_load_env_file([self documentsPath]); });
     BOOL ok = winios_jit_acquire(winios_jit_configured_bytes(), detachAfter);
     dispatch_async(_diagQueue, ^{
         [self writeDiagnosticsSnapshot];
@@ -1821,6 +1837,7 @@ static NSString *winios_unpack_resource(NSString *name, NSString *dst) {
         else if (availMB < 3400 && availMB > 1800) ramMB = (availMB - 768) & ~127ull;
         else if (availMB <= 1800) ramMB = 2048;
     }
+    winios_jit_log_memory_config(ramMB);
 
     NSString *sharedDir = [[self documentsPath] stringByAppendingPathComponent:@"Shared"];
     [[NSFileManager defaultManager] createDirectoryAtPath:sharedDir withIntermediateDirectories:YES attributes:nil error:nil];

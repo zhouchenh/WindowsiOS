@@ -1075,12 +1075,12 @@ private struct AdvancedSettings: View {
                 Picker(L("内存", "Memory"), selection: $vm.ramLimitMB) {
                     Text(L("自动", "Automatic")).tag(0)
                     ForEach(VMViewModel.ramChoices, id: \.self) { mb in
-                        Text("\(mb / 1024) GB").tag(mb)
+                        Text(mb % 1024 == 0 ? "\(mb / 1024) GB" : "\(mb) MB").tag(mb)
                     }
                 }
             } footer: {
-                Text(L("给虚拟机的内存上限（Windows 和 Arch Linux 共用）。“自动”会用设备能给的最大值（最多 16 GB，并给系统留出约 2.5 GB）。设备给不了所选大小时会自动降一档。",
-                       "The most memory the virtual machine gets (shared by Windows and Arch Linux). Automatic uses as much as the device allows (up to 16 GB, leaving about 2.5 GB for iOS). If the device cannot give the chosen size, the next smaller one is used."))
+                Text(L("给虚拟机的内存上限（Windows 和 Arch Linux 共用）。“自动”会用设备能给的最大值（最多 16 GB，并给系统留出约 2.5 GB）。设备给不了所选大小时会自动降一档。改动在下次启动 App 后生效。",
+                       "The most memory the virtual machine gets (shared by Windows and Arch Linux). Automatic uses as much as the device allows (up to 16 GB, leaving about 2.5 GB for iOS). If the device cannot give the chosen size, the next smaller one is used. Changes take effect after restarting the app."))
             }
 
             DiskSizeSection(vm: vm)
