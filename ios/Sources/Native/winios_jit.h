@@ -29,7 +29,9 @@ typedef struct WinIosDualMapping {
 /* User limits from the app's advanced settings, set before JIT is acquired: the JIT code cache
    (MiB, 0 = the default) and the most guest RAM to reserve (MiB, 0 = as much as fits). */
 void winios_jit_configure(uint32_t jit_mb, uint32_t ram_mb);
-/* Before JIT is acquired: whether 3D will be on (keeps more address space free for Metal). */
+/* Before JIT is acquired: whether 3D will be on (probes more VA room for Metal).
+ * Reads HV_3D_ROOM_MB from the process environment again before RAM allocation;
+ * callers using env.txt must load it before acquiring JIT. */
 void winios_jit_configure_3d(bool on);
 size_t winios_jit_configured_bytes(void);
 void winios_jit_install_trap_handler(void);

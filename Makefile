@@ -182,7 +182,13 @@ ios-lib: $(IB)/libwinvm.a
 clean:
 	rm -rf $(B)
 
-.PHONY: all test-core test-dns test-net test-neptune test-fb-capture test-dxmt-shared-init ios-lib clean
+.PHONY: all test-core test-dns test-net test-neptune test-fb-capture test-dxmt-shared-init test-jit-budget ios-lib clean
+
+$(B)/test_winios_jit_budget: tests/test_winios_jit_budget.c ios/Sources/Native/winios_jit_budget.h | $(B)
+	$(CC) $(CFLAGS) -Werror -fsanitize=address,undefined -fno-sanitize-recover=all $< -o $@
+
+test-jit-budget: $(B)/test_winios_jit_budget
+	./$(B)/test_winios_jit_budget
 
 # ---- Windows guest tools: build/guest/WinIOSBrowser.exe (the OAuth bridge, see docs/oauth-bridge.md) ----
 # Freestanding AArch64 Win32: no CRT, only kernel32/ws2_32 imports. Needs Homebrew llvm and lld.
