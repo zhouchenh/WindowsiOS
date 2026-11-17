@@ -98,7 +98,9 @@ if ($Watch) {
         } catch {
             if ($null -eq $seen -and (Is404 $_)) { $seen = '' } # no file: nothing asked yet
         }
-        Start-Sleep -Seconds 2
+        # every second: the app may ask from the background (auto-2D when leaving the app), where each second
+        # counts; a local read of the share costs next to nothing
+        Start-Sleep -Seconds 1
     }
 }
 

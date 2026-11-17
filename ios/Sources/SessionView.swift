@@ -763,6 +763,9 @@ private struct SettingsSheet: View {
                          "3D needs the 3D driver installed in Windows first (run START.bat on the WINKIT disk). If the screen stays black after turning it on, turn it off here and restart the app. Applies the next time Windows starts."))
             }
 
+            LeavingAppSection() // auto-2D, Picture in Picture, back to 3D (Windows): ServerMode.swift
+            BackgroundTestSection() // diagnostics for the above: BackgroundTest.swift
+
             Section {
                 ForEach(chromeSurfaces, id: \.self) { s in
                     Toggle(s.title, isOn: Binding(

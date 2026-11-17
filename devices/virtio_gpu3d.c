@@ -166,6 +166,7 @@ typedef struct Parked {
     struct Parked *next;
     Hdr h;
     uint32_t epoch;
+    uint64_t parked_ns; /* CLOCK_MONOTONIC: background drain answers it a grace period later */
     HvVirtqElem e;
 } Parked;
 
@@ -196,6 +197,8 @@ struct HvVgpu3d {
     uint32_t epoch;      /* bumped by a driver reset */
     uint32_t done_epoch; /* the worker has reset the renderer for this one */
     FenceEv *events;
+    HvVgpu3dDrain drain; /* background drain (hv_vgpu3d_set_background) */
+    uint64_t drain_trips;
 
     /* worker only */
     int used; /* the renderer did work (a command, a cursor read-back) since its last reset */
@@ -208,6 +211,10 @@ struct HvVgpu3d {
     uint32_t nlive, nlive_npt, peak_live;
     uint64_t ctx_failed, ctx_destroyed, ctx_destroy_unknown;
     uint64_t fenced_ring, fenced_global; /* fenced commands by timeline */
+    uint64_t drained_ring, drained_global; /* fences answered by background drain, not by the renderer */
+    uint64_t drained_trip;                 /* ... since drain last went on */
+    uint64_t drain_max_age_ns;             /* the oldest fence drain answered (from when it was parked) */
+    int drain_was_on;                      /* the worker's view: the trip's totals are logged when it ends */
     Res3d res[MAX_RES3D];
     uint32_t capsets[8], ncapsets;
     uint32_t scanout_res;
@@ -1156,6 +1163,65 @@ static uint32_t process(HvVgpu3d *s, const HvVirtqElem *e, const Hdr *h, uint32_
     (void)got;
 }
 
+static uint64_t mono_ns(void) {
+    return clock_gettime_nsec_np(CLOCK_MONOTONIC);
+}
+
+/* Background drain (worker): answers every parked fence that is due, oldest first, and logs the trip's totals when
+   drain goes off. */
+static void drain_parked(HvVgpu3d *s, const HvVgpu3dDrain *d) {
+    if (!d->on) {
+        if (s->drain_was_on) {
+            s->drain_was_on = 0;
+            WARN("background drain off: %llu fences answered by drain this time (oldest %llu ms; %llu ring, %llu global "
+                 "in all); %s parked now\n",
+                 (unsigned long long)s->drained_trip, (unsigned long long)(s->drain_max_age_ns / 1000000ull),
+                 (unsigned long long)s->drained_ring, (unsigned long long)s->drained_global, s->fenceq ? "some" : "none");
+        }
+        return;
+    }
+    if (!s->drain_was_on) {
+        s->drain_was_on = 1;
+        s->drained_trip = 0;
+        s->drain_max_age_ns = 0;
+    }
+    if (!s->fenceq) return;
+    uint64_t now = mono_ns();
+    Parked *due = NULL; /* the queue is newest first: taken off in that order and pushed here, it is oldest first */
+    for (Parked **pp = &s->fenceq; *pp;) {
+        Parked *p = *pp;
+        if (hv_vgpu3d_drain_due(d, p->parked_ns, now)) {
+            *pp = p->next;
+            p->next = due;
+            due = p;
+        } else {
+            pp = &p->next;
+        }
+    }
+    while (due) {
+        Parked *p = due;
+        due = p->next;
+        int ring = (p->h.flags & FLAG_RING_IDX) != 0;
+        uint64_t age = now - p->parked_ns;
+        if (age > s->drain_max_age_ns) s->drain_max_age_ns = age;
+        if (ring) s->drained_ring++;
+        else {
+            s->drained_global++;
+            s->nparked_global--;
+        }
+        s->drained_trip++;
+        if (s->drained_trip <= 20)
+            WARN("background drain: %s fence %llu (ctx %u ring %u, cmd %#x) answered after %llu ms\n", ring ? "ring" : "global",
+                 (unsigned long long)p->h.fence_id, p->h.ctx_id, ring ? p->h.ring_idx : 0, p->h.type,
+                 (unsigned long long)(age / 1000000ull));
+        else if (s->drained_trip == 21)
+            WARN("background drain: more fences answered (the count is in the trip's summary and the status line)\n");
+        respond(s, &p->e, &p->h, p->epoch, RESP_OK_NODATA, NULL, 0);
+        s->fences++;
+        free(p);
+    }
+}
+
 static void complete_fences(HvVgpu3d *s, const FenceEv *f) {
     Parked **pp = &s->fenceq;
     while (*pp) {
@@ -1207,12 +1273,15 @@ static void renderer_reset(HvVgpu3d *s) {
         free(s->res[i].iov);
         memset(&s->res[i], 0, sizeof s->res[i]);
     }
+    uint32_t dropped = 0;
     while (s->fenceq) {
         Parked *p = s->fenceq;
         s->fenceq = p->next;
         free(p);
+        dropped++;
     }
     s->nparked_global = 0;
+    if (dropped && s->drain_was_on) WARN("renderer reset in background drain: %u parked fences dropped\n", dropped);
     if (s->page_host) {
         memset(s->page_host, 0, (s->win_size >> 12) * sizeof *s->page_host);
         sync_tlbs(s);
@@ -1270,17 +1339,32 @@ static void *worker(void *arg) {
     static uint8_t req[HDR + 64 + 32];
     for (;;) {
         pthread_mutex_lock(&s->mu);
+        /* background drain: wake when the oldest parked fence is due (the queue is the worker's own) */
+        uint64_t drain_wake = UINT64_MAX;
+        for (Parked *p = s->fenceq; p && s->drain.on; p = p->next) {
+            uint64_t t = hv_vgpu3d_drain_due_at(&s->drain, p->parked_ns);
+            if (t < drain_wake) drain_wake = t;
+        }
         while (!s->kicked && !s->events && s->done_epoch == s->epoch) {
-            if (s->nparked_global) {
+            if (s->nparked_global || drain_wake != UINT64_MAX) {
+                uint64_t now = mono_ns();
+                uint64_t wait = s->nparked_global ? 1000000ull : 1000000000ull;
+                if (drain_wake != UINT64_MAX) {
+                    uint64_t left = drain_wake > now ? drain_wake - now : 0;
+                    if (left < wait) wait = left;
+                }
+                if (!wait) break;
                 struct timespec ts;
                 clock_gettime(CLOCK_REALTIME, &ts);
-                ts.tv_nsec += 1000000;
+                ts.tv_sec += (time_t)(wait / 1000000000ull);
+                ts.tv_nsec += (long)(wait % 1000000000ull);
                 if (ts.tv_nsec >= 1000000000) ts.tv_sec++, ts.tv_nsec -= 1000000000;
                 if (pthread_cond_timedwait(&s->cv, &s->mu, &ts) == ETIMEDOUT) break;
             } else {
                 pthread_cond_wait(&s->cv, &s->mu);
             }
         }
+        HvVgpu3dDrain drain = s->drain;
         s->kicked = 0;
         int cursor_pending = s->cursor_pending;
         uint32_t cursor_res = s->cursor_req;
@@ -1304,6 +1388,7 @@ static void *worker(void *arg) {
             ev = n;
         }
         if (s->nparked_global) V.virgl_renderer_poll(); /* global fences retire from here */
+        drain_parked(s, &drain);
         if (cursor_pending) {
             s->used = 1;
             fetch_cursor(s, cursor_res);
@@ -1376,6 +1461,7 @@ static void *worker(void *arg) {
                 V.virgl_renderer_create_fence((int)p->h.fence_id, p->h.type);
                 s->nparked_global++;
             }
+            p->parked_ns = mono_ns();
             p->next = s->fenceq;
             s->fenceq = p;
         }
@@ -1466,6 +1552,20 @@ void hv_vgpu3d_reset(HvVgpu3d *s) {
     pthread_mutex_unlock(&s->mu);
 }
 
+void hv_vgpu3d_set_background(HvVgpu3d *s, int on) {
+    if (!s) return;
+    pthread_mutex_lock(&s->mu);
+    int was = s->drain.on;
+    hv_vgpu3d_drain_set(&s->drain, on, mono_ns());
+    if (on && !was) s->drain_trips++;
+    s->kicked = 1; /* the worker looks at its parked fences again */
+    pthread_cond_signal(&s->cv);
+    pthread_mutex_unlock(&s->mu);
+    if ((on != 0) != was)
+        fprintf(stderr, "winvm: virtio-gpu 3D background drain %s (parked fences answered after %llu ms)\n", on ? "on" : "off",
+                (unsigned long long)(HV_VGPU3D_DRAIN_GRACE_NS / 1000000ull));
+}
+
 void hv_vgpu3d_bar_update(HvVgpu3d *s) {
     if (!s || !s->win) return;
     HvPciDev *d = &s->g->vio.pci;
@@ -1490,10 +1590,13 @@ int hv_vgpu3d_describe(HvVgpu3d *s, char *buf, unsigned len) {
     if (!s) s = g_state;
     if (!s) return snprintf(buf, len, "off");
     if (s->init_ok < 0) return snprintf(buf, len, "unavailable (%s)", s->why);
+    pthread_mutex_lock(&s->mu);
+    int drain_on = s->drain.on;
+    pthread_mutex_unlock(&s->mu);
     return snprintf(buf, len,
                     "on capsets=%u ctxs=%llu cmds=%llu submits=%llu (%lluKB) blobs=%llu maps=%llu fences=%llu "
                     "(ring %llu global %llu) errors=%llu submit_errors=%llu live_ctxs=%u (neptune %u, peak %u) scanout=%u %ux%u%s "
-                    "resets=%llu (skipped %llu) hostmem@%#llx",
+                    "resets=%llu (skipped %llu) hostmem@%#llx drain=%s trips=%llu drained=%llu (ring %llu global %llu, this trip %llu, oldest %llums)",
                     s->ncapsets, (unsigned long long)s->ctxs, (unsigned long long)s->cmds,
                     (unsigned long long)s->submits, (unsigned long long)(s->submit_bytes >> 10),
                     (unsigned long long)s->blobs, (unsigned long long)s->maps, (unsigned long long)s->fences,
@@ -1502,5 +1605,9 @@ int hv_vgpu3d_describe(HvVgpu3d *s, char *buf, unsigned len) {
                     s->scanout_res, s->sc_w,
                     s->sc_h,
                     s->scanout_handle || (s->g && s->g->fb && s->g->fb->ovr_tex) ? " metal" : "",
-                    (unsigned long long)s->resets, (unsigned long long)s->resets_skipped, (unsigned long long)s->win_pa);
+                    (unsigned long long)s->resets, (unsigned long long)s->resets_skipped, (unsigned long long)s->win_pa,
+                    drain_on ? "on" : "off", (unsigned long long)s->drain_trips,
+                    (unsigned long long)(s->drained_ring + s->drained_global), (unsigned long long)s->drained_ring,
+                    (unsigned long long)s->drained_global, (unsigned long long)s->drained_trip,
+                    (unsigned long long)(s->drain_max_age_ns / 1000000ull));
 }

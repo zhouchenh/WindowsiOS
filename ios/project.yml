@@ -130,6 +130,12 @@ targets:
       - sdk: CoreGraphics.framework
       - sdk: ImageIO.framework
       - sdk: UniformTypeIdentifiers.framework
+      # Windows in Picture in Picture (winios_pip.m) and the background test (BackgroundTest.swift)
+      - sdk: AVKit.framework
+      - sdk: CoreMedia.framework
+      - sdk: CoreVideo.framework
+      - sdk: Accelerate.framework
+      - sdk: BackgroundTasks.framework
     # builtin-jit: the helper links StikJIT; it lives in the app's Frameworks with a minimal
     # Info.plist (installd refuses a framework without one), signed here when signing is on.
     # From Henge's project.yml (7b55730).

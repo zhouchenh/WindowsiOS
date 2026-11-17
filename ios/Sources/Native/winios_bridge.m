@@ -60,6 +60,15 @@ NSNotificationName const WinIOSDisplayWillReshapeNotification = @"WinIOSDisplayW
     BOOL _started3D;            /* host 3D was on when this machine started (the renderer loaded) */
     int64_t _gpuSwitchSeq;
     UIBackgroundTaskIdentifier _bgGrace;
+    /* auto-2D when leaving the app (main thread) */
+    BOOL _autoSwitch2D, _autoAway, _autoDone, _presenterPaused;
+    int64_t _autoSeq;
+    double _autoRunSecs;       /* seconds Windows ran since the auto switch was asked (paused time does not count) */
+    CFAbsoluteTime _autoStart, _autoLastTick;
+    NSTimer *_autoWatch;
+    /* the audio session (PiP test) */
+    BOOL _pipArmed;
+    NSInteger _pipAudioCategory, _appliedAudioMode;
 
     /* display sizing engine (main thread) */
     CGFloat _viewNativeScale;
@@ -98,6 +107,9 @@ NSNotificationName const WinIOSDisplayWillReshapeNotification = @"WinIOSDisplayW
 - (void)updateUnpackProgress:(double)frac;
 - (void)startDiagTimer;
 - (void)stopDiagTimer;
+- (int64_t)writeGraphicsRequest3D:(BOOL)on;
+- (void)startAutoSwitch;
+- (void)endAutoSwitchAway;
 @end
 
 /* The presenter's hold ended by itself (fb_metal.m): the canvas recomputes its gravity (MetalDisplayView
@@ -288,29 +300,70 @@ static const AVAudioSessionCategoryOptions kWinIOSAudioOptions = AVAudioSessionC
                                                                   AVAudioSessionCategoryOptionAllowBluetoothA2DP |
                                                                   AVAudioSessionCategoryOptionMixWithOthers;
 
-- (void)configureAudioSession {
+/* The category: the app's own (PlayAndRecord, mixing with other apps), or, only while PiP is armed and the background
+   test asks for it, Playback (mixing, or alone) to find out what automatic Picture in Picture needs. */
+- (void)applyAudioCategory {
     AVAudioSession *session = [AVAudioSession sharedInstance];
+    NSInteger mode = _pipArmed ? _pipAudioCategory : 0;
     NSError *err = nil;
-    if (![session setCategory:AVAudioSessionCategoryPlayAndRecord mode:AVAudioSessionModeDefault options:kWinIOSAudioOptions error:&err]) {
+    if (mode == 1) {
+        [session setCategory:AVAudioSessionCategoryPlayback mode:AVAudioSessionModeDefault
+                     options:AVAudioSessionCategoryOptionMixWithOthers error:&err];
+    } else if (mode == 2) {
+        [session setCategory:AVAudioSessionCategoryPlayback mode:AVAudioSessionModeDefault options:0 error:&err];
+    } else if (![session setCategory:AVAudioSessionCategoryPlayAndRecord mode:AVAudioSessionModeDefault options:kWinIOSAudioOptions error:&err]) {
         /* Fallback to Playback if PlayAndRecord temporarily rejected before permission */
         [session setCategory:AVAudioSessionCategoryPlayback withOptions:AVAudioSessionCategoryOptionMixWithOthers error:nil];
     }
+    if (mode != _appliedAudioMode) {
+        _appliedAudioMode = mode;
+        fprintf(stderr, "winvm: audio session: %s%s%s\n", self.audioCategoryName.UTF8String,
+                mode ? " (background test: while Picture in Picture is armed)" : "",
+                err ? [NSString stringWithFormat:@" (error %ld)", (long)err.code].UTF8String : "");
+    }
+}
+
+- (NSString *)audioCategoryName {
+    AVAudioSession *s = [AVAudioSession sharedInstance];
+    NSString *cat = [s.category stringByReplacingOccurrencesOfString:@"AVAudioSessionCategory" withString:@""];
+    return [cat stringByAppendingString:(s.categoryOptions & AVAudioSessionCategoryOptionMixWithOthers) ? @"+mix" : @""];
+}
+
+- (BOOL)pipArmed { return _pipArmed; }
+- (void)setPipArmed:(BOOL)on {
+    if (on == _pipArmed) return;
+    _pipArmed = on;
+    if (_pipAudioCategory) {
+        [self applyAudioCategory];
+        if (_vmRunning) hv_audio_restart_output(0);
+    }
+}
+- (NSInteger)pipAudioCategory { return _pipAudioCategory; }
+- (void)setPipAudioCategory:(NSInteger)mode {
+    mode = mode < 0 || mode > 2 ? 0 : mode;
+    if (mode == _pipAudioCategory) return;
+    _pipAudioCategory = mode;
+    [self applyAudioCategory];
+    if (_vmRunning) hv_audio_restart_output(0);
+}
+
+- (void)configureAudioSession {
+    AVAudioSession *session = [AVAudioSession sharedInstance];
+    [self applyAudioCategory];
     [session setPreferredSampleRate:48000.0 error:nil];
     [session setPreferredIOBufferDuration:0.010 error:nil];
     [session setActive:YES error:nil];
 }
 
 - (void)configureAudioSessionAndMicPermission {
-    AVAudioSessionCategoryOptions opts = kWinIOSAudioOptions;
     [self configureAudioSession];
 
     if (@available(iOS 17.0, *)) {
         [AVAudioApplication requestRecordPermissionWithCompletionHandler:^(BOOL granted) {
             if (granted) {
                 dispatch_async(dispatch_get_main_queue(), ^{
-                    AVAudioSession *s = [AVAudioSession sharedInstance];
-                    [s setCategory:AVAudioSessionCategoryPlayAndRecord mode:AVAudioSessionModeDefault options:opts error:nil];
-                    [s setActive:YES error:nil];
+                    [self applyAudioCategory];
+                    [[AVAudioSession sharedInstance] setActive:YES error:nil];
                 });
             }
         }];
@@ -374,7 +427,9 @@ static const AVAudioSessionCategoryOptions kWinIOSAudioOptions = AVAudioSessionC
    running there (host 3D or a switch pending, a debugger, Linux, or server mode off), and when Keep screen on is
    set. Evaluated again on every change of these (graphics switches and driver restarts: also from the diag tick). */
 - (void)applyIdleTimer {
-    BOOL bgOK = _runInBackground && !winios_machine_is_linux() && self.backgroundBlocker == WinIOSBackgroundBlockerNothing;
+    /* whether the screen may lock stays server mode's choice; auto-2D only widens what can run in the background */
+    BOOL bgOK = _runInBackground && !winios_machine_is_linux() &&
+                (self.backgroundBlocker == WinIOSBackgroundBlockerNothing || self.autoSwitchPossible);
     BOOL keep = _vmRunning && (_keepScreenOn || !bgOK);
     UIApplication *app = UIApplication.sharedApplication;
     if (app.idleTimerDisabled == keep) return;
@@ -400,8 +455,15 @@ static const AVAudioSessionCategoryOptions kWinIOSAudioOptions = AVAudioSessionC
     _bgGrace = [[UIApplication sharedApplication] beginBackgroundTaskWithName:@"winvm.background"
                                                             expirationHandler:^{ [self endBackgroundGrace]; }];
     WinIOSBackgroundBlocker blocker = self.backgroundBlocker;
-    BOOL keep = (_runInBackground && !winios_machine_is_linux() && blocker == WinIOSBackgroundBlockerNothing) ||
+    BOOL isLinux = winios_machine_is_linux();
+    BOOL autoSwitch = self.autoSwitchPossible; /* before anything changes the offer */
+    BOOL keep = ((_runInBackground || _autoSwitch2D) && !isLinux && blocker == WinIOSBackgroundBlockerNothing) || autoSwitch ||
                 getenv("WINIOS_RUN_IN_BACKGROUND");
+    if (autoSwitch) [self startAutoSwitch];
+    if (keep && !isLinux) {
+        hv_winvm_display_set_paused(1); /* nothing is presented in the background (iOS refuses it anyway) */
+        _presenterPaused = YES;
+    }
     if (!keep) {
         _pausedInBackground = YES;
         [self applyPause];
@@ -414,7 +476,8 @@ static const AVAudioSessionCategoryOptions kWinIOSAudioOptions = AVAudioSessionC
         hv_audio_pause_capture(1); /* no microphone (and no indicator) while away */
         [self applyAudioKeepAlive];
         hv_audio_restart_output(0);
-        fprintf(stderr, "winvm: keeps running in the background (server mode; audio output %s)\n",
+        fprintf(stderr, "winvm: keeps running in the background (%s; audio output %s)\n",
+                autoSwitch ? "auto-2D" : _runInBackground ? "server mode" : _autoSwitch2D ? "auto-2D, already on 2D" : "WINIOS_RUN_IN_BACKGROUND",
                 hv_audio_output_running() ? "running" : "NOT running: iOS may suspend the app");
     }
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(10 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
@@ -454,7 +517,110 @@ static const AVAudioSessionCategoryOptions kWinIOSAudioOptions = AVAudioSessionC
 - (void)onAppActive:(NSNotification *)note {
     (void)note;
     [self resumeFromBackground];
+    /* only now, not at WillEnterForeground: the GPU is refused until the app is active again */
+    [self endAutoSwitchAway];
+    if (_presenterPaused) {
+        _presenterPaused = NO;
+        hv_winvm_display_set_paused(0);
+    }
     [self pushBattery];
+}
+
+/* ---- auto-2D when leaving the app ---- */
+
+- (BOOL)autoSwitch2D { return _autoSwitch2D; }
+- (void)setAutoSwitch2D:(BOOL)on {
+    if (on == _autoSwitch2D) return;
+    _autoSwitch2D = on;
+    fprintf(stderr, "winvm: auto-2D when leaving the app %s\n", on ? "on" : "off");
+    [self applyIdleTimer];
+}
+- (int64_t)autoSwitchSeq { return _autoSeq; }
+- (BOOL)autoSwitchAway { return _autoAway; }
+
+- (BOOL)autoSwitchPossible {
+    if (!_autoSwitch2D || !_vmRunning || !_started3D || winios_machine_is_linux() || winios_jit_is_traced()) return NO;
+    WinIOSGraphicsMode g = [self graphicsMode];
+    return g.capable && (g.offered3D || g.negotiated3D);
+}
+
+- (nullable NSString *)gpuStatusLine {
+    if (!_vmRunning) return nil;
+    char line[1024];
+    if (hv_winvm_gpu_status(line, sizeof line) < 0) return nil;
+    return [NSString stringWithUTF8String:line];
+}
+
+/* didEnterBackground, Windows on 3D: never blocks (a lock, a small file). */
+- (void)startAutoSwitch {
+    WinIOSGraphicsMode g = [self graphicsMode];
+    _autoAway = YES;
+    _autoDone = NO;
+    _autoRunSecs = 0;
+    _autoStart = _autoLastTick = CFAbsoluteTimeGetCurrent();
+    hv_winvm_gpu_set_background(1); /* first: from now on no fence waits on refused GPU work for long */
+    if (g.offered3D) {
+        hv_winvm_gpu_set_3d(0);
+        _autoSeq = [self writeGraphicsRequest3D:NO];
+        fprintf(stderr, "winvm: auto-2D: left the app on 3D: 2D offered, Windows asked to restart its display adapter "
+                        "(request %lld; driver now %s, %u resets)\n", (long long)_autoSeq, g.negotiated3D ? "3D" : "2D", g.resets);
+    } else {
+        _autoSeq = _gpuSwitchSeq; /* a switch to 2D asked earlier is still under way: it goes on */
+        fprintf(stderr, "winvm: auto-2D: left the app with the switch to 2D under way (request %lld): it goes on in the background\n",
+                (long long)_autoSeq);
+    }
+    [_autoWatch invalidate];
+    _autoWatch = [NSTimer scheduledTimerWithTimeInterval:1.0 target:self selector:@selector(autoSwitchWatch:) userInfo:nil repeats:YES];
+    _autoWatch.tolerance = 0.2;
+}
+
+/* Every second while away: done once the 3D driver is gone; Windows paused if it is still there after 60 s of running. */
+- (void)autoSwitchWatch:(NSTimer *)t {
+    (void)t;
+    if (!_vmRunning || !_autoAway) {
+        [_autoWatch invalidate];
+        _autoWatch = nil;
+        return;
+    }
+    CFAbsoluteTime now = CFAbsoluteTimeGetCurrent();
+    if (!_pausedInBackground && !_guardPaused) _autoRunSecs += MIN(MAX(now - _autoLastTick, 0.0), 1.5);
+    _autoLastTick = now;
+    WinIOSGraphicsMode g = [self graphicsMode];
+    if (!g.negotiated3D) {
+        if (!_autoDone) {
+            _autoDone = YES;
+            fprintf(stderr, "winvm: auto-2D: the display driver %s without 3D after %.1f s (%.1f s running, %u resets)\n",
+                    g.driverOK ? "runs" : "stopped (basic display, or starting)", now - _autoStart, _autoRunSecs, g.resets);
+            [self applyIdleTimer];
+        }
+        if (g.driverOK) { /* settled: nothing more to watch */
+            [_autoWatch invalidate];
+            _autoWatch = nil;
+        }
+        return;
+    }
+    if (_autoRunSecs > 60.0 && !_pausedInBackground) {
+        fprintf(stderr, "winvm: auto-2D: the 3D driver still runs after %.0f s of Windows running in the background: Windows "
+                        "paused until the app is back (the switch goes on then)\n", _autoRunSecs);
+        _pausedInBackground = YES;
+        [self applyPause];
+        [_autoWatch invalidate];
+        _autoWatch = nil;
+    }
+}
+
+/* didBecomeActive: drain off; the switch (if it is not done) goes on in the front. */
+- (void)endAutoSwitchAway {
+    if (!_autoAway) return;
+    _autoAway = NO;
+    [_autoWatch invalidate];
+    _autoWatch = nil;
+    hv_winvm_gpu_set_background(0);
+    WinIOSGraphicsMode g = [self graphicsMode];
+    fprintf(stderr, "winvm: auto-2D: back in front after %.1f s: drain off, display driver %s%s\n",
+            CFAbsoluteTimeGetCurrent() - _autoStart, g.negotiated3D ? "still 3D" : g.driverOK ? "2D" : "not running",
+            g.negotiated3D && !g.offered3D ? " (the switch goes on)" : "");
+    [self applyIdleTimer];
 }
 
 /* ---- Battery: the iPhone's battery as Windows' battery and AC adapter ---- */
@@ -560,7 +726,8 @@ static BOOL winios_battery_setting(void) {
 - (WinIOSBackgroundBlocker)backgroundBlocker {
     if (!_vmRunning) return WinIOSBackgroundBlockerNotRunning;
     WinIOSGraphicsMode g = [self graphicsMode];
-    if (g.negotiated3D && !g.offered3D) return WinIOSBackgroundBlockerSwitchPending;
+    /* a switch auto-2D started when the app left runs in the background with drain on: it does not hold Windows */
+    if (g.negotiated3D && !g.offered3D) return _autoAway ? WinIOSBackgroundBlockerNothing : WinIOSBackgroundBlockerSwitchPending;
     if (g.negotiated3D || g.offered3D) return WinIOSBackgroundBlockerHost3D;
     if (winios_jit_is_traced()) return WinIOSBackgroundBlockerDebugger;
     return WinIOSBackgroundBlockerNothing;
@@ -613,6 +780,12 @@ static BOOL winios_battery_setting(void) {
     }
     [self applyIdleTimer]; /* 3D offered again: the screen stays on */
     if (!restart) return 0;
+    return [self writeGraphicsRequest3D:on];
+}
+
+/* A new request for WinKit's graphics task (the offer is already set). Any app state: auto-2D writes it from
+   didEnterBackground. */
+- (int64_t)writeGraphicsRequest3D:(BOOL)on {
     _gpuSwitchSeq = MAX(_gpuSwitchSeq + 1, (int64_t)([[NSDate date] timeIntervalSince1970] * 10.0));
     NSString *dir = [[self documentsPath] stringByAppendingPathComponent:@"Shared"];
     [[NSFileManager defaultManager] createDirectoryAtPath:dir withIntermediateDirectories:YES attributes:nil error:nil];
@@ -1791,6 +1964,7 @@ static NSString *winios_unpack_resource(NSString *name, NSString *dst) {
     _vmRunning = YES;
     _guardPaused = NO;
     _pausedInBackground = NO;
+    _autoSeq = 0;
     [self applyAudioKeepAlive]; /* after hv_audio_attach_hda (in hv_winvm_create) */
     _touchDown = 0;
     _bootStartTime = CFAbsoluteTimeGetCurrent();
@@ -2112,6 +2286,11 @@ static void winios_type_run(NSString *text) {
     [self stopDiagTimer];
     [self endReshapeWatch:WinIOSReshapeStateIdle]; /* display hook */
     hv_fb_metal_hold_for_size(0, 0, 0);
+    _autoAway = NO; /* the machine's drain and switch went with it */
+    [_autoWatch invalidate];
+    _autoWatch = nil;
+    _presenterPaused = NO;
+    hv_winvm_display_set_paused(0); /* the next machine's presenter starts drawing */
     [self applyIdleTimer];
     _vmStatus = [NSString stringWithFormat:@"Stopped (%@)", reason];
     dispatch_async(_diagQueue, ^{ [self writeDiagnosticsSnapshot]; });

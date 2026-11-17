@@ -9,7 +9,10 @@
    - A 2D driver after a switch is never taken for the firmware (GET_DISPLAY_INFO answers the preferred size, not
      ramfb's), while the firmware itself at boot still is.
    - Without the renderer: 3D cannot be offered (-1) and nothing changes.
-   - fb_display: 3D's read-back buffer leaves the screen only while it is still what the screen shows. */
+   - fb_display: 3D's read-back buffer leaves the screen only while it is still what the screen shows.
+   - Background drain (virtio_gpu3d.h): when a parked fence is answered by the host itself while the app is in the
+     background, played through a stand-in fence queue the way the worker uses it; and the device passes the setting
+     on to its renderer. */
 #include "fb_display.h"
 #include "virtio_gpu.h"
 #include "virtio_gpu3d.h"
@@ -86,6 +89,10 @@ void hv_vgpu3d_kick(HvVgpu3d *s) { (void)s; }
 void hv_vgpu3d_cursor(HvVgpu3d *s, uint32_t res) { (void)s, (void)res; }
 void hv_vgpu3d_reset(HvVgpu3d *s) { if (s) renderer_resets++; }
 void hv_vgpu3d_bar_update(HvVgpu3d *s) { (void)s; }
+static int background_calls, background_on;
+void hv_vgpu3d_set_background(HvVgpu3d *s, int on) {
+    if (s) background_calls++, background_on = on;
+}
 int hv_vgpu3d_describe(HvVgpu3d *s, char *buf, unsigned len) { return snprintf(buf, len, "%s", s ? "on" : "off"); }
 
 /* ---- a driver starting, as the transport sees it ---- */
@@ -244,8 +251,77 @@ static void renderer_reset_plan(void) {
     check("reset plan: a parked fence alone", hv_vgpu3d_reset_needed(&one));
 }
 
+/* The worker's use of the drain plan over a queue of parked fences: what is answered at a given moment, oldest first,
+   and when it next has to wake. */
+#define MS 1000000ull
+typedef struct { uint64_t parked_ns; int answered; uint64_t at; } FakeFence;
+static int drain_pass(const HvVgpu3dDrain *d, FakeFence *f, int n, uint64_t now, uint64_t *wake) {
+    int answered = 0;
+    *wake = UINT64_MAX;
+    for (int i = 0; i < n; i++) {
+        if (f[i].answered) continue;
+        if (hv_vgpu3d_drain_due(d, f[i].parked_ns, now)) {
+            f[i].answered = 1, f[i].at = now;
+            answered++;
+        } else {
+            uint64_t t = hv_vgpu3d_drain_due_at(d, f[i].parked_ns);
+            if (t < *wake) *wake = t;
+        }
+    }
+    return answered;
+}
+
+static void background_drain(void) {
+    HvVgpu3dDrain d;
+    memset(&d, 0, sizeof d);
+    uint64_t wake;
+    check("drain off: never due", !hv_vgpu3d_drain_due(&d, 0, 3600000 * MS) && hv_vgpu3d_drain_due_at(&d, 5) == UINT64_MAX);
+    /* parked in the foreground long before the app left, a fresh one just before, one in the background */
+    FakeFence f[3] = {{.parked_ns = 1000 * MS}, {.parked_ns = 9900 * MS}, {.parked_ns = 10100 * MS}};
+    check("drain off: the worker sleeps without a deadline", drain_pass(&d, f, 3, 10000 * MS, &wake) == 0 && wake == UINT64_MAX);
+    hv_vgpu3d_drain_set(&d, 1, 10000 * MS); /* the app goes to the background at 10 s */
+    check("drain on: nothing answered at once, even a fence parked long ago",
+          drain_pass(&d, f, 3, 10000 * MS, &wake) == 0 && wake == 10250 * MS);
+    check("drain on: the grace period counts from going on", drain_pass(&d, f, 3, 10249 * MS, &wake) == 0);
+    check("drain on: after the grace both earlier fences are answered", drain_pass(&d, f, 3, 10250 * MS, &wake) == 2 &&
+                                                                         f[0].answered && f[1].answered && !f[2].answered);
+    check("drain on: a fence parked in the background waits its own grace", wake == 10350 * MS &&
+                                                                             drain_pass(&d, f, 3, 10349 * MS, &wake) == 0);
+    check("drain on: then it is answered", drain_pass(&d, f, 3, 10350 * MS, &wake) == 1 && wake == UINT64_MAX);
+    hv_vgpu3d_drain_set(&d, 1, 20000 * MS);
+    check("drain on again while on: the first moment stays", d.since_ns == 10000 * MS);
+    hv_vgpu3d_drain_set(&d, 0, 30000 * MS); /* back in front */
+    FakeFence g[1] = {{.parked_ns = 30000 * MS}};
+    check("drain off again: fences wait for the renderer", drain_pass(&d, g, 1, 90000 * MS, &wake) == 0 && wake == UINT64_MAX);
+    hv_vgpu3d_drain_set(&d, 1, 100000 * MS); /* the next trip */
+    check("next trip: counted from its own start", d.since_ns == 100000 * MS &&
+                                                    !hv_vgpu3d_drain_due(&d, g[0].parked_ns, 100100 * MS) &&
+                                                    hv_vgpu3d_drain_due(&d, g[0].parked_ns, 100250 * MS));
+    d.grace_ns = 5 * MS;
+    check("a grace of its own", hv_vgpu3d_drain_due_at(&d, 100000 * MS) == 100005 * MS);
+    check("no overflow at the end of time", hv_vgpu3d_drain_due_at(&d, UINT64_MAX - 1) == UINT64_MAX - 1);
+
+    /* the device passes the setting on to its renderer, and does nothing without one */
+    renderer_loaded = 1;
+    HvFbDisplay fb;
+    memset(&fb, 0, sizeof fb);
+    pthread_mutex_init(&fb.mu, NULL);
+    HvVirtioGpu *gpu = hv_virtio_gpu_create(NULL, NULL, &fb, 1920, 1200);
+    background_calls = 0;
+    hv_virtio_gpu_set_background(gpu, 1);
+    check("device: background on reaches the renderer", background_calls == 1 && background_on == 1);
+    hv_virtio_gpu_set_background(gpu, 0);
+    check("device: and off", background_calls == 2 && background_on == 0);
+    renderer_loaded = 0;
+    HvVirtioGpu *plain = hv_virtio_gpu_create(NULL, NULL, &fb, 1920, 1200);
+    hv_virtio_gpu_set_background(plain, 1);
+    hv_virtio_gpu_set_background(NULL, 1);
+    check("device: no renderer, nothing to drain", background_calls == 2);
+}
+
 int main(void) {
     with_renderer();
+    background_drain();
     renderer_reset_plan();
     without_renderer();
     override_ownership();

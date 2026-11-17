@@ -584,6 +584,10 @@ int hv_virtio_gpu_set_3d(HvVirtioGpu *g, int on) {
     return 0;
 }
 
+void hv_virtio_gpu_set_background(HvVirtioGpu *g, int on) {
+    if (g && g->g3d) hv_vgpu3d_set_background(g->g3d, on);
+}
+
 void hv_virtio_gpu_mode(HvVirtioGpu *g, HvVgpuMode *out) {
     memset(out, 0, sizeof *out);
     if (!g) return;
