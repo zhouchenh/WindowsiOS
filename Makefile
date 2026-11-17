@@ -126,6 +126,12 @@ test-neptune: $(B)/test_neptune_cleanup
 	python3 tests/test_neptune_hook.py
 	python3 tests/test_neptune_device.py
 	ASAN_OPTIONS=detect_leaks=0 $(B)/test_neptune_cleanup
+$(B)/test_fb_capture: tests/test_fb_capture.m devices/fb_metal.m devices/fb_display.c devices/*.h core/*.h | $(B)
+	$(CC) $(OBJCFLAGS) -Werror -fsanitize=address,undefined -fno-sanitize-recover=all \
+		tests/test_fb_capture.m devices/fb_display.c -framework Foundation -framework Metal \
+		-framework QuartzCore -framework CoreGraphics -framework ImageIO -o $@
+test-fb-capture: $(B)/test_fb_capture
+	ASAN_OPTIONS=detect_leaks=0 $(B)/test_fb_capture
 
 $(B)/hvsparse: tools/hvsparse_main.c host/hvsparse.c host/hvsparse.h | $(B)
 	$(CC) $(CFLAGS) tools/hvsparse_main.c host/hvsparse.c -o $@
@@ -174,7 +180,7 @@ ios-lib: $(IB)/libwinvm.a
 clean:
 	rm -rf $(B)
 
-.PHONY: all test-core test-dns test-net test-neptune ios-lib clean
+.PHONY: all test-core test-dns test-net test-neptune test-fb-capture ios-lib clean
 
 # ---- Windows guest tools: build/guest/WinIOSBrowser.exe (the OAuth bridge, see docs/oauth-bridge.md) ----
 # Freestanding AArch64 Win32: no CRT, only kernel32/ws2_32 imports. Needs Homebrew llvm and lld.
