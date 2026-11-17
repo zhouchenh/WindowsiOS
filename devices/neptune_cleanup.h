@@ -21,13 +21,18 @@ void hv_npt_cleanup_describe(char *buffer, size_t length);
  * batches and device retirement, so a blocked leftover Release cannot delay
  * normal device retirement. The batch FIFO holds at most eight batches; its
  * five-second watchdog counts allowed time after dequeue. Device counter
- * waits remain retryable without an age/count limit. Only an entered native
- * getter/finalizer has a five-second allowed-time watchdog. */
+ * waits remain retryable without an age/count limit, with 10ms..1s backoff.
+ * Entered native calls have a five-second allowed-time watchdog. Returned
+ * passive reads remain usable after a watchdog warning. A stalled initializer
+ * can recover through a successfully completed empty same-queue buffer. */
 void hv_npt_cleanup_set_active(int active);
+/* Recheck inside a native factory before a later commit: a factory may block
+ * across a foreground/background transition. Does not call Metal. */
+int hv_npt_cleanup_gpu_allowed(void);
 
 struct HvNptDeviceSnapshot {
     uint64_t main_goal, main_done, initializer_goal;
-    void *event;
+    void *event, *initializer_queue;
 };
 struct HvNptDeviceOps {
     /* Exact original QI also inlines refcount increments. It runs under the
@@ -38,6 +43,13 @@ struct HvNptDeviceOps {
     int (*snapshot)(void *device, struct HvNptDeviceSnapshot *out);
     /* Called without the mutex, with a deferred private reference held. */
     int (*event_value)(void *event, uint64_t *out);
+    /* Submit an EMPTY buffer on that exact initializer queue. The returned
+     * ticket owns a native reference. Status: 1=successfully completed,
+     * 0=pending, -1=failed (never evidence that earlier work retired).
+     * Calls run outside the lifetime lock, only while GPU work is allowed. */
+    void *(*barrier_begin)(void *queue);
+    int (*barrier_status)(void *ticket);
+    void (*barrier_release)(void *ticket);
     /* Caller already set the private sentinel. Stop/join compiler workers
      * before the exact deleting destructor. Return 1 after destruction, 0
      * on failure with the sealed device/maps intact. Never free on failure. */

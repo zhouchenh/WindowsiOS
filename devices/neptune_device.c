@@ -23,6 +23,8 @@ static bool device_installed, device_creation_started;
 static struct {
     int32_t (*query)(void *, const void *, void **);
     int32_t (*event_value)(void *);
+    int32_t (*pool)(void *), (*retain)(void *), (*release)(void *);
+    int32_t (*command_buffer)(void *), (*commit)(void *), (*status)(void *);
     void (*destroy)(void *);
 } device_calls; /* Immutable before device_image release publication. */
 
@@ -128,7 +130,8 @@ static int device_snapshot(void *device, struct HvNptDeviceSnapshot *out)
     out->main_done=__atomic_load_n((uint64_t *)(queue+0x18),__ATOMIC_ACQUIRE);
     memcpy(&seq,(const void *)(queue+0x10008),8);
     memcpy(&out->event,(const void *)(queue+0x10028),8);
-    if (!next || !seq || (seq>1 && !out->event)) return 0;
+    memcpy(&out->initializer_queue,(const void *)(queue+0x10020),8);
+    if (!next || !seq || (seq>1 && (!out->event || !out->initializer_queue))) return 0;
     out->main_goal=next-1;
     out->initializer_goal=seq-1;
     return 1;
@@ -143,6 +146,43 @@ static int device_event_value(void *event, uint64_t *out)
     if (device_calls.event_value(&args)) return 0;
     *out=args.value;
     return 1;
+}
+static void *device_barrier_begin(void *queue)
+{
+    if (!atomic_load_explicit(&device_image,memory_order_acquire) || !queue ||
+        !hv_npt_cleanup_gpu_allowed()) return NULL;
+    void *pool=NULL;
+    device_calls.pool(&pool);
+    if (!pool) return NULL;
+    struct {void *queue, *buffer;} args={queue,NULL};
+    if (hv_npt_cleanup_gpu_allowed()) device_calls.command_buffer(&args);
+    if (args.buffer) {
+        /* commandBuffer is autoreleased. Keep one explicit ticket reference
+         * across nonblocking polls; no DXMT resource is encoded or flushed. */
+        device_calls.retain(&args.buffer);
+        if (hv_npt_cleanup_gpu_allowed()) device_calls.commit(&args.buffer);
+        else {
+            /* The factory may have blocked across background entry. Release
+             * the uncommitted ticket; never issue a new commit while paused. */
+            device_calls.release(&args.buffer);
+            args.buffer=NULL;
+        }
+    }
+    device_calls.release(&pool);
+    return args.buffer;
+}
+static int device_barrier_status(void *ticket)
+{
+    if (!atomic_load_explicit(&device_image,memory_order_acquire) || !ticket) return -1;
+    struct {void *buffer; uint64_t status;} args={ticket,0};
+    if (device_calls.status(&args)) return -1;
+    /* A newly rejected/error command may finish before earlier work. Only
+     * Completed proves execution after earlier buffers on this same queue. */
+    return args.status==4 ? 1 : args.status==5 ? -1 : 0;
+}
+static void device_barrier_release(void *ticket)
+{
+    if (ticket) device_calls.release(&ticket);
 }
 _Static_assert(sizeof(pthread_t)==8 && sizeof(pthread_mutex_t)==64 && sizeof(pthread_cond_t)==48,
     "pinned DXMT native pthread ABI required");
@@ -197,6 +237,8 @@ static int32_t device_query_interface(void *device,const void *iid,void **out)
 }
 static const struct HvNptDeviceOps device_ops={
     .snapshot=device_snapshot,.event_value=device_event_value,.destroy=device_destroy,
+    .barrier_begin=device_barrier_begin,.barrier_status=device_barrier_status,
+    .barrier_release=device_barrier_release,
     .query_interface=device_query_interface
 };
 
@@ -231,6 +273,12 @@ static int install_device_image(uintptr_t base)
      * partially installed vtable. On failure all slots we own are rolled back. */
     device_calls.query=(void *)(base+hv_npt_device_targets[0]);
     device_calls.event_value=(void *)(base+HV_NPT_DEVICE_EVENT);
+    device_calls.pool=(void *)(base+HV_NPT_DEVICE_POOL);
+    device_calls.retain=(void *)(base+HV_NPT_DEVICE_RETAIN);
+    device_calls.release=(void *)(base+HV_NPT_DEVICE_RELEASE);
+    device_calls.command_buffer=(void *)(base+HV_NPT_DEVICE_COMMAND_BUFFER);
+    device_calls.commit=(void *)(base+HV_NPT_DEVICE_COMMIT);
+    device_calls.status=(void *)(base+HV_NPT_DEVICE_STATUS);
     device_calls.destroy=(void *)(base+HV_NPT_DEVICE_DTOR);
     atomic_store_explicit(&device_image,base,memory_order_release);
     size_t bound=0;

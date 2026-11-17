@@ -41,12 +41,35 @@ The guarded DXMT hooks preserve the public/private reference-count transitions.
 At public count zero, cleanup retains the private reference that the original
 implementation would have dropped immediately. Its worker compares main-queue
 retirement with the submitted sequence and separately checks the resource
-initializer's completion event. It submits no GPU completion probe. A device
-that is only waiting for counters or an unsignaled event stays pending and is
-retried, even after a long background trip or without lifecycle wiring. Waiting
-behind other work does not permanently quarantine a normally released device.
-Invalid state and entered native calls that exceed the watchdog retain their
-owned references and report the failure.
+initializer's completion event. A device waiting for counters stays pending
+without an age or queue-length cutoff. Retries back off from 10 ms to at most
+one second, resetting when retirement makes progress. Waiting behind other work
+does not permanently quarantine a normally released device.
+
+An initializer command buffer refused in the background can finish with an
+error without executing its shared-event signal. Once the main queue has retired
+and that event has stalled for five seconds of allowed time, cleanup submits an
+empty command buffer on the initializer's **own** queue. It retains that buffer
+and polls its status without a synchronous GPU wait. Only `Completed` establishes
+retirement; an errored, nil, or pending recovery buffer leaves the private pin
+held and retryable. There is at most one outstanding recovery buffer per device
+job. Cleanup never flushes pending CPU-side initializer uploads just to obtain a
+signal, and it never writes a guessed value into the shared event.
+
+This relies on Metal's [same-queue execution order](https://developer.apple.com/library/archive/documentation/Miscellaneous/Conceptual/MetalProgrammingGuide/Cmd-Submiss/Cmd-Submiss.html)
+and [successful command-buffer completion](https://developer.apple.com/documentation/metal/mtlcommandbuffer/status).
+A newly rejected recovery buffer is not evidence that preceding work retired.
+The factory may block at the queue's buffer limit, so the native helper checks
+foreground permission again after it returns and before committing. If permission
+was revoked, it releases the uncommitted buffer and retries after foreground return.
+Successful recovery proof survives a later lifecycle pause for that same public-zero
+epoch; the final reference-count check still excludes a resurrected producer.
+
+The watchdog reports a native call stalled beyond five seconds of allowed time.
+A passive event/status read returning later is rechecked rather than permanently
+quarantined: suspension does not invalidate a successful result. An entered
+destructor cannot be cancelled. Invalid object state or a failed finalizer still
+retains the affected objects and reports the failure.
 
 `QueryInterface`, `AddRef`, and `Release` transitions are serialized: the pinned
 `QueryInterface` contains an inlined reference increment. This prevents a device
@@ -131,6 +154,16 @@ the background; pending retirement resumes when permission returns.
 The host tests validate reference accounting, guards and cleanup control flow.
 Run `make test-neptune` for synthetic Mach-O guard checks, native interposition
 rollback tests, compiler stop/join tests and fake-COM retirement scenarios.
+The 31 cleanup scenarios include an initializer goal of 5 whose event remains 4
+after a simulated hour, recovery through a successful same-queue buffer, rejected
+and nil recovery buffers, one retained pending ticket, exponential polling backoff,
+background transitions, public-reference resurrection, and a passive getter that
+returns ready after a six-second stall with the lifecycle gate unwired. Native
+callback tests cover queue-offset validation, statuses 0 through 5, ticket retain/
+release balance, and a factory that returns after background entry without a new
+commit. A host Metal smoke test also held an earlier command buffer on an event:
+the later empty buffer remained pending until that event was signaled, after which
+both completed. These are host results, not a phone reclamation measurement.
 They do not establish Metal retirement or memory recovery on the phone. The lead
 builds the test IPA with the approved UTM framework directory; this branch does
 not change the guest or its drivers.
@@ -148,7 +181,11 @@ not change the guest or its drivers.
    fluctuate or cache; they should not grow by another device/queue each cycle.
 4. Check each cleanup batch's reference count, device retirement counters, elapsed time and
    result. A quarantined or stuck batch is a failed reclamation test even though
-   it preserves safety. Save its call/reason and the surrounding census lines.
+   it preserves safety. `stalled_init` counts initializer jobs stalled for at least
+   five allowed seconds; `barriers` counts successful recovery proofs, and
+   `slow_calls`/`stalled_call` identify returned/current native-call stalls. A
+   retirement line with `barrier=1` may legitimately show a stale initializer
+   event below its goal. Save these fields and the surrounding census lines.
 5. Repeat a normal background and
    foreground trip while cleanup is pending. The app must remain responsive;
    cleanup must wait while backgrounded. This test does not require a graphics

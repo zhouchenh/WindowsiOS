@@ -22,7 +22,11 @@ static int test_pthread_create(pthread_t *t, const pthread_attr_t *a, void *(*f)
     if (atomic_exchange(&fail_thread, 0)) return 11;
     return pthread_create(t, a, f, p);
 }
-#define NPT_NOW_NS() atomic_load(&fake_time)
+static uint64_t test_now_ns(void) {
+    struct timespec now; clock_gettime(CLOCK_MONOTONIC, &now);
+    return (uint64_t)now.tv_sec * UINT64_C(1000000000) + (uint64_t)now.tv_nsec + atomic_load(&fake_time);
+}
+#define NPT_NOW_NS() test_now_ns()
 #define calloc test_calloc
 #define pthread_create test_pthread_create
 #include "../devices/neptune_cleanup.c"
@@ -51,6 +55,8 @@ struct FakeDevice {
     _Atomic uint64_t main_goal, main_done, init_goal, init_done;
     _Atomic unsigned destroyed, event_entered, block_event, fail_event, fail_snapshot;
     _Atomic unsigned destroy_entered, block_destroy, fail_destroy, transient_refs;
+    _Atomic unsigned barrier_entered, barrier_polls, barrier_released, barrier_status;
+    _Atomic unsigned barrier_nil, block_barrier, block_barrier_poll, barrier_poll_entered, pause_on_barrier_success;
     FakeDevice *hidden;
 };
 _Static_assert(offsetof(FakeDevice, pub) == 8, "fake public counter");
@@ -76,7 +82,7 @@ static int fake_snapshot(void *p, struct HvNptDeviceSnapshot *out) {
     out->main_goal = atomic_load(&d->main_goal);
     out->main_done = atomic_load(&d->main_done);
     out->initializer_goal = atomic_load(&d->init_goal);
-    out->event = d;
+    out->event = d; out->initializer_queue = d;
     return 1;
 }
 static int fake_event(void *p, uint64_t *out) {
@@ -112,7 +118,32 @@ static int fake_destroy(void *p) {
     atomic_fetch_add(&d->destroyed, 1);
     return 1;
 }
-static const struct HvNptDeviceOps ops = {fake_qi, fake_snapshot, fake_event, fake_destroy};
+static void *fake_barrier_begin(void *p) {
+    FakeDevice *d = p;
+    assert(hv_npt_cleanup_gpu_allowed());
+    atomic_fetch_add(&d->barrier_entered, 1);
+    while (atomic_load(&d->block_barrier)) pause_ms();
+    if (!hv_npt_cleanup_gpu_allowed() || atomic_load(&d->barrier_nil)) return NULL;
+    return d;
+}
+static int fake_barrier_status(void *p) {
+    FakeDevice *d = p;
+    assert(hv_npt_cleanup_gpu_allowed());
+    atomic_fetch_add(&d->barrier_poll_entered, 1);
+    while (atomic_load(&d->block_barrier_poll)) pause_ms();
+    atomic_fetch_add(&d->barrier_polls, 1);
+    unsigned status = atomic_load(&d->barrier_status);
+    if (status == 1 && atomic_exchange(&d->pause_on_barrier_success, 0)) hv_npt_cleanup_set_active(0);
+    return status == 1 ? 1 : status == 2 ? -1 : 0;
+}
+static void fake_barrier_release(void *p) {
+    atomic_fetch_add(&((FakeDevice *)p)->barrier_released, 1);
+}
+static const struct HvNptDeviceOps ops = {
+    .query_interface=fake_qi, .snapshot=fake_snapshot, .event_value=fake_event,
+    .barrier_begin=fake_barrier_begin, .barrier_status=fake_barrier_status,
+    .barrier_release=fake_barrier_release, .destroy=fake_destroy
+};
 static void setup(void) { assert(hv_npt_cleanup_set_device_ops(&ops)); hv_npt_cleanup_set_backend_verified(1); }
 static FakeDevice *device(void) {
     FakeDevice *d = calloc(1, sizeof(*d)); assert(d);
@@ -247,9 +278,10 @@ static void blocked_getter_background(void) {
     enter(); assert(device_current && !device_current->expired); leave();
     hv_npt_cleanup_set_active(1); advance(NPT_TIMEOUT_NS);
     char text[512]; hv_npt_cleanup_describe(text, sizeof(text));
-    assert(strstr(text, "initializer event value") && strstr(text, "device_pins=1"));
+    assert(strstr(text, "initializer event value") && strstr(text, "stalled_call=1"));
     atomic_store(&d->block_event, 0); hv_npt_cleanup_poll(); await_idle();
-    assert(!atomic_load(&d->destroyed) && count_load(&d->priv) == 1);
+    assert(atomic_load(&d->destroyed) == 1);
+    enter(); assert(!quarantined_pins && slow_calls == 1); leave();
 }
 static void paused_queue_does_not_age(void) {
     setup(); hv_npt_cleanup_set_active(0); FakeDevice *d = device();
@@ -393,8 +425,130 @@ static void concurrent_reference_transitions(void) {
     hv_npt_device_release(d); await_value(&d->destroyed, 1); await_idle();
 }
 
+static void await_initializer_retry(FakeDevice *d) {
+    for (unsigned i = 0; i < 3000; i++) {
+        enter(); int found = 0;
+        for (Job *j = device_waiting; j; j = j->next)
+            if (j->device == d && j->initializer_stalling) found = 1;
+        leave();
+        if (found) return;
+        pause_ms();
+    }
+    assert(!"initializer did not become pending");
+}
+static FakeDevice *stalled_device(void) {
+    FakeDevice *d = device();
+    atomic_store(&d->init_goal, 5); atomic_store(&d->init_done, 4);
+    hv_npt_device_release(d); await_initializer_retry(d);
+    return d;
+}
+static void stale_event_recovers_after_hour(void) {
+    setup(); FakeDevice *d = stalled_device();
+    atomic_store(&d->barrier_status, 1);
+    advance(UINT64_C(3600000000000));
+    await_value(&d->destroyed, 1); await_idle();
+    assert(atomic_load(&d->init_done) == 4 && atomic_load(&d->barrier_entered) == 1);
+    assert(atomic_load(&d->barrier_released) == 1);
+    enter(); assert(barrier_recoveries == 1 && !quarantined_pins); leave();
+}
+static void failed_barrier_retries(void) {
+    setup(); FakeDevice *d = stalled_device(); atomic_store(&d->barrier_status, 2);
+    advance(UINT64_C(6000000000)); await_value(&d->barrier_released, 1);
+    assert(!atomic_load(&d->destroyed) && count_load(&d->priv) == 1);
+    enter(); assert(!quarantined_pins && !barrier_recoveries); leave();
+    atomic_store(&d->barrier_status, 1);
+    await_value(&d->destroyed, 1); await_idle();
+    assert(atomic_load(&d->barrier_entered) >= 2);
+}
+static void nil_barrier_backoff(void) {
+    setup(); FakeDevice *d = stalled_device(); atomic_store(&d->barrier_nil, 1);
+    for (unsigned i = 0; i < 10; i++) {
+        unsigned calls = atomic_load(&d->event_entered);
+        advance(UINT64_C(1000000000)); await_value(&d->event_entered, calls + 1);
+        await_initializer_retry(d);
+    }
+    enter();
+    assert(device_waiting && device_waiting->retry_ns == NPT_RETRY_MAX_NS);
+    assert(!quarantined_pins);
+    leave();
+    unsigned calls = atomic_load(&d->event_entered);
+    for (int i = 0; i < 30; i++) pause_ms();
+    assert(atomic_load(&d->event_entered) == calls); /* no 100Hz endless polling */
+    assert(!atomic_load(&d->destroyed) && atomic_load(&d->barrier_entered));
+    atomic_store(&d->barrier_nil, 0); atomic_store(&d->barrier_status, 1);
+    advance(NPT_RETRY_MAX_NS); await_value(&d->destroyed, 1); await_idle();
+}
+static void pending_barrier_single_ticket(void) {
+    setup(); FakeDevice *d = stalled_device();
+    advance(UINT64_C(6000000000)); await_value(&d->barrier_entered, 1);
+    await_value(&d->barrier_polls, 1);
+    for (unsigned i = 0; i < 4; i++) { advance(NPT_RETRY_MAX_NS); pause_ms(); }
+    assert(atomic_load(&d->barrier_entered) == 1 && !atomic_load(&d->destroyed));
+    atomic_store(&d->barrier_status, 1);
+    advance(NPT_RETRY_MAX_NS); await_value(&d->destroyed, 1); await_idle();
+    assert(atomic_load(&d->barrier_released) == 1);
+}
+static void background_blocks_barrier_factory(void) {
+    setup(); FakeDevice *d = stalled_device();
+    hv_npt_cleanup_set_active(0); advance(UINT64_C(3600000000000));
+    for (int i = 0; i < 10; i++) pause_ms();
+    assert(!atomic_load(&d->barrier_entered));
+    hv_npt_cleanup_set_active(1); atomic_store(&d->barrier_status, 1);
+    advance(UINT64_C(6000000000)); await_value(&d->destroyed, 1); await_idle();
+}
+static void factory_spans_background(void) {
+    setup(); FakeDevice *d = stalled_device(); atomic_store(&d->block_barrier, 1);
+    advance(UINT64_C(6000000000)); await_value(&d->barrier_entered, 1);
+    hv_npt_cleanup_set_active(0); atomic_store(&d->block_barrier, 0);
+    for (int i = 0; i < 10; i++) pause_ms();
+    assert(!atomic_load(&d->barrier_polls) && !atomic_load(&d->destroyed));
+    atomic_store(&d->barrier_status, 1); hv_npt_cleanup_set_active(1);
+    advance(NPT_RETRY_MAX_NS); await_value(&d->destroyed, 1); await_idle();
+    assert(atomic_load(&d->barrier_entered) == 2);
+}
+static void resurrection_during_barrier_poll(void) {
+    setup(); FakeDevice *d = stalled_device();
+    atomic_store(&d->barrier_status, 1); atomic_store(&d->block_barrier_poll, 1);
+    advance(UINT64_C(6000000000)); await_value(&d->barrier_poll_entered, 1);
+    void *alias; assert(!hv_npt_device_query_interface(d, NULL, &alias));
+    atomic_store(&d->main_goal, 9); atomic_store(&d->main_done, 8);
+    hv_npt_device_release(d); atomic_store(&d->block_barrier_poll, 0);
+    await_value(&d->barrier_released, 1);
+    for (int i = 0; i < 10; i++) pause_ms();
+    assert(!atomic_load(&d->destroyed) && count_load(&d->priv) == 1);
+    atomic_store(&d->main_done, 9); atomic_store(&d->init_done, 5);
+    hv_npt_cleanup_poll(); await_value(&d->destroyed, 1); await_idle();
+}
+static void successful_barrier_survives_background(void) {
+    setup(); FakeDevice *d = stalled_device();
+    atomic_store(&d->barrier_status, 1); atomic_store(&d->pause_on_barrier_success, 1);
+    advance(UINT64_C(6000000000)); await_value(&d->barrier_polls, 1);
+    for (int i = 0; i < 10; i++) pause_ms();
+    assert(!hv_npt_cleanup_gpu_allowed() && !atomic_load(&d->destroyed));
+    hv_npt_cleanup_set_active(1); await_value(&d->destroyed, 1); await_idle();
+    assert(atomic_load(&d->barrier_entered) == 1);
+}
+static void slow_getter_return_recovers_unwired_gate(void) {
+    setup(); FakeDevice *d = device();
+    atomic_store(&d->init_goal, 1); atomic_store(&d->init_done, 1); atomic_store(&d->block_event, 1);
+    hv_npt_device_release(d); await_value(&d->event_entered, 1);
+    advance(UINT64_C(6000000000));
+    enter(); assert(device_current->call_stalled && !device_current->expired); leave();
+    atomic_store(&d->block_event, 0); await_value(&d->destroyed, 1); await_idle();
+    enter(); assert(!quarantined_pins && slow_calls == 1); leave();
+}
+
 int main(void) {
     struct { const char *name; void (*run)(void); } cases[] = {
+        {"stale initializer event recovers after an hour", stale_event_recovers_after_hour},
+        {"own errored barrier retries without deleting", failed_barrier_retries},
+        {"nil barrier retries with bounded polling", nil_barrier_backoff},
+        {"pending barrier keeps one ticket", pending_barrier_single_ticket},
+        {"background prevents barrier factory", background_blocks_barrier_factory},
+        {"blocked factory spans background safely", factory_spans_background},
+        {"QI resurrection during barrier poll", resurrection_during_barrier_poll},
+        {"successful barrier proof survives background", successful_barrier_survives_background},
+        {"slow passive getter recovers without lifecycle gate", slow_getter_return_recovers_unwired_gate},
         {"hidden graph, aliases, registrations, tombstone", healthy_hidden_graph},
         {"main and initializer retire independently", delayed_main_and_initializer},
         {"long main and initializer waits stay retryable", long_counter_wait_remains_retryable},

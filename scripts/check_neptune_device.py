@@ -22,6 +22,27 @@ TARGETS = (0xD680, 0xDBC0, 0xDBF8)
 DESTRUCTOR = 0xDF08
 EVENT_VALUE = 0xD8E08
 GUARDS = (
+    # initializer own queue construction/store at +0x18.
+    (0x1187D8,
+     "eafbff97e00317aa41008052ccf8fe97f80300aae00700f9800240f9400000b45ef8fe97980200f9e00317aa11f9fe97f70300aae00700f9600242f8400000b456f8fe97771200f9"),
+    # native retain.
+    (0xD8B38,
+     "fd7bbfa9fd030091080040f92941459400008052fd7bc1a8c0035fd6"),
+    # native release.
+    (0xD8B54,
+     "fd7bbfa9fd030091080040f91f41459400008052fd7bc1a8c0035fd6"),
+    # native autorelease pool.
+    (0xD8D1C,
+     "f44fbea9fd7b01a9fd430091f30300aaa89a0090000d46f98c404594600200f900008052fd7b41a9f44fc2a8c0035fd6"),
+    # native command-buffer factory.
+    (0xD8D4C,
+     "f44fbea9fd7b01a9fd430091f30300aa000040f948424594600600f900008052fd7b41a9f44fc2a8c0035fd6"),
+    # native command-buffer commit.
+    (0xD8D78,
+     "fd7bbfa9fd030091000040f94742459400008052fd7bc1a8c0035fd6"),
+    # native command-buffer status.
+    (0xD8DB0,
+     "f44fbea9fd7b01a9fd430091f30300aa000040f9074b4594600600f900008052fd7b41a9f44fc2a8c0035fd6"),
     # container construction, refs and queue pointer.
     (0xD43C,
      "ff8301d1f85f02a9f65703a9f44f04a9fd7b05a9fd430191f40304aaf50303aaf60302aaf70301aaf30300aa2004000f"
@@ -221,7 +242,10 @@ def header():
            '#ifndef HV_NEPTUNE_DEVICE_LAYOUT_H', '#define HV_NEPTUNE_DEVICE_LAYOUT_H',
            '#include <stddef.h>', '#include <stdint.h>',
            '#define HV_NPT_DEVICE_VTABLE 0x13c4a58u',
-           '#define HV_NPT_DEVICE_DTOR 0xdf08u', '#define HV_NPT_DEVICE_EVENT 0xd8e08u']
+           '#define HV_NPT_DEVICE_DTOR 0xdf08u', '#define HV_NPT_DEVICE_EVENT 0xd8e08u',
+           '#define HV_NPT_DEVICE_POOL 0xd8d1cu', '#define HV_NPT_DEVICE_RETAIN 0xd8b38u',
+           '#define HV_NPT_DEVICE_RELEASE 0xd8b54u', '#define HV_NPT_DEVICE_COMMAND_BUFFER 0xd8d4cu',
+           '#define HV_NPT_DEVICE_COMMIT 0xd8d78u', '#define HV_NPT_DEVICE_STATUS 0xd8db0u']
     out.append('static const uint8_t hv_npt_device_uuid[] = {' + ','.join(f'0x{x:02x}' for x in UUID) + '};')
     out.append('static const uintptr_t hv_npt_device_targets[] = {0xd680,0xdbc0,0xdbf8};')
     for i, (_, h) in enumerate(GUARDS):

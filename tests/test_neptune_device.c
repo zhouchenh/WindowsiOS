@@ -20,6 +20,8 @@ static _Atomic int destroys;
 static uintptr_t *race;
 static const struct HvNptDeviceOps *observed_ops;
 static bool fail_join;
+static bool native_allowed=true;
+int hv_npt_cleanup_gpu_allowed(void) { return native_allowed; }
 static void *destroy_expected;
 static _Atomic int compiler_done;
 static pthread_mutex_t compiler_gate_mutex=PTHREAD_MUTEX_INITIALIZER;
@@ -102,6 +104,49 @@ static int32_t fake_event(void *args)
     assert(a->event==(void *)31); a->value=99; return 0;
 }
 static void fake_destroy(void *p) {assert(p==destroy_expected);++destroys;}
+static int native_buffer_refs, native_commits, native_factories, native_status;
+static bool native_nil, native_pause_factory;
+static int32_t fake_pool(void *p) { *(void **)p=(void *)41; return 0; }
+static int32_t fake_native_retain(void *p) {
+    assert(*(void **)p==(void *)43 && native_buffer_refs==1); native_buffer_refs++; return 0;
+}
+static int32_t fake_native_release(void *p) {
+    if (*(void **)p==(void *)41) { if (native_buffer_refs) native_buffer_refs--; }
+    else { assert(*(void **)p==(void *)43 && native_buffer_refs); native_buffer_refs--; }
+    return 0;
+}
+static int32_t fake_factory(void *p) {
+    struct {void *queue,*buffer;} *a=p;
+    assert(a->queue==(void *)42 && native_allowed); native_factories++;
+    a->buffer=native_nil?NULL:(void *)43; native_buffer_refs=native_nil?0:1;
+    if (native_pause_factory) native_allowed=false;
+    return 0;
+}
+static int32_t fake_commit(void *p) {
+    assert(*(void **)p==(void *)43 && native_allowed && native_buffer_refs==2);
+    native_commits++; return 0;
+}
+static int32_t fake_status(void *p) {
+    struct {void *buffer; uint64_t status;} *a=p;
+    assert(a->buffer==(void *)43 && native_buffer_refs==1); a->status=native_status; return 0;
+}
+static void barrier_callbacks(void) {
+    device_calls.pool=fake_pool; device_calls.retain=fake_native_retain;
+    device_calls.release=fake_native_release; device_calls.command_buffer=fake_factory;
+    device_calls.commit=fake_commit; device_calls.status=fake_status;
+    void *ticket=observed_ops->barrier_begin((void *)42);
+    assert(ticket==(void *)43 && native_buffer_refs==1 && native_commits==1);
+    for (native_status=0;native_status<6;native_status++)
+        assert(observed_ops->barrier_status(ticket)==(native_status==4?1:native_status==5?-1:0));
+    observed_ops->barrier_release(ticket); assert(!native_buffer_refs);
+    native_allowed=false;
+    assert(!observed_ops->barrier_begin((void *)42) && native_factories==1);
+    native_allowed=true; native_nil=true;
+    assert(!observed_ops->barrier_begin((void *)42) && native_commits==1 && !native_buffer_refs);
+    native_nil=false; native_pause_factory=true;
+    assert(!observed_ops->barrier_begin((void *)42) && native_commits==1 && !native_buffer_refs);
+    native_allowed=true; native_pause_factory=false;
+}
 static void callbacks(void *base)
 {
     assert((uintptr_t)device_calls.query==(uintptr_t)base+0xd680);
@@ -112,10 +157,11 @@ static void callbacks(void *base)
     *(uintptr_t *)object=(uintptr_t)base+HV_NPT_DEVICE_VTABLE;
     memcpy(object+0x40,&queue,8);
     queue[0]=8; queue[3]=6;
-    queue[0x10008/8]=5; queue[0x10028/8]=31;
+    queue[0x10008/8]=5; queue[0x10028/8]=31; queue[0x10020/8]=42;
     struct HvNptDeviceSnapshot s;
     assert(observed_ops->snapshot(object,&s));
-    assert(s.main_goal==7 && s.main_done==6 && s.initializer_goal==4 && s.event==(void *)31);
+    assert(s.main_goal==7 && s.main_done==6 && s.initializer_goal==4 && s.event==(void *)31 && s.initializer_queue==(void *)42);
+    queue[0x10020/8]=0; assert(!observed_ops->snapshot(object,&s)); queue[0x10020/8]=42;
     queue[0]=0; assert(!observed_ops->snapshot(object,&s)); queue[0]=1;
     queue[0x10028/8]=0; assert(!observed_ops->snapshot(object,&s));
     queue[0x10008/8]=1; assert(observed_ops->snapshot(object,&s));
@@ -124,6 +170,7 @@ static void callbacks(void *base)
     assert(observed_ops->query_interface(object,(void *)23,&out)==-7 && out==object);
     assert(observed_ops->event_value((void *)31,&value) && value==99);
     assert(!observed_ops->event_value(NULL,&value));
+    barrier_callbacks();
     destroy_expected=object;
     assert(observed_ops->destroy(object)); assert(destroys==1);
     free(queue);
