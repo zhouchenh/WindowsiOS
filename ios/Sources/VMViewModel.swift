@@ -164,7 +164,10 @@ final class VMViewModel: ObservableObject {
     /// (needs the WinKit hook inside Windows); the on-screen keyboard opens by itself.
     /// The machine the launch page starts: "Win11" or "Arch" (Arch Linux ARM). Each has its own folder.
     @Published var machine: String = UserDefaults.standard.string(forKey: "winios.machine") ?? "Win11" {
-        didSet { UserDefaults.standard.set(machine, forKey: "winios.machine") }
+        didSet {
+            UserDefaults.standard.set(machine, forKey: "winios.machine")
+            ServerModeController.shared.applyToBridge() // Linux has no server mode and no headless
+        }
     }
     var isLinux: Bool { machine == "Arch" }
     var machineTitle: String { isLinux ? "Arch Linux" : "Windows 11" }
@@ -245,10 +248,21 @@ final class VMViewModel: ObservableObject {
     private static let claudeInstallLine = "powershell -ep bypass -noexit -c \"irm http://10.0.2.4/ai.ps1 | iex; ai\""
 
     /// The WinKit helper inside Windows (cli_setup.ps1) reports in every few seconds.
-    private var guestHelperAlive: Bool {
+    static var guestHelperAlive: Bool {
         let f = VMViewModel.documentsURL.appendingPathComponent("Shared/agent_alive.txt")
         guard let d = (try? FileManager.default.attributesOfItem(atPath: f.path))?[.modificationDate] as? Date else { return false }
         return Date().timeIntervalSince(d) < 40
+    }
+    private var guestHelperAlive: Bool { VMViewModel.guestHelperAlive }
+
+    /// A job for the WinKit helper (Shared/agent_job.txt: an id line, then one command line it starts with
+    /// `cmd.exe /c` in the signed-in user's session). false when the helper is not there to run it.
+    @discardableResult
+    static func postAgentJob(_ commandLine: String) -> Bool {
+        guard guestHelperAlive else { return false }
+        let job = UUID().uuidString + "\r\n" + commandLine + "\r\n"
+        try? job.write(to: VMViewModel.documentsURL.appendingPathComponent("Shared/agent_job.txt"), atomically: true, encoding: .ascii)
+        return true
     }
 
     private func publishClaudeInstaller() {
@@ -264,8 +278,7 @@ final class VMViewModel: ObservableObject {
         guard isVMRunning else { return }
         guard guestHelperAlive else { guestHelperMissing = true; return }
         publishClaudeInstaller()
-        let job = UUID().uuidString + "\r\n" + VMViewModel.claudeInstallLine + "\r\n"
-        try? job.write(to: VMViewModel.documentsURL.appendingPathComponent("Shared/agent_job.txt"), atomically: true, encoding: .ascii)
+        VMViewModel.postAgentJob(VMViewModel.claudeInstallLine)
         if !hardwareKeyboard && !isLaptopLayoutActive { systemKeyboardVisible = true } // the API key is typed by hand
     }
 
@@ -566,6 +579,7 @@ function ai {
                              UInt32(max(0, UserDefaults.standard.integer(forKey: "winios.ramMB"))))
         winios_jit_configure_3d(VMViewModel.readGPU3DSwitch())
         let bridge = WinIOSBridge.shared
+        ServerModeController.shared.applyToBridge() // server mode's settings, before Windows can start
         bridge.installTrapGuard()
         bridge.setDisplayFrameRate(frameRate)
         display.attach(to: self) // per-screen display settings, pushed before Windows can start

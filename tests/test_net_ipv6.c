@@ -15,8 +15,12 @@
      DHCP, DNS to 10.0.2.3) still works.
    - HV_IPV6=0: no IPv6 at all (no advertisement, no answers), IPv4 as before.
    - HV_DNS_PROXY=0: the advertisement names no DNS server (libslirp has no IPv6 one to forward to, and the proxy,
-     being off, announces none). test_dns_parse covers the announcement itself. */
+     being off, announces none). test_dns_parse covers the announcement itself.
+   - forward addresses (no network, made-up interfaces): which IPv6 addresses a port forward listens on. Never
+     link-local, multicast or IPv4-mapped ones; a VPN with a unique local address only, or with a global one only;
+     a local network with IPv6 only (no IPv4: IPv4 is loopback, and says why). test_net_fwd covers the rest. */
 #include "dns_proxy.h"
+#include "fake_ifaddrs.h"
 #include "net_slirp.h"
 
 #include <arpa/inet.h>
@@ -503,8 +507,112 @@ static int scenario(int which) {
     return failures != 0;
 }
 
+/* Made-up address flags (XNU's IN6_IFF_*) for the documentation addresses below. */
+static int fake_flags(const char *ifname, const struct in6_addr *a) {
+    (void)ifname;
+    char t[INET6_ADDRSTRLEN];
+    inet_ntop(AF_INET6, a, t, sizeof t);
+    if (!strcmp(t, "2001:db8:5::d")) return HV_IN6_IFF_DEPRECATED | 0x80 /* temporary */;
+    if (!strcmp(t, "2001:db8:5::7")) return HV_IN6_IFF_TENTATIVE;
+    if (!strcmp(t, "2001:db8:5::dd")) return HV_IN6_IFF_DUPLICATED;
+    if (!strcmp(t, "2001:db8:5::de")) return HV_IN6_IFF_DETACHED;
+    if (!strcmp(t, "2001:db8:5::46")) return HV_IN6_IFF_CLAT46;
+    return 0x40; /* autoconf: fine */
+}
+
+/* Which IPv6 addresses a forward takes (hv_net_fwd_plan_json); in this process, nothing is attached. */
+static int plan(const FakeIfs *f, int scope, int no_global6, const char *want, const char *lacks) {
+    HvFwdRule r = {.proto = HV_FWD_TCP, .host_port = 3389, .guest_port = 3389, .scope = scope, .enabled = 1,
+                   .no_global6 = no_global6};
+    char *j = hv_net_fwd_plan_json(&f->ifa[0], &r);
+    int ok = j && strstr(j, want) && (!lacks || !strstr(j, lacks));
+    if (!ok) fprintf(stderr, "  plan: %s\n", j ? j : "(none)");
+    free(j);
+    return ok;
+}
+
+static int forward_addresses(void) {
+    unsetenv("HV_NET_VPN_IF");
+    unsetenv("HV_NET_LAN_IF");
+    unsetenv("HV_NET_LAN_GLOBAL6");
+    FakeIfs f = {0};
+    fake_if(&f, "en0", "fe80::1:2", 1);
+    fake_if(&f, "en0", "ff02::1", 1);
+    fake_if(&f, "en0", "::ffff:192.0.2.9", 1);
+    fake_if(&f, "en0", "::", 1);
+    fake_if(&f, "en0", "2001:db8:5::5", 1);
+    check("local network, IPv6 only: the global address, and [::1]",
+          plan(&f, HV_FWD_LAN, 0, "\"listen\":[\"127.0.0.1:3389\",\"[2001:db8:5::5]:3389\",\"[::1]:3389\"]", "fe80"));
+    check("local network, IPv6 only: never multicast, IPv4-mapped or unspecified",
+          plan(&f, HV_FWD_LAN, 0, "\"note4\":\"no IPv4 address on the local network\"", "ff02") &&
+              plan(&f, HV_FWD_LAN, 0, "\"note6\":\"\"", "ffff") && plan(&f, HV_FWD_LAN, 0, "\"relay\":\"127.0.0.1\"", "\"[::]"));
+
+    FakeIfs u = {0}; /* a mesh VPN with an IPv4 address and a unique local IPv6 one */
+    fake_if(&u, "utun2", "fe80::2", 1);
+    fake_if(&u, "utun2", "fd7a:115c:a1e0::2", 1);
+    fake_if(&u, "utun2", "100.64.0.2", 1);
+    check("VPN: IPv4 and the unique local IPv6 address",
+          plan(&u, HV_FWD_VPN, 0, "\"listen\":[\"100.64.0.2:3389\",\"[fd7a:115c:a1e0::2]:3389\"]", "fe80"));
+    FakeIfs ula = {0};
+    fake_if(&ula, "utun2", "fd7a:115c:a1e0::2", 1);
+    check("VPN with a unique local IPv6 address only: listens on it, relayed through IPv4 loopback",
+          plan(&ula, HV_FWD_VPN, 0, "\"listen\":[\"[fd7a:115c:a1e0::2]:3389\"],\"relay\":\"127.0.0.1\"", NULL));
+    FakeIfs g = {0};
+    fake_if(&g, "ipsec2", "2001:db8:c::9", 1);
+    fake_if(&g, "wg0", "2001:db8:7::2", 1);
+    fake_if(&g, "wg0", "fe80::7", 1);
+    check("VPN with a global IPv6 address only (WireGuard): listens on it, not on the carrier's",
+          plan(&g, HV_FWD_VPN, 0, "\"listen\":[\"[2001:db8:7::2]:3389\"]", "2001:db8:c"));
+    check("a global-IPv6-only VPN with global addresses left out: nothing to listen on, said so",
+          plan(&g, HV_FWD_VPN, 1, "\"ok\":false,\"code\":\"vpn_global6\"", "2001:db8:7"));
+
+    FakeIfs wg = {0}; /* WireGuard: IPv4, a unique local and a global IPv6 address */
+    fake_if(&wg, "utun4", "10.8.0.2", 1);
+    fake_if(&wg, "utun4", "2001:db8:8::2", 1);
+    fake_if(&wg, "utun4", "fd00:8::2", 1);
+    check("VPN, global IPv6 on: IPv4, unique local, then global",
+          plan(&wg, HV_FWD_VPN, 0, "\"listen\":[\"10.8.0.2:3389\",\"[fd00:8::2]:3389\",\"[2001:db8:8::2]:3389\"]", NULL));
+    check("VPN, global IPv6 off (the rule's switch): IPv4 and unique local only",
+          plan(&wg, HV_FWD_VPN, 1, "\"listen\":[\"10.8.0.2:3389\",\"[fd00:8::2]:3389\"]", "2001:db8:8"));
+    FakeIfs wg4 = {0};
+    fake_if(&wg4, "utun4", "10.8.0.2", 1);
+    fake_if(&wg4, "utun4", "2001:db8:8::2", 1);
+    check("VPN with IPv4 and a global IPv6 address, global off: IPv4 only, and why",
+          plan(&wg4, HV_FWD_VPN, 1, "\"note6\":\"the VPN (utun4) has only global IPv6 addresses, and this forward leaves them out\"",
+               "2001:db8:8"));
+
+    /* Address flags: never one the kernel will not bind; deprecated ones last. */
+    hv_net_set_addr6_flags_fn(fake_flags);
+    FakeIfs fl = {0};
+    fake_if(&fl, "en0", "192.0.2.4", 1);
+    fake_if(&fl, "en0", "2001:db8:5::d", 1);  /* deprecated (an old temporary address) */
+    fake_if(&fl, "en0", "2001:db8:5::7", 1);  /* tentative (a new one, in DAD) */
+    fake_if(&fl, "en0", "2001:db8:5::dd", 1); /* duplicated */
+    fake_if(&fl, "en0", "2001:db8:5::de", 1); /* detached */
+    fake_if(&fl, "en0", "2001:db8:5::46", 1); /* CLAT46 */
+    fake_if(&fl, "en0", "2001:db8:5::5", 1);
+    fake_if(&fl, "en0", "fd00:5::5", 1);
+    check("local network flags: tentative, duplicated, detached and CLAT46 left out; deprecated after the others",
+          plan(&fl, HV_FWD_LAN, 0,
+               "\"listen\":[\"192.0.2.4:3389\",\"127.0.0.1:3389\",\"[fd00:5::5]:3389\",\"[2001:db8:5::5]:3389\","
+               "\"[2001:db8:5::d]:3389\",\"[::1]:3389\"]",
+               NULL));
+    FakeIfs tv = {0}; /* a VPN whose only addresses cannot be bound yet */
+    fake_if(&tv, "utun3", "2001:db8:5::7", 1);
+    fake_if(&tv, "utun3", "fe80::3", 1);
+    check("a VPN with only a tentative IPv6 address is no VPN yet", plan(&tv, HV_FWD_VPN, 0, "\"code\":\"no_vpn\"", NULL));
+    fake_if(&tv, "utun3", "fd00:3::3", 1);
+    check("... its unique local address is taken, the tentative one not",
+          plan(&tv, HV_FWD_VPN, 0, "\"listen\":[\"[fd00:3::3]:3389\"]", "2001:db8:5::7"));
+    hv_net_set_addr6_flags_fn(NULL);
+    printf("net (forward addresses): %d failures\n", failures);
+    fflush(stdout);
+    return failures != 0;
+}
+
 int main(void) {
-    int bad = 0;
+    int bad = forward_addresses();
+    failures = 0; /* each scenario below counts its own */
     for (int which = IPV6_ON; which <= PROXY_OFF; which++) {
         fflush(stdout);
         pid_t pid = fork();

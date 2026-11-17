@@ -52,6 +52,11 @@ int hv_winvm_save_png(const char *path);
 void hv_winvm_set_preferred_display(uint32_t w, uint32_t h);
 /* virtio-gpu status line for diagnostics; returns -1 without virtio-gpu. */
 int hv_winvm_gpu_status(char *buf, unsigned len);
+/* Graphics hot switch (virtio_gpu.h): offer 3D or 2D from the guest's next display driver start. 0, or -1 when
+   3D is asked for without the renderer loaded (the machine started without host 3D). */
+int hv_winvm_gpu_set_3d(int on);
+/* The mode: capable, offered3d, negotiated3d, driver_ok, resets (all 0 without virtio-gpu). */
+void hv_winvm_gpu_mode(int *capable, int *offered3d, int *negotiated3d, int *driver_ok, uint32_t *resets);
 
 /* Input hooks (any thread) */
 void hv_winvm_key_hid(uint8_t usage, int down);

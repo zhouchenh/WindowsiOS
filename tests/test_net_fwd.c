@@ -14,8 +14,14 @@
      limited; the store file holds the saved forwards only.
    - a damaged store is put aside (<path>.bad) and the list starts empty.
    - HV_NET_FWD_RULES=0: saved forwards are listed but not opened; HV_NET_FWD's forms (loopback, lan:, one
-     address, comma-separated, a bad item skipped) still open, from HV_NET_FWD_FILE as the Mac tool reads it. */
+     address, comma-separated, a bad item skipped) still open, from HV_NET_FWD_FILE as the Mac tool reads it.
+   - address choice (hv_net_fwd_plan_json over made-up interfaces, tests/fake_ifaddrs.h): every scope over IPv4 and
+     IPv6. Local network: the LAN interfaces' IPv4, unique local and global IPv6 addresses and loopback, never
+     link-local or cellular, global ones left out by the rule's choice or HV_NET_LAN_GLOBAL6=0; VPN: every usable
+     address of the chosen interface (IPv4, unique local and global IPv6), the preference order, an IPv6-only VPN
+     (its relay through loopback), and what is passed over (iOS's link-local-only utuns, the carrier's ipsec). */
 #include "net_slirp.h"
+#include "fake_ifaddrs.h"
 
 #include <arpa/inet.h>
 #include <errno.h>
@@ -442,6 +448,9 @@ static int scenario_rules(void) {
     /* The saved one, opened at start. */
     snprintf(what, sizeof what, "\"listen\":[\"127.0.0.1:%d\",\"[::1]:%d\"]", p_saved, p_saved);
     check("saved forward listening on 127.0.0.1 and [::1]", wait_for("saved", what, 3000));
+    check("saved forward: IPv4 and IPv6 each listening",
+          has("saved", "\"ipv4\":{\"state\":\"listening\",\"message\":\"\"},\"ipv6\":{\"state\":\"listening\""));
+    check("saved forward from before the choice (no ipv6Global): global IPv6 stays off", has("saved", "\"ipv6Global\":false"));
     check("saved forward: TCP over IPv4", tcp_echo("127.0.0.1", p_saved));
     check("saved forward: TCP over IPv6", tcp_echo("::1", p_saved));
 
@@ -525,6 +534,9 @@ static int scenario_rules(void) {
         hv_net_fwd_refresh();
         snprintf(what, sizeof what, "\"listen\":[\"127.0.0.1:%d\",\"[::1]:%d\"]", p_lan, p_lan);
         check("no local network: loopback only", wait_for("lan", what, 3000));
+        check("no local network: each family says why",
+              has("lan", "\"ipv4\":{\"state\":\"none\",\"message\":\"no IPv4 address on the local network\"}") &&
+                  has("lan", "\"ipv6\":{\"state\":\"none\",\"message\":\"no IPv6 address on the local network\"}"));
         check("no local network: the LAN address refuses", tcp_closed(lan, p_lan));
         check("no local network: loopback still works", tcp_echo("127.0.0.1", p_lan) && tcp_echo("::1", p_lan));
         unsetenv("HV_NET_LAN_IF");
@@ -543,6 +555,8 @@ static int scenario_rules(void) {
     snprintf(what, sizeof what, "\"listen\":[\"127.0.0.1:%d\",\"[::1]:%d\"]", p_vpn, p_vpn);
     check("VPN forward follows the VPN when it comes", wait_for("vpn", what, 3000));
     check("VPN forward works", tcp_echo("127.0.0.1", p_vpn) && tcp_echo("::1", p_vpn));
+    check("VPN forward: both families listening", has("vpn", "\"ipv4\":{\"state\":\"listening\"") &&
+                                                      has("vpn", "\"ipv6\":{\"state\":\"listening\""));
     addrs = hv_net_fwd_addresses_json();
     check("addresses list the VPN", addrs && strstr(addrs, "\"vpn\":[{\"interface\":\"lo0\",\"address\":\"127.0.0.1\""));
     free(addrs);
@@ -561,6 +575,22 @@ static int scenario_rules(void) {
     close(holder);
     check("... and opened once it is free", wait_for("busy", "\"state\":\"listening\"", 6000));
     check("... and works", tcp_echo("127.0.0.1", p_busy));
+
+    /* An IPv6 address that failed while IPv4 opened: the forward listens, and the timer tries the IPv6 relay again
+       (as for an address still tentative when the forward opened). */
+    int p_half = free_port();
+    sl = make_addr(&ss, "::1", p_half);
+    int holder6 = socket(AF_INET6, SOCK_STREAM, 0);
+    if (bind(holder6, (struct sockaddr *)&ss, sl) || listen(holder6, 1)) exit(2);
+    put(rule("half", HV_FWD_TCP, p_half, 7, HV_FWD_LOOPBACK));
+    check("IPv6 relay in use: IPv4 listens, IPv6 says so",
+          wait_for("half", "\"ipv6\":{\"state\":\"error\"", 2000) && has("half", "\"state\":\"listening\"") &&
+              tcp_echo("127.0.0.1", p_half));
+    close(holder6);
+    check("... the IPv6 relay opens once the address is free (periodic retry)",
+          wait_for("half", "\"ipv6\":{\"state\":\"listening\"", 6000));
+    check("... and works over both", tcp_echo("::1", p_half) && tcp_echo("127.0.0.1", p_half));
+    hv_net_fwd_remove("half", 0);
 
     /* Opened again (as after the app comes back from the background): still working. */
     hv_net_fwd_reopen();
@@ -593,6 +623,13 @@ static int scenario_rules(void) {
     check("guest: cannot replace the app's forward", hv_net_fwd_put(&steal, HV_FWD_GUEST, err, sizeof err) != 0);
     check("guest: can only remove its own", hv_net_fwd_remove("lan", 1) != 0 && hv_net_fwd_remove(g.id, 1) == 0);
     HvFwdRule parsed = {.proto = HV_FWD_TCP};
+    HvFwdRule g6 = rule("noglobal", HV_FWD_TCP, free_port(), 7, HV_FWD_LAN);
+    check("parse: ipv6Global false", hv_net_fwd_parse_rule("{\"ipv6Global\":false}", 20, &g6) == 0 && g6.no_global6 == 1);
+    put(g6);
+    check("list: ipv6Global false kept", has("noglobal", "\"ipv6Global\":false"));
+    check("parse: ipv6Global true", hv_net_fwd_parse_rule("{\"ipv6Global\":true}", 19, &g6) == 0 && g6.no_global6 == 0);
+    g6.no_global6 = 1;
+    put(g6);
     const char *js = "{\"protocol\":\"tcp+udp\",\"hostPort\":5000,\"guestPort\":22,\"name\":\"a\\\"b\",\"scope\":\"vpn\"}";
     check("parse a forward", hv_net_fwd_parse_rule(js, strlen(js), &parsed) == 0 && parsed.proto == HV_FWD_BOTH &&
                                  parsed.host_port == 5000 && parsed.guest_port == 22 && !strcmp(parsed.name, "a\"b") &&
@@ -612,6 +649,12 @@ static int scenario_rules(void) {
         check("store has the saved forwards", strstr(text, "\"id\": \"saved\"") && strstr(text, "\"id\": \"lan\"") &&
                                                   strstr(text, "\"id\": \"busy\"") && strstr(text, "\"id\": \"vpn\""));
         check("store: TCP+UDP and the scope", strstr(text, "\"protocol\": \"tcp+udp\"") && strstr(text, "\"scope\": \"lan\""));
+        check("store: a forward without global IPv6 says so", strstr(text, "\"ipv6Global\": false") != NULL);
+        check("store: a forward with global IPv6 says so too (always written)", strstr(text, "\"ipv6Global\": true") != NULL);
+        const char *sv = strstr(text, "\"id\": \"saved\"");
+        const char *sv_end = sv ? strchr(sv, '}') : NULL;
+        const char *sv_g6 = sv ? strstr(sv, "\"ipv6Global\": false") : NULL;
+        check("store: the old rule is written with global IPv6 off", sv && sv_end && sv_g6 && sv_g6 < sv_end);
         check("store: the turned-off one is kept, off", strstr(text, "\"id\": \"both\"") && strstr(text, "\"enabled\": false"));
         check("store: removed and session forwards are not", !strstr(text, "\"id\": \"udp\"") && !strstr(text, "session-"));
         check("store: the name kept as UTF-8", strstr(text, "Saved \xc3\xa9") != NULL);
@@ -851,13 +894,146 @@ static int scenario_rules_off(void) {
     return failures != 0;
 }
 
+/* ---- the address choice, over made-up interfaces ---- */
+
+/* The plan's JSON for one rule (freed here), and whether it has / lacks each piece. */
+static int plan_has(const FakeIfs *f, HvFwdRule r, const char *const *want, const char *const *lacks, char *out, size_t cap) {
+    char *j = hv_net_fwd_plan_json(f->n ? &f->ifa[0] : NULL, &r);
+    int ok = j != NULL;
+    for (int k = 0; ok && want && want[k]; k++)
+        if (!strstr(j, want[k])) ok = 0, fprintf(stderr, "  plan lacks %s: %s\n", want[k], j);
+    for (int k = 0; ok && lacks && lacks[k]; k++)
+        if (strstr(j, lacks[k])) ok = 0, fprintf(stderr, "  plan has %s: %s\n", lacks[k], j);
+    if (out && j) snprintf(out, cap, "%s", j);
+    free(j);
+    return ok;
+}
+
+static int scenario_plan(void) {
+    unsetenv("HV_NET_VPN_IF");
+    unsetenv("HV_NET_LAN_IF");
+    unsetenv("HV_NET_LAN_GLOBAL6");
+    HvFwdRule lan = rule("lan", HV_FWD_BOTH, 3389, 3389, HV_FWD_LAN);
+    HvFwdRule vpn = rule("vpn", HV_FWD_BOTH, 3389, 3389, HV_FWD_VPN);
+    HvFwdRule lo = rule("lo", HV_FWD_BOTH, 3389, 3389, HV_FWD_LOOPBACK);
+    char out[1024];
+
+    /* A Wi-Fi with IPv4, a unique local and a global IPv6 address (and its link-local one), cellular beside it,
+       a WireGuard VPN with IPv4, unique local and global IPv6, iOS's own utuns (link-local only) and the
+       carrier's Wi-Fi Calling tunnel (a global IPv6 address, no IPv4). */
+    FakeIfs f = {0};
+    fake_if(&f, "lo0", "127.0.0.1", 1);
+    fake_if(&f, "lo0", "::1", 1);
+    fake_if(&f, "lo0", "fe80::1", 1);
+    fake_if(&f, "en0", "fe80::10", 1);
+    fake_if(&f, "en0", "192.0.2.10", 1);
+    fake_if(&f, "en0", "2001:db8:1::10", 1);
+    fake_if(&f, "en0", "fd00:1::10", 1);
+    fake_if(&f, "pdp_ip0", "198.51.100.7", 1);
+    fake_if(&f, "pdp_ip0", "2001:db8:2::7", 1);
+    fake_if(&f, "utun0", "fe80::a", 1);
+    fake_if(&f, "utun1", "fe80::b", 1);
+    fake_if(&f, "ipsec0", "2001:db8:c::1", 1);
+    fake_if(&f, "utun4", "fe80::4", 1);
+    fake_if(&f, "utun4", "10.8.0.2", 1);
+    fake_if(&f, "utun4", "2001:db8:8::2", 1);
+    fake_if(&f, "utun4", "fd00:8::2", 1);
+
+    check("local network: IPv4, loopback, unique local and global IPv6 (unique local first), [::1]",
+          plan_has(&f, lan, (const char *const[]){"\"listen\":[\"192.0.2.10:3389\",\"127.0.0.1:3389\",\"[fd00:1::10]:3389\","
+                                                  "\"[2001:db8:1::10]:3389\",\"[::1]:3389\"]", "\"note4\":\"\"", "\"note6\":\"\"", NULL},
+                   (const char *const[]){"fe80", "198.51.100.7", "2001:db8:2::7", "10.8.0.2", NULL}, out, sizeof out));
+    lan.no_global6 = 1;
+    check("local network without global IPv6: the unique local one only",
+          plan_has(&f, lan, (const char *const[]){"\"[fd00:1::10]:3389\"", "\"[::1]:3389\"", NULL},
+                   (const char *const[]){"2001:db8:1::10", NULL}, out, sizeof out));
+    lan.no_global6 = 0;
+    setenv("HV_NET_LAN_GLOBAL6", "0", 1);
+    check("HV_NET_LAN_GLOBAL6=0: no global IPv6 for any rule",
+          plan_has(&f, lan, (const char *const[]){"\"[fd00:1::10]:3389\"", NULL}, (const char *const[]){"2001:db8:1::10", NULL},
+                   out, sizeof out));
+    unsetenv("HV_NET_LAN_GLOBAL6");
+    check("VPN: every usable address of the VPN, IPv4 and IPv6 (unique local first)",
+          plan_has(&f, vpn, (const char *const[]){"\"listen\":[\"10.8.0.2:3389\",\"[fd00:8::2]:3389\",\"[2001:db8:8::2]:3389\"]",
+                                                  "\"relay\":\"10.8.0.2\"", "\"note6\":\"\"", NULL},
+                   (const char *const[]){"fe80", "127.0.0.1", "::1]", "2001:db8:c::1", "192.0.2.10", NULL}, out, sizeof out));
+    check("this device only: 127.0.0.1 and [::1]",
+          plan_has(&f, lo, (const char *const[]){"\"listen\":[\"127.0.0.1:3389\",\"[::1]:3389\"]", NULL}, NULL, out, sizeof out));
+
+    /* A VPN that gives the phone only a global IPv6 address (no IPv4, no unique local one): taken, never the
+       carrier's ipsec; the relays reach the guest through IPv4 loopback, which is not shown. */
+    FakeIfs g = {0};
+    fake_if(&g, "utun0", "fe80::a", 1);
+    fake_if(&g, "ipsec0", "2001:db8:c::1", 1);
+    fake_if(&g, "ipsec1", "2001:db8:c::2", 1);
+    fake_if(&g, "utun3", "fe80::3", 1);
+    fake_if(&g, "utun3", "2001:db8:9::5", 1);
+    check("VPN with a global IPv6 address only: listens on it, IPv4 says why",
+          plan_has(&g, vpn, (const char *const[]){"\"listen\":[\"[2001:db8:9::5]:3389\"]", "\"relay\":\"127.0.0.1\"",
+                                                  "\"note4\":\"the VPN (utun3) has no IPv4 address\"", NULL},
+                   (const char *const[]){"2001:db8:c::", "fe80", NULL}, out, sizeof out));
+
+    /* Only the carrier's tunnels and iOS's link-local utuns: no VPN. */
+    FakeIfs c = {0};
+    fake_if(&c, "utun0", "fe80::a", 1);
+    fake_if(&c, "utun1", "fe80::b", 1);
+    fake_if(&c, "ipsec0", "2001:db8:c::1", 1);
+    fake_if(&c, "en0", "192.0.2.10", 1);
+    check("no VPN: iOS's utuns and the carrier's ipsec are passed over",
+          plan_has(&c, vpn, (const char *const[]){"\"ok\":false", "\"code\":\"no_vpn\"", "\"listen\":[]", NULL}, NULL, out,
+                   sizeof out));
+    check("local network with IPv4 only: IPv6 is loopback and says why",
+          plan_has(&c, lan, (const char *const[]){"\"192.0.2.10:3389\"", "\"note6\":\"no IPv6 address on the local network\"",
+                                                  NULL}, NULL, out, sizeof out));
+
+    /* An IPv4-only VPN, preferred over another VPN by the list's order; an interface that is down counts for nothing. */
+    FakeIfs o = {0};
+    fake_if(&o, "wg0", "10.9.0.2", 1);
+    fake_if(&o, "utun5", "10.7.0.2", 1);
+    fake_if(&o, "en0", "192.0.2.10", 0);
+    fake_if(&o, "en1", "fd00:2::1", 1);
+    fake_if(&o, "en1", "2001:db8:3::1", 1);
+    check("VPN: utun before wg; IPv6 says the VPN has none",
+          plan_has(&o, vpn, (const char *const[]){"\"listen\":[\"10.7.0.2:3389\"]", "\"note6\":\"the VPN (utun5) has no IPv6 address\"",
+                                                  NULL}, (const char *const[]){"10.9.0.2", NULL}, out, sizeof out));
+    check("local network: a down interface is left out, IPv4 says why",
+          plan_has(&o, lan, (const char *const[]){"\"note4\":\"no IPv4 address on the local network\"", "\"[2001:db8:3::1]:3389\"",
+                                                  NULL}, (const char *const[]){"192.0.2.10", NULL}, out, sizeof out));
+    lan.no_global6 = 1;
+    FakeIfs onlyg = {0};
+    fake_if(&onlyg, "en0", "192.0.2.10", 1);
+    fake_if(&onlyg, "en0", "2001:db8:1::10", 1);
+    check("local network with only a global IPv6 address, left out: says so",
+          plan_has(&onlyg, lan, (const char *const[]){"only global IPv6 addresses here", NULL}, (const char *const[]){"2001:db8", NULL},
+                   out, sizeof out));
+    lan.no_global6 = 0;
+
+    /* Many addresses: at most 7 of each family on the local network, plus loopback. */
+    FakeIfs many = {0};
+    char a[64];
+    for (int k = 0; k < 10; k++) {
+        snprintf(a, sizeof a, "2001:db8:1::%x", k + 1);
+        fake_if(&many, "en0", a, 1);
+    }
+    char *j = hv_net_fwd_plan_json(&many.ifa[0], &lan);
+    int n6 = 0;
+    for (char *q = j; q && (q = strstr(q, "[2001:db8:1::")); q++) n6++;
+    check("local network: at most 7 IPv6 addresses besides [::1]", j && n6 == 7 && strstr(j, "\"[::1]:3389\""));
+    free(j);
+
+    printf("fwd (address choice): %d failures\n", failures);
+    fflush(stdout);
+    return failures != 0;
+}
+
 int main(void) {
     const char *tmp = getenv("TMPDIR");
     snprintf(dir, sizeof dir, "%s/test_net_fwd.XXXXXX", tmp && *tmp ? tmp : "/tmp");
     if (!mkdtemp(dir)) return 2;
-    int (*scenarios[])(void) = {scenario_rules, scenario_bad_store, scenario_rules_off, scenario_utf8, scenario_store_priority,
-                                scenario_emfile};
-    const char *names[] = {"rules", "damaged store", "HV_NET_FWD_RULES=0", "UTF-8 names", "store priority", "EMFILE"};
+    int (*scenarios[])(void) = {scenario_plan, scenario_rules, scenario_bad_store, scenario_rules_off, scenario_utf8,
+                                scenario_store_priority, scenario_emfile};
+    const char *names[] = {"address choice", "rules", "damaged store", "HV_NET_FWD_RULES=0", "UTF-8 names", "store priority",
+                           "EMFILE"};
     int bad = 0;
     for (int i = 0; i < (int)(sizeof scenarios / sizeof *scenarios); i++) {
         fflush(stdout);

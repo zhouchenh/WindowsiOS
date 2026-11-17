@@ -212,9 +212,16 @@ static int backing_read(HvVirtioGpu *g, HvVgpuRes *r, uint64_t off, uint8_t *dst
    offer; a preferred size ramfb lacks leaves only 640x480 for both, and Windows' Basic
    Display then starts at 640x480. So until the OS driver takes over (after the firmware's
    reset at ExitBootServices), report the ramfb size. */
+static int firmware_stage(HvVirtioGpu *g) {
+    /* The 3D driver (viogpu3d) negotiates VIRGL, which the firmware's driver never does. A 2D driver after a
+       switch from 3D (hv_virtio_gpu_set_3d) is never taken for the firmware: switching restarts the driver, and
+       every driver start resets the device, so resets is past 1 by then (the count only goes back to 0 when the
+       machine resets). */
+    return g->resets <= 1 && !(g->vio.driver_features & F_VIRGL);
+}
+
 static void guest_mode(HvVirtioGpu *g, uint32_t *w, uint32_t *h) {
-    /* The 3D driver (viogpu3d) negotiates VIRGL, which the firmware's driver never does. */
-    if (g->resets <= 1 && !(g->vio.driver_features & F_VIRGL)) {
+    if (firmware_stage(g)) {
         uint32_t fw = 1210, fh = 834;
         HvFbDisplay *fb = g->fb;
         if (fb) {
@@ -260,7 +267,7 @@ uint32_t hv_virtio_gpu_handle2d(HvVirtioGpu *g, const HvVirtqElem *e, uint8_t *r
         g->info_reqs++;
         g->info_w = mw;
         g->info_h = mh;
-        LOG("display info -> %ux%u (stage %s)\n", mw, mh, g->resets <= 1 ? "firmware" : "os");
+        LOG("display info -> %ux%u (stage %s)\n", mw, mh, firmware_stage(g) ? "firmware" : "os");
         break;
     }
     case CMD_GET_EDID: {
@@ -518,7 +525,7 @@ static void on_reset(HvVirtio *v) {
     if (!g) return;
     pthread_mutex_lock(&g->mu);
     g->resets++;
-    LOG("device reset by driver (#%u)\n", g->resets);
+    LOG("device reset by driver (#%u, next start offered %s)\n", g->resets, g->offer3d ? "3D" : "2D");
     drop_all(g);
     pthread_mutex_unlock(&g->mu);
     if (g->g3d) hv_vgpu3d_reset(g->g3d);
@@ -544,6 +551,8 @@ HvVirtioGpu *hv_virtio_gpu_create(HvMachine *m, HvPcie *bus, HvFbDisplay *fb, ui
     uint32_t cfg[4] = {0, 0, 1, hv_vgpu3d_num_capsets(g->g3d)}; /* events_read, events_clear, num_scanouts, num_capsets */
     memcpy(v->config, cfg, sizeof cfg);
     v->config_len = sizeof cfg;
+    g->base_features = v->features;
+    g->offer3d = g->g3d != NULL;
     if (g->g3d) {
         v->features |= hv_vgpu3d_features(g->g3d);
         hv_pci_add_bar_flags(&v->pci, HV_VGPU3D_HOSTMEM_BAR, hv_vgpu3d_hostmem_size(g->g3d), 1, 1);
@@ -553,6 +562,39 @@ HvVirtioGpu *hv_virtio_gpu_create(HvMachine *m, HvPcie *bus, HvFbDisplay *fb, ui
     hv_pcie_attach(bus, &v->pci);
     fprintf(stderr, "winvm: virtio-gpu attached (preferred %ux%u, 3D %s)\n", g->pref_w, g->pref_h, g->g3d ? "on" : "off");
     return g;
+}
+
+int hv_virtio_gpu_set_3d(HvVirtioGpu *g, int on) {
+    if (!g) return -1;
+    on = on != 0;
+    if (on && !g->g3d) return -1;
+    hv_dev_lock(g->vio.m); /* the features and config are read by the vCPU under the device lock */
+    int changed = on != g->offer3d;
+    g->offer3d = on;
+    g->vio.features = g->base_features | (on ? hv_vgpu3d_features(g->g3d) : 0);
+    uint32_t ncap = on ? hv_vgpu3d_num_capsets(g->g3d) : 0;
+    memcpy(g->vio.config + 12, &ncap, 4);
+    if (changed) g->mode_switches++;
+    uint32_t resets = g->resets;
+    int now3d = (g->vio.driver_features & F_VIRGL) != 0;
+    hv_dev_unlock(g->vio.m);
+    if (changed)
+        fprintf(stderr, "winvm: virtio-gpu offers %s from the next driver start (driver now %s, %u resets)\n",
+                on ? "3D" : "2D", now3d ? "3D" : "2D", resets);
+    return 0;
+}
+
+void hv_virtio_gpu_mode(HvVirtioGpu *g, HvVgpuMode *out) {
+    memset(out, 0, sizeof *out);
+    if (!g) return;
+    hv_dev_lock(g->vio.m);
+    out->capable = g->g3d != NULL;
+    out->offered3d = g->offer3d;
+    out->negotiated3d = (g->vio.driver_features & F_VIRGL) != 0;
+    out->driver_ok = (g->vio.status & 4) != 0;
+    out->resets = g->resets;
+    out->switches = g->mode_switches;
+    hv_dev_unlock(g->vio.m);
 }
 
 void hv_virtio_gpu_set_preferred(HvVirtioGpu *g, uint32_t w, uint32_t h) {
@@ -580,13 +622,14 @@ int hv_virtio_gpu_describe(HvVirtioGpu *g, char *buf, unsigned len) {
     HvVgpuRes *r = find(g, g->scanout_res);
     int n = snprintf(buf, len,
                      "stage=%s resets=%u driver_ok=%d scanout=%ux%u pref=%ux%u info=%ux%u info_reqs=%llu edid_reqs=%llu cmds=%llu flushes=%llu msix=%d",
-                     g->resets <= 1 && !(g->vio.driver_features & F_VIRGL) ? "firmware" : "os", g->resets, (g->vio.status & 4) != 0, r ? r->width : 0,
+                     firmware_stage(g) ? "firmware" : "os", g->resets, (g->vio.status & 4) != 0, r ? r->width : 0,
                      r ? r->height : 0, g->pref_w, g->pref_h, g->info_w, g->info_h, (unsigned long long)g->info_reqs,
                      (unsigned long long)g->edid_reqs, (unsigned long long)g->cmds, (unsigned long long)g->flushes,
                      hv_pci_msix_enabled(&g->vio.pci));
     pthread_mutex_unlock(&g->mu);
     if (n > 0 && (unsigned)n < len) {
-        n += snprintf(buf + n, len - (unsigned)n, " virgl=%d 3d=", (g->vio.driver_features & F_VIRGL) != 0);
+        n += snprintf(buf + n, len - (unsigned)n, " virgl=%d offer=%s switches=%u 3d=", (g->vio.driver_features & F_VIRGL) != 0,
+                      g->offer3d ? "3d" : "2d", g->mode_switches);
         if ((unsigned)n < len) n += hv_vgpu3d_describe(g->g3d, buf + n, len - (unsigned)n);
     }
     return n;

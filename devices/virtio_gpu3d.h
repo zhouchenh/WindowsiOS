@@ -33,6 +33,16 @@ void hv_vgpu3d_kick(HvVgpu3d *s);
 void hv_vgpu3d_cursor(HvVgpu3d *s, uint32_t res);
 /* Driver reset (device lock held): drops in-flight requests; the renderer resets on the worker. */
 void hv_vgpu3d_reset(HvVgpu3d *s);
+/* What the renderer holds when a driver reset comes (worker thread). A reset of a renderer that did nothing since its
+   last reset is skipped (no virgl_renderer_reset, so no Metal work): driver resets in 2D, which may come while the
+   app is in the background, never touch the GPU. */
+typedef struct {
+    int used;          /* a command or a cursor read-back since the last reset */
+    uint32_t live_ctxs, resources, scanout, parked;
+} HvVgpu3dUse;
+static inline int hv_vgpu3d_reset_needed(const HvVgpu3dUse *u) {
+    return u->used || u->live_ctxs || u->resources || u->scanout || u->parked;
+}
 /* PCI config written: (re)place the hostmem window where the BAR now points. */
 void hv_vgpu3d_bar_update(HvVgpu3d *s);
 int hv_vgpu3d_describe(HvVgpu3d *s, char *buf, unsigned len);

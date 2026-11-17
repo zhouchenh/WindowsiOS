@@ -28,9 +28,11 @@ extern uint64_t hv_net_tx_frames, hv_net_rx_frames;
 
 /* Who can connect: */
 #define HV_FWD_LOOPBACK 0 /* apps on this device only: 127.0.0.1 and [::1] */
-#define HV_FWD_LAN 1      /* the local network: the Wi-Fi, wired and Personal Hotspot addresses (not cellular, no global
-                             IPv6 unless HV_NET_LAN_GLOBAL6=1), followed as they change, and loopback */
-#define HV_FWD_VPN 2      /* the address of the active VPN interface (utun...), followed when it changes */
+#define HV_FWD_LAN 1      /* the local network: the Wi-Fi, wired and Personal Hotspot addresses, IPv4 and IPv6 (unique
+                             local, and global unless the rule's no_global6 or HV_NET_LAN_GLOBAL6=0; never link-local,
+                             never cellular), followed as they change, and loopback */
+#define HV_FWD_VPN 2      /* every address of the active VPN interface (utun...): IPv4, and IPv6 unique local and
+                             global unless the rule's no_global6 (not link-local), followed when they change */
 
 typedef struct HvFwdRule {
     char id[48];   /* letters, digits, '-', '_', '.'; empty: one is made up */
@@ -40,6 +42,10 @@ typedef struct HvFwdRule {
     int guest_port;
     int scope; /* HV_FWD_LOOPBACK, HV_FWD_LAN or HV_FWD_VPN */
     int enabled;
+    int no_global6; /* HV_FWD_LAN and HV_FWD_VPN: leave the interface's global IPv6 addresses out (JSON
+                       "ipv6Global": false). A global address may be reachable from the internet unless the router
+                       or the VPN server filters it. A saved rule without the key (from before it was a choice)
+                       loads with it set. */
 } HvFwdRule;
 
 /* The file the machine's forwards are kept in (JSON, see net_slirp.c). Loads it, replacing the saved forwards
@@ -67,12 +73,31 @@ void hv_net_fwd_reopen(void);
 int hv_net_fwd_sync(int timeout_ms);
 /* The forwards with their state, as JSON (malloc'd):
    {"running":bool,"rules":[{"id","name","protocol":"tcp"|"udp"|"tcp+udp","hostPort","guestPort",
-     "scope":"loopback"|"lan"|"vpn","enabled","session","state":"off"|"waiting"|"listening"|"error",
-     "code","message","warning","listen":["127.0.0.1:3389",...]}]} */
+     "scope":"loopback"|"lan"|"vpn","ipv6Global":bool,"enabled","session",
+     "state":"off"|"waiting"|"listening"|"error","code","message","warning",
+     "listen":["127.0.0.1:3389","[fd00::1]:3389",...],
+     "ipv4":{"state":"listening"|"error"|"none"|"off","message"},"ipv6":{...}}]}
+   ipv4 / ipv6: each family on its own. "none": the scope has no address of that family now (the message says
+   why); "error": none of its listeners opened; "listening" with a message: some of its addresses failed. */
 char *hv_net_fwd_list_json(void);
 /* The device's addresses others can connect to, as JSON (malloc'd):
-   {"lan":[{"interface","address","family":4|6}],"vpn":[...]} */
+   {"lan":[{"interface","address","family":4|6,"global":bool}],"vpn":[...]} (global: a global IPv6 address) */
 char *hv_net_fwd_addresses_json(void);
+/* Where a forward would listen with these interfaces (a getifaddrs list), for tests and diagnostics, as JSON
+   (malloc'd): {"ok":bool,"code","listen":["a.b.c.d:port","[v6]:port",...],"relay":"a.b.c.d","note4","note6"}.
+   listen leaves out the IPv4 loopback an IPv6-only VPN keeps as the relays' way in. */
+struct ifaddrs;
+char *hv_net_fwd_plan_json(const struct ifaddrs *ifa, const HvFwdRule *r);
+/* An IPv6 address's flags (XNU's IN6_IFF_*), as SIOCGIFAFLAG_IN6 reads them; 0 when it cannot be read. Forwards
+   never take an address that cannot be bound (tentative, duplicated, detached, or kept for CLAT46) and put deprecated
+   ones last. For tests: fn replaces the lookup (NULL: the real one). */
+#define HV_IN6_IFF_TENTATIVE 0x0002
+#define HV_IN6_IFF_DUPLICATED 0x0004
+#define HV_IN6_IFF_DETACHED 0x0008
+#define HV_IN6_IFF_DEPRECATED 0x0010
+#define HV_IN6_IFF_CLAT46 0x1000
+struct in6_addr;
+void hv_net_set_addr6_flags_fn(int (*fn)(const char *ifname, const struct in6_addr *a));
 /* One forward from JSON (the keys hv_net_fwd_list_json uses; missing ones keep *r's values). 0, or -1. */
 int hv_net_fwd_parse_rule(const char *json, size_t len, HvFwdRule *r);
 

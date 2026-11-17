@@ -8,6 +8,8 @@
 #   follows the iPhone's (kept matched by the display helper).
 #   Power settings (power.ps1, also on its own as POWER.bat): the app shows the iPhone's battery in Windows,
 #   and Windows must never sleep, hibernate, turn the screen off or shut down on a low battery by itself.
+#   Graphics (gpu_switch.ps1): the app switches between host 3D and 2D without restarting Windows (a task restarts
+#   only the display adapter).
 #   Optional, on their own: SSH-SETUP.bat (OpenSSH server), REMOTE-DESKTOP.bat (Remote Desktop host).
 # Run through START.bat. -Finish is what the logon task runs after the restart.
 param([switch]$Finish)
@@ -108,6 +110,11 @@ Say 'Clock: Windows time follows the iPhone'
 # whenever the app comes back to the front, and the time zone is the iPhone's (the helper below keeps it so).
 try { & (Join-Path $home3d 'clock_setup.ps1') } catch { Write-Host "  clock skipped: $($_.Exception.Message)" -ForegroundColor Yellow }
 
+Say 'Graphics: 3D / 2D without a restart'
+# A task (as SYSTEM) restarts only the display adapter when the app switches between host 3D and 2D (server mode
+# keeps Windows running in the background on 2D), and tells the app how it went.
+try { & (Join-Path $home3d 'gpu_switch.ps1') } catch { Write-Host "  graphics switch skipped: $($_.Exception.Message)" -ForegroundColor Yellow }
+
 Say 'Helpers: display size and scale, keyboard focus, clipboard'
 # The background helper (the app's toolbar jobs, e.g. Claude Code, and the display: Windows' mode and scale
 # follow the app live) and the keyboard focus agent (the iPhone keyboard comes up in text boxes, Chinese and
@@ -133,4 +140,5 @@ Write-Host 'The clock is right from the next start of the app after that shut-do
 Write-Host 'Check with dxdiag: Display > "Red Hat VirtIO GPU 3D controller", Feature Levels 11_0.'
 Write-Host 'If the screen ever stays black: delete gpu3d.on from the app''s Shared folder in the Files app and restart the app.'
 Write-Host 'Optional: SSH-SETUP.bat (SSH server, key login) and REMOTE-DESKTOP.bat (Remote Desktop) in C:\WinKit, then'
-Write-Host 'Settings > Port forwarding in the app to reach Windows from other devices.'
+Write-Host 'Settings > Port forwarding in the app to reach Windows from other devices (Settings > Network > Server mode keeps'
+Write-Host 'Windows running in the background). RETURN-TO-SCREEN.bat hands a Remote Desktop session back to the app''s screen.'

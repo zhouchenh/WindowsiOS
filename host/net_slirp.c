@@ -11,7 +11,7 @@
    Windows prefers IPv4 for names that have both (RFC 6724: ULA source, global destination).
    docs/networking.md has the whole picture.
 
-   Port forwards (TCP and UDP, from this device's loopback, every interface or the VPN's address into the guest)
+   Port forwards (TCP and UDP, IPv4 and IPv6, from this device's loopback, the local network's or the VPN's addresses into the guest)
    are rules kept in a table and applied on the network thread: see "port forwards" below.
 
    libslirp is not thread-safe, so it lives on one thread with its sockets and
@@ -38,8 +38,12 @@
 #include <stdlib.h>
 #include <string.h>
 #include <strings.h>
+#include <sys/ioctl.h>
 #include <sys/socket.h>
 #include <time.h>
+#if __has_include(<netinet6/in6_var.h>)
+#include <netinet6/in6_var.h>
+#endif
 #include <unistd.h>
 
 #define QUEUE 512
@@ -237,12 +241,14 @@ static const SlirpCb callbacks = {
    closes the listeners, comparing what each rule wants with what it has (fwd_reconcile). It does so when told
    (fwd_changed), and every few seconds to follow the VPN's address and to retry forwards that failed.
 
-   IPv4 is libslirp's own host forward, on 127.0.0.1, the local network's addresses or the VPN's address. libslirp
-   cannot take an IPv6 connection to the guest's IPv4 address, so IPv6 ([::1], the local network's private
-   addresses, the VPN's IPv6 address) is a small relay of our own (Bridge) that hands each TCP connection, or each
-   UDP peer's datagrams, to the IPv4 listener. The guest then sees those as coming from 10.0.2.2. The local network
-   is the addresses of the Wi-Fi, wired and Personal Hotspot interfaces (lan_ifs), followed as they change, never
-   every interface: not cellular, and not a global IPv6 address the internet may reach. Saved rules are a JSON
+   Every forward listens over IPv4 and IPv6. IPv4 is libslirp's own host forward, on 127.0.0.1, the local network's
+   addresses or the VPN's. libslirp cannot take an IPv6 connection to the guest's IPv4 address, so IPv6 ([::1], the
+   local network's unique local and global addresses, the VPN's IPv6 addresses) is a small relay of our own (Bridge)
+   that hands each TCP connection, or each UDP peer's datagrams, to the IPv4 listener. The guest then sees those as
+   coming from 10.0.2.2. The local network is the addresses of the Wi-Fi, wired and Personal Hotspot interfaces
+   (lan_ifs), followed as they change, never every interface and never cellular; a rule may leave the global IPv6
+   ones out (no_global6: the internet may reach them where the router lets IPv6 in). The VPN is every usable
+   address of the chosen VPN interface (vpn_pick). Link-local addresses are never taken. Saved rules are a JSON
    file in the machine's folder (fwd_save). */
 
 #define MAX_RULES 64
@@ -251,7 +257,7 @@ static const SlirpCb callbacks = {
 #define UDP_PEERS 32
 #define UDP_IDLE_MS 120000
 #define BRIDGE_PUMPS 64 /* TCP connections one IPv6 relay carries at once; more are refused */
-#define FWD_ADDRS 6      /* addresses of one family a forward listens on */
+#define FWD_ADDRS 8      /* addresses of one family a forward listens on */
 #define FWD_LISTEN (2 * FWD_ADDRS)
 
 /* How many connections of one relay are being pumped; shared by the relay and its pump threads, which
@@ -297,6 +303,7 @@ typedef struct Rule {
     char state[12], code[16], msg[160], warn[160];
     char listen[FWD_LISTEN][64];
     int nlisten;
+    char st4[12], st6[12], msg4[160], msg6[160]; /* each family on its own (hv_net_fwd_list_json) */
     Applied ap; /* network thread only */
 } Rule;
 
@@ -614,6 +621,10 @@ static int jrule(JP *j, HvFwdRule *r) {
             r->guest_port = v < 0 || v > 70000 ? -1 : (int)v;
         } else if (!strcmp(key, "enabled")) {
             if (!jbool(j, &r->enabled)) return 0;
+        } else if (!strcmp(key, "ipv6Global")) {
+            int on = 1;
+            if (!jbool(j, &on)) return 0;
+            r->no_global6 = !on;
         } else if (!jskip(j, 1)) {
             return 0;
         }
@@ -918,6 +929,57 @@ static int usable6(const struct sockaddr *sa) {
     return !IN6_IS_ADDR_UNSPECIFIED(a) && !IN6_IS_ADDR_LINKLOCAL(a) && !IN6_IS_ADDR_MULTICAST(a) &&
            !IN6_IS_ADDR_V4MAPPED(a);
 }
+/* An IPv6 address's flags (SIOCGIFAFLAG_IN6). iOS's SDK leaves netinet6/in6_var.h out, but the kernel is XNU on
+   both: the request is laid out and numbered as XNU's struct in6_ifreq (checked against the header where it is). */
+struct hv_in6_ifreq {
+    char ifr_name[IFNAMSIZ];
+    union {
+        struct sockaddr_in6 addr;
+        int flags6;
+        uint64_t size[34]; /* XNU's union: struct in6_ifstat, 34 counters */
+    } ifr_ifru;
+};
+#define HV_SIOCGIFAFLAG_IN6 _IOWR('i', 73, struct hv_in6_ifreq)
+#ifdef SIOCGIFAFLAG_IN6
+_Static_assert(sizeof(struct hv_in6_ifreq) == sizeof(struct in6_ifreq), "struct in6_ifreq");
+_Static_assert(HV_SIOCGIFAFLAG_IN6 == SIOCGIFAFLAG_IN6, "SIOCGIFAFLAG_IN6");
+_Static_assert(HV_IN6_IFF_TENTATIVE == IN6_IFF_TENTATIVE && HV_IN6_IFF_DUPLICATED == IN6_IFF_DUPLICATED &&
+                   HV_IN6_IFF_DETACHED == IN6_IFF_DETACHED && HV_IN6_IFF_DEPRECATED == IN6_IFF_DEPRECATED &&
+                   HV_IN6_IFF_CLAT46 == IN6_IFF_CLAT46,
+               "IN6_IFF_*");
+#endif
+#define IN6_IFF_UNBINDABLE (HV_IN6_IFF_TENTATIVE | HV_IN6_IFF_DUPLICATED | HV_IN6_IFF_DETACHED | HV_IN6_IFF_CLAT46)
+
+static int (*addr6_flags_fn)(const char *ifname, const struct in6_addr *a);
+void hv_net_set_addr6_flags_fn(int (*fn)(const char *ifname, const struct in6_addr *a)) { addr6_flags_fn = fn; }
+
+static int addr6_flags(const char *ifname, const struct sockaddr *sa) {
+    const struct sockaddr_in6 *s6 = (const struct sockaddr_in6 *)sa;
+    if (addr6_flags_fn) return addr6_flags_fn(ifname, &s6->sin6_addr);
+    int fd = socket(AF_INET6, SOCK_DGRAM, 0);
+    if (fd < 0) return 0;
+    struct hv_in6_ifreq r;
+    memset(&r, 0, sizeof r);
+    snprintf(r.ifr_name, sizeof r.ifr_name, "%s", ifname);
+    r.ifr_ifru.addr = *s6;
+    r.ifr_ifru.addr.sin6_len = sizeof r.ifr_ifru.addr;
+    r.ifr_ifru.addr.sin6_family = AF_INET6;
+    int flags = ioctl(fd, HV_SIOCGIFAFLAG_IN6, &r) == 0 ? r.ifr_ifru.flags6 : 0;
+    close(fd);
+    return flags;
+}
+/* An address of this interface a forward can listen on: usable (usable6) and one the kernel lets a socket bind
+   (in6_pcbbind refuses tentative, duplicated, detached and CLAT46 addresses). *deprecated: it is (a forward still
+   takes it, after the others). */
+static int bindable6(const struct ifaddrs *i, int *deprecated) {
+    if (deprecated) *deprecated = 0;
+    if (!usable6(i->ifa_addr)) return 0;
+    int f = addr6_flags(i->ifa_name, i->ifa_addr);
+    if (f & IN6_IFF_UNBINDABLE) return 0;
+    if (deprecated) *deprecated = (f & HV_IN6_IFF_DEPRECATED) != 0;
+    return 1;
+}
+
 static const char *vpn_ifs(void) {
     const char *e = getenv("HV_NET_VPN_IF"); /* which interfaces are a VPN's, preferred in this order; the tests use lo0 */
     return e && *e ? e : "utun,wg,tun,ppp,ipsec";
@@ -936,109 +998,159 @@ static int if_rank(const char *name, const char *list) {
 static int ula6(const struct sockaddr *sa) { /* fc00::/7: a private network's own IPv6 addresses */
     return (((const struct sockaddr_in6 *)sa)->sin6_addr.s6_addr[0] & 0xfe) == 0xfc;
 }
+/* A global IPv6 address: one the internet may reach (not unique local, loopback or the old site-local). */
+static int global6(const struct sockaddr *sa) {
+    const struct in6_addr *a = &((const struct sockaddr_in6 *)sa)->sin6_addr;
+    return usable6(sa) && !ula6(sa) && !IN6_IS_ADDR_LOOPBACK(a) && !IN6_IS_ADDR_SITELOCAL(a);
+}
 static const char *lan_ifs(void) {
     const char *e = getenv("HV_NET_LAN_IF");
     return e && *e ? e : "en,bridge"; /* Wi-Fi and wired, and the personal hotspot (bridge100); never pdp_ip (cellular) */
 }
+/* Local network forwards take global IPv6 addresses (unless a rule leaves them out): HV_NET_LAN_GLOBAL6=0 leaves
+   them out of every one. */
+static int lan_global6_allowed(void) {
+    const char *e = getenv("HV_NET_LAN_GLOBAL6");
+    return !(e && *e == '0');
+}
+
+static int has4(const struct in_addr *a, int n, struct in_addr x) {
+    for (int k = 0; k < n; k++)
+        if (a[k].s_addr == x.s_addr) return 1;
+    return 0;
+}
+static int has6(const struct in6_addr *a, int n, const struct in6_addr *x) {
+    for (int k = 0; k < n; k++)
+        if (!memcmp(&a[k], x, sizeof *x)) return 1;
+    return 0;
+}
 
 typedef struct VpnAddr {
     char ifname[IFNAMSIZ];
-    int has4, has6;
-    struct in_addr a4;
-    struct in6_addr a6;
+    int n4, n6;
+    struct in_addr a4[FWD_ADDRS];
+    struct in6_addr a6[FWD_ADDRS]; /* unique local ones first, deprecated ones after the others */
+    uint8_t g6[FWD_ADDRS];         /* a6[k] is global */
 } VpnAddr;
 
 /* The active VPN: a VPN interface that is up with an IPv4 address, else one with a unique local IPv6 address
-   (fc00::/7), preferring the list's order (utun, wg, tun, ppp, then ipsec). iOS's own utun interfaces only have
-   link-local addresses, and the carrier's tunnels for Wi-Fi Calling and VoLTE (ipsecN, a global IPv6 address from
-   the carrier and no IPv4) are not a VPN the user connected: both are passed over. */
-static void vpn_lookup(VpnAddr *v) {
+   (fc00::/7), else a utun, wg, tun or ppp one with a global IPv6 address, preferring the list's order (utun, wg,
+   tun, ppp, then ipsec). A forward then listens on every usable address it has: its IPv4 ones and its IPv6 ones,
+   unique local and global (never link-local, never one that cannot be bound: bindable6). iOS's own utun interfaces only have link-local addresses, and the
+   carrier's tunnels for Wi-Fi Calling and VoLTE (ipsecN, a global IPv6 address from the carrier and no IPv4) are
+   not a VPN the user connected: both are passed over. */
+static void vpn_pick(const struct ifaddrs *ifa, VpnAddr *v) {
     memset(v, 0, sizeof *v);
-    struct ifaddrs *ifa = NULL;
-    if (getifaddrs(&ifa) != 0) return;
     const char *list = vpn_ifs();
-    for (int want4 = 1; want4 >= 0 && !v->ifname[0]; want4--) {
+    for (int pass = 2; pass >= 0 && !v->ifname[0]; pass--) { /* 2: IPv4, 1: unique local IPv6, 0: global IPv6 */
         int best = -1;
-        for (struct ifaddrs *i = ifa; i; i = i->ifa_next) {
+        for (const struct ifaddrs *i = ifa; i; i = i->ifa_next) {
             if (!i->ifa_addr || !(i->ifa_flags & IFF_UP)) continue;
             int rank = if_rank(i->ifa_name, list), fam = i->ifa_addr->sa_family;
             if (rank < 0 || (best >= 0 && rank >= best)) continue;
-            if ((want4 && fam == AF_INET && usable4(i->ifa_addr)) ||
-                (!want4 && fam == AF_INET6 && usable6(i->ifa_addr) && ula6(i->ifa_addr))) {
+            int ok = pass == 2   ? fam == AF_INET && usable4(i->ifa_addr)
+                     : pass == 1 ? fam == AF_INET6 && ula6(i->ifa_addr) && bindable6(i, NULL)
+                                 : fam == AF_INET6 && global6(i->ifa_addr) && strncmp(i->ifa_name, "ipsec", 5) != 0 &&
+                                       bindable6(i, NULL);
+            if (ok) {
                 snprintf(v->ifname, sizeof v->ifname, "%s", i->ifa_name);
                 best = rank;
             }
         }
     }
-    for (struct ifaddrs *i = ifa; i && v->ifname[0]; i = i->ifa_next) {
-        if (!i->ifa_addr || strcmp(i->ifa_name, v->ifname)) continue;
-        if (i->ifa_addr->sa_family == AF_INET && !v->has4 && usable4(i->ifa_addr))
-            v->has4 = 1, v->a4 = ((struct sockaddr_in *)i->ifa_addr)->sin_addr;
-        if (i->ifa_addr->sa_family == AF_INET6 && !v->has6 && usable6(i->ifa_addr))
-            v->has6 = 1, v->a6 = ((struct sockaddr_in6 *)i->ifa_addr)->sin6_addr;
+    /* IPv6: unique local ones first; in each, deprecated ones after the others */
+    for (int pass = 0; pass < 4 && v->ifname[0]; pass++)
+        for (const struct ifaddrs *i = ifa; i; i = i->ifa_next) {
+            if (!i->ifa_addr || strcmp(i->ifa_name, v->ifname)) continue;
+            if (pass == 0 && i->ifa_addr->sa_family == AF_INET && usable4(i->ifa_addr) && v->n4 < FWD_ADDRS) {
+                struct in_addr a = ((const struct sockaddr_in *)i->ifa_addr)->sin_addr;
+                if (!has4(v->a4, v->n4, a)) v->a4[v->n4++] = a;
+            }
+            int dep;
+            if (i->ifa_addr->sa_family == AF_INET6 && v->n6 < FWD_ADDRS && (pass < 2) == (ula6(i->ifa_addr) != 0) &&
+                bindable6(i, &dep) && dep == (pass & 1)) {
+                struct in6_addr a = ((const struct sockaddr_in6 *)i->ifa_addr)->sin6_addr;
+                if (has6(v->a6, v->n6, &a)) continue;
+                v->g6[v->n6] = (uint8_t)global6(i->ifa_addr);
+                v->a6[v->n6++] = a;
+            }
+        }
+}
+
+static void vpn_lookup(VpnAddr *v) {
+    struct ifaddrs *ifa = NULL;
+    if (getifaddrs(&ifa) != 0) {
+        memset(v, 0, sizeof *v);
+        return;
     }
+    vpn_pick(ifa, v);
     freeifaddrs(ifa);
 }
 
-/* A local network's IPv6 address a forward may listen on: a unique local one (fc00::/7). A global one on the Wi-Fi
-   is reachable from the whole internet wherever the network does not filter incoming IPv6 (many carriers and public
-   networks do not), so it is only taken with HV_NET_LAN_GLOBAL6=1. */
-static int lan6_ok(const struct sockaddr *sa) {
-    if (!usable6(sa)) return 0;
-    if (ula6(sa)) return 1;
-    const char *e = getenv("HV_NET_LAN_GLOBAL6");
-    return e && *e && *e != '0';
-}
-
+#define LAN6_MAX (2 * FWD_ADDRS)
 typedef struct LanAddr {
     int n4, n6;
     struct in_addr a4[FWD_ADDRS - 1]; /* one place is loopback's */
-    struct in6_addr a6[FWD_ADDRS - 1];
+    struct in6_addr a6[LAN6_MAX];     /* unique local and global; a rule takes what it may, FWD_ADDRS - 1 at most */
+    uint8_t g6[LAN6_MAX];             /* a6[k] is global */
 } LanAddr;
 
-/* The local network's addresses now: those of the lan_ifs() interfaces that are up. */
-static void lan_lookup(LanAddr *l) {
+/* The local network's addresses now: those of the lan_ifs() interfaces that are up. IPv6: unique local and global
+   ones, never link-local (a link-local address needs a scope id, and every network has one) and never one that
+   cannot be bound (bindable6); deprecated ones after the others. */
+static void lan_pick(const struct ifaddrs *ifa, LanAddr *l) {
     memset(l, 0, sizeof *l);
-    struct ifaddrs *ifa = NULL;
-    if (getifaddrs(&ifa) != 0) return;
     const char *list = lan_ifs();
-    for (struct ifaddrs *i = ifa; i; i = i->ifa_next) {
-        if (!i->ifa_addr || !(i->ifa_flags & IFF_UP) || (i->ifa_flags & IFF_LOOPBACK) || !if_matches(i->ifa_name, list))
-            continue;
-        if (i->ifa_addr->sa_family == AF_INET && usable4(i->ifa_addr) && l->n4 < FWD_ADDRS - 1) {
-            struct in_addr a = ((struct sockaddr_in *)i->ifa_addr)->sin_addr;
-            int dup = 0;
-            for (int k = 0; k < l->n4; k++) dup |= l->a4[k].s_addr == a.s_addr;
-            if (!dup) l->a4[l->n4++] = a;
-        } else if (i->ifa_addr->sa_family == AF_INET6 && lan6_ok(i->ifa_addr) && l->n6 < FWD_ADDRS - 1) {
-            struct in6_addr a = ((struct sockaddr_in6 *)i->ifa_addr)->sin6_addr;
-            int dup = 0;
-            for (int k = 0; k < l->n6; k++) dup |= !memcmp(&l->a6[k], &a, sizeof a);
-            if (!dup) l->a6[l->n6++] = a;
+    for (int pass = 0; pass < 2; pass++) /* 0: IPv4, and IPv6 not deprecated; 1: deprecated IPv6 */
+        for (const struct ifaddrs *i = ifa; i; i = i->ifa_next) {
+            if (!i->ifa_addr || !(i->ifa_flags & IFF_UP) || (i->ifa_flags & IFF_LOOPBACK) || !if_matches(i->ifa_name, list))
+                continue;
+            int dep;
+            if (i->ifa_addr->sa_family == AF_INET && usable4(i->ifa_addr) && l->n4 < FWD_ADDRS - 1) {
+                struct in_addr a = ((const struct sockaddr_in *)i->ifa_addr)->sin_addr;
+                if (pass == 0 && !has4(l->a4, l->n4, a)) l->a4[l->n4++] = a;
+            } else if (i->ifa_addr->sa_family == AF_INET6 && l->n6 < LAN6_MAX && bindable6(i, &dep) && dep == pass) {
+                struct in6_addr a = ((const struct sockaddr_in6 *)i->ifa_addr)->sin6_addr;
+                if (IN6_IS_ADDR_LOOPBACK(&a) || has6(l->a6, l->n6, &a)) continue;
+                l->g6[l->n6] = (uint8_t)global6(i->ifa_addr);
+                l->a6[l->n6++] = a;
+            }
         }
+}
+
+static void lan_lookup(LanAddr *l) {
+    struct ifaddrs *ifa = NULL;
+    if (getifaddrs(&ifa) != 0) {
+        memset(l, 0, sizeof *l);
+        return;
     }
+    lan_pick(ifa, l);
     freeifaddrs(ifa);
 }
 
 static void addr_list(Buf *b, struct ifaddrs *ifa, const char *list, const char *only_if) {
     int first = 1, n = 0;
     bstr(b, "[");
-    for (struct ifaddrs *i = ifa; i && n < 8; i = i->ifa_next) {
+    for (struct ifaddrs *i = ifa; i && n < 12; i = i->ifa_next) {
         if (!i->ifa_addr || !(i->ifa_flags & IFF_UP) || (i->ifa_flags & IFF_LOOPBACK && !only_if)) continue;
         if (only_if ? strcmp(i->ifa_name, only_if) != 0 : !if_matches(i->ifa_name, list)) continue;
-        int fam = i->ifa_addr->sa_family;
+        int fam = i->ifa_addr->sa_family, global = 0;
         char a[INET6_ADDRSTRLEN];
-        if (fam == AF_INET && usable4(i->ifa_addr))
+        if (fam == AF_INET && usable4(i->ifa_addr)) {
             inet_ntop(AF_INET, &((struct sockaddr_in *)i->ifa_addr)->sin_addr, a, sizeof a);
-        else if (fam == AF_INET6 && (only_if ? usable6(i->ifa_addr) : lan6_ok(i->ifa_addr))) /* what LAN forwards take */
+        } else if (fam == AF_INET6 && bindable6(i, NULL) &&
+                   (only_if || !IN6_IS_ADDR_LOOPBACK(&((struct sockaddr_in6 *)i->ifa_addr)->sin6_addr))) {
             inet_ntop(AF_INET6, &((struct sockaddr_in6 *)i->ifa_addr)->sin6_addr, a, sizeof a);
-        else
+            global = global6(i->ifa_addr);
+        } else {
             continue;
+        }
         bstr(b, first ? "{\"interface\":" : ",{\"interface\":");
         bjson(b, i->ifa_name);
         bstr(b, ",\"address\":");
         bjson(b, a);
-        bstr(b, fam == AF_INET ? ",\"family\":4}" : ",\"family\":6}");
+        bstr(b, fam == AF_INET ? ",\"family\":4" : ",\"family\":6");
+        bstr(b, global ? ",\"global\":true}" : ",\"global\":false}");
         first = 0, n++;
     }
     bstr(b, "]");
@@ -1047,9 +1159,9 @@ static void addr_list(Buf *b, struct ifaddrs *ifa, const char *list, const char 
 char *hv_net_fwd_addresses_json(void) {
     Buf b = {0};
     struct ifaddrs *ifa = NULL;
-    VpnAddr v;
-    vpn_lookup(&v);
     if (getifaddrs(&ifa) != 0) ifa = NULL;
+    VpnAddr v;
+    vpn_pick(ifa, &v);
     bstr(&b, "{\"lan\":");
     addr_list(&b, ifa, lan_ifs(), NULL);
     bstr(&b, ",\"vpn\":");
@@ -1093,6 +1205,8 @@ static void store_rule_json(Buf *b, const HvFwdRule *c, int enabled, int first) 
     bint(b, c->guest_port);
     bstr(b, ", \"scope\": ");
     bjson(b, scope_name(c->scope));
+    /* always written: a rule without it is one from before it was a choice, and loads with it off */
+    bstr(b, c->no_global6 ? ", \"ipv6Global\": false" : ", \"ipv6Global\": true");
     bstr(b, enabled ? ", \"enabled\": true}" : ", \"enabled\": false}");
 }
 
@@ -1163,6 +1277,7 @@ static int put_locked(HvFwdRule *in, int session, int from_guest, char *err, siz
     if (c.scope < HV_FWD_LOOPBACK || c.scope > HV_FWD_VPN) return snprintf(err, errlen, "unknown scope"), -1;
     if (from_guest) c.scope = HV_FWD_LOOPBACK; /* the guest never opens anything beyond this device */
     c.enabled = c.enabled != 0;
+    c.no_global6 = c.no_global6 != 0;
     if (!c.id[0]) {
         if (session) snprintf(c.id, sizeof c.id, "session-%s-%d", proto_name(c.proto), c.host_port);
         else snprintf(c.id, sizeof c.id, "fwd-%08x%04x", arc4random(), arc4random() & 0xffff);
@@ -1318,7 +1433,9 @@ int hv_net_fwd_set_store(const char *path) {
                 if (j.p < j.end && *j.p == ']') j.p++;
                 else
                     for (;;) {
-                        HvFwdRule r = {.proto = HV_FWD_TCP, .enabled = 1};
+                        /* A rule saved before global IPv6 was a choice has no "ipv6Global": it keeps what it had
+                           then, no global addresses, so an update never widens a forward on its own. */
+                        HvFwdRule r = {.proto = HV_FWD_TCP, .enabled = 1, .no_global6 = 1};
                         if (!jrule(&j, &r)) { ok = 0; break; }
                         if (nloaded < MAX_RULES) loaded[nloaded++] = r;
                         jws(&j);
@@ -1463,6 +1580,7 @@ char *hv_net_fwd_list_json(void) {
         bint(&b, r->cfg.guest_port);
         bstr(&b, ",\"scope\":");
         bjson(&b, scope_name(r->cfg.scope));
+        bstr(&b, r->cfg.no_global6 ? ",\"ipv6Global\":false" : ",\"ipv6Global\":true");
         bstr(&b, r->cfg.enabled ? ",\"enabled\":true" : ",\"enabled\":false");
         bstr(&b, r->session ? ",\"session\":true,\"state\":" : ",\"session\":false,\"state\":");
         bjson(&b, state);
@@ -1478,7 +1596,15 @@ char *hv_net_fwd_list_json(void) {
             if (k) bstr(&b, ",");
             bjson(&b, r->listen[k]);
         }
-        bstr(&b, "]}");
+        bstr(&b, "],\"ipv4\":{\"state\":");
+        bjson(&b, live && r->st4[0] ? r->st4 : "off");
+        bstr(&b, ",\"message\":");
+        bjson(&b, live ? r->msg4 : "");
+        bstr(&b, "},\"ipv6\":{\"state\":");
+        bjson(&b, live && r->st6[0] ? r->st6 : "off");
+        bstr(&b, ",\"message\":");
+        bjson(&b, live ? r->msg6 : "");
+        bstr(&b, "}}");
         first = 0;
     }
     bstr(&b, "]}");
@@ -1502,6 +1628,7 @@ typedef struct Want {
     struct in_addr relay;  /* the IPv4 listener the IPv6 relays hand their connections to */
     int n6;
     struct in6_addr a6[FWD_ADDRS];
+    char note4[96], note6[96]; /* the scope has none of its own addresses of that family now: why */
 } Want;
 
 static void want4(Want *w, struct in_addr a, int show) {
@@ -1517,28 +1644,97 @@ static void want_for(const HvFwdRule *c, const VpnAddr *vpn, const LanAddr *lan,
     struct in_addr lo4 = {.s_addr = htonl(INADDR_LOOPBACK)};
     w->relay = lo4;
     switch (c->scope) {
-    case HV_FWD_LAN: /* the local network's own addresses, and this device's apps */
+    case HV_FWD_LAN: { /* the local network's own addresses, and this device's apps */
         for (int k = 0; k < lan->n4; k++) want4(w, lan->a4[k], 1);
         want4(w, lo4, 1);
-        for (int k = 0; k < lan->n6; k++) want6(w, &lan->a6[k]);
+        int global = !c->no_global6 && lan_global6_allowed(), left_out = 0;
+        for (int pass = 0; pass < 2; pass++) /* unique local ones first */
+            for (int k = 0; k < lan->n6 && w->n6 < FWD_ADDRS - 1; k++) {
+                if (lan->g6[k] != pass) continue;
+                if (lan->g6[k] && !global) left_out++;
+                else want6(w, &lan->a6[k]);
+            }
         want6(w, &in6addr_loopback);
+        if (!lan->n4) snprintf(w->note4, sizeof w->note4, "no IPv4 address on the local network");
+        if (w->n6 == 1)
+            snprintf(w->note6, sizeof w->note6, "%s", left_out ? "only global IPv6 addresses here, and this forward leaves them out"
+                                                               : "no IPv6 address on the local network");
         break;
-    case HV_FWD_VPN:
-        if (!vpn->has4 && !vpn->has6) {
+    }
+    case HV_FWD_VPN: {
+        if (!vpn->n4 && !vpn->n6) {
             w->ok = 0;
             snprintf(w->code, sizeof w->code, "no_vpn");
             snprintf(w->msg, sizeof w->msg, "no VPN is connected");
             return;
         }
-        if (vpn->has4) want4(w, vpn->a4, 1), w->relay = vpn->a4;
-        else want4(w, lo4, 0); /* an IPv6-only VPN: the relay's way in */
-        if (vpn->has6) want6(w, &vpn->a6);
+        int left_out = 0;
+        for (int k = 0; k < vpn->n6; k++) {
+            if (vpn->g6[k] && c->no_global6) left_out++;
+            else want6(w, &vpn->a6[k]);
+        }
+        if (!vpn->n4 && !w->n6) { /* a VPN with only global IPv6 addresses, which this forward leaves out */
+            w->ok = 0;
+            snprintf(w->code, sizeof w->code, "vpn_global6");
+            snprintf(w->msg, sizeof w->msg, "the VPN (%s) has only global IPv6 addresses, and this forward leaves them out",
+                     vpn->ifname);
+            return;
+        }
+        for (int k = 0; k < vpn->n4; k++) want4(w, vpn->a4[k], 1);
+        if (vpn->n4) w->relay = vpn->a4[0];
+        else want4(w, lo4, 0); /* an IPv6-only VPN: the relays' way in */
+        if (!vpn->n4) snprintf(w->note4, sizeof w->note4, "the VPN (%s) has no IPv4 address", vpn->ifname);
+        if (!w->n6)
+            snprintf(w->note6, sizeof w->note6,
+                     left_out ? "the VPN (%s) has only global IPv6 addresses, and this forward leaves them out"
+                              : "the VPN (%s) has no IPv6 address",
+                     vpn->ifname);
         break;
+    }
     default:
         want4(w, lo4, 1);
         want6(w, &in6addr_loopback);
         break;
     }
+}
+
+char *hv_net_fwd_plan_json(const struct ifaddrs *ifa, const HvFwdRule *r) {
+    VpnAddr vpn;
+    LanAddr lan;
+    vpn_pick(ifa, &vpn);
+    lan_pick(ifa, &lan);
+    Want w;
+    want_for(r, &vpn, &lan, &w);
+    Buf b = {0};
+    char a[INET6_ADDRSTRLEN + 16], t[INET6_ADDRSTRLEN];
+    bstr(&b, w.ok ? "{\"ok\":true,\"code\":" : "{\"ok\":false,\"code\":");
+    bjson(&b, w.code);
+    bstr(&b, ",\"listen\":[");
+    int first = 1;
+    for (int k = 0; k < w.n4; k++) {
+        if (!w.show4[k]) continue;
+        inet_ntop(AF_INET, &w.a4[k], t, sizeof t);
+        snprintf(a, sizeof a, "%s:%d", t, r->host_port);
+        if (!first) bstr(&b, ",");
+        bjson(&b, a);
+        first = 0;
+    }
+    for (int k = 0; k < w.n6; k++) {
+        inet_ntop(AF_INET6, &w.a6[k], t, sizeof t);
+        snprintf(a, sizeof a, "[%s]:%d", t, r->host_port);
+        if (!first) bstr(&b, ",");
+        bjson(&b, a);
+        first = 0;
+    }
+    inet_ntop(AF_INET, &w.relay, t, sizeof t);
+    bstr(&b, "],\"relay\":");
+    bjson(&b, t);
+    bstr(&b, ",\"note4\":");
+    bjson(&b, w.note4);
+    bstr(&b, ",\"note6\":");
+    bjson(&b, w.note6);
+    bstr(&b, "}");
+    return b.p;
 }
 
 static void fwd_teardown(Applied *ap) {
@@ -1573,7 +1769,10 @@ typedef struct Outcome {
     char state[12], code[16], msg[160], warn[160];
     char listen[FWD_LISTEN][64];
     int nlisten;
+    char st4[12], st6[12], msg4[160], msg6[160];
 } Outcome;
+
+static void fwd_open6(const HvFwdRule *c, const Want *w, Applied *ap, Outcome *o);
 
 static void fwd_apply(const HvFwdRule *c, const Want *w, Applied *ap, Outcome *o) {
     struct in_addr guest;
@@ -1591,12 +1790,31 @@ static void fwd_apply(const HvFwdRule *c, const Want *w, Applied *ap, Outcome *o
                 fwd_teardown(ap);
                 snprintf(o->state, sizeof o->state, "error");
                 errno_text(e, c->host_port, udp ? "UDP" : "TCP", o->code, sizeof o->code, o->msg, sizeof o->msg);
+                /* IPv4 comes first: the IPv6 relays hand their connections to its listener */
+                snprintf(o->st4, sizeof o->st4, "error");
+                snprintf(o->msg4, sizeof o->msg4, "%s", o->msg);
+                snprintf(o->st6, sizeof o->st6, "off");
+                snprintf(o->msg6, sizeof o->msg6, "not opened: IPv4 failed first");
                 return;
             }
             if (udp) ap->udp4[k] = 1;
             else ap->tcp4[k] = 1;
         }
     ap->on = 1;
+    fwd_open6(c, w, ap, o);
+}
+
+/* A wanted IPv6 relay of an open forward is missing (it failed to open): the periodic pass tries it again. */
+static int bridge_missing(const HvFwdRule *c, const Applied *ap) {
+    if (!ap->on) return 0;
+    for (int k = 0; k < ap->n6; k++)
+        if (((c->proto & HV_FWD_TCP) && !ap->tcp6[k]) || ((c->proto & HV_FWD_UDP) && !ap->udp6[k])) return 1;
+    return 0;
+}
+
+/* An open forward (its IPv4 listeners open): opens the IPv6 relays it does not have yet, and writes the outcome. */
+static void fwd_open6(const HvFwdRule *c, const Want *w, Applied *ap, Outcome *o) {
+    memset(o, 0, sizeof *o);
     snprintf(o->state, sizeof o->state, "listening");
     char a[INET6_ADDRSTRLEN];
     for (int k = 0; k < w->n4 && o->nlisten < FWD_LISTEN; k++) {
@@ -1604,26 +1822,49 @@ static void fwd_apply(const HvFwdRule *c, const Want *w, Applied *ap, Outcome *o
         inet_ntop(AF_INET, &w->a4[k], a, sizeof a);
         snprintf(o->listen[o->nlisten++], sizeof o->listen[0], "%s:%d", a, c->host_port);
     }
-    int e6 = 0;
+    snprintf(o->st4, sizeof o->st4, "%s", w->note4[0] ? "none" : "listening");
+    snprintf(o->msg4, sizeof o->msg4, "%s", w->note4);
+    int e6 = 0, open6 = 0, failed6 = 0;
     const char *p6 = NULL;
+    char at6[INET6_ADDRSTRLEN] = "";
     for (int k = 0; k < w->n6; k++) {
+        int bad = 0;
         for (int udp = 0; udp <= 1; udp++) {
             if (!(c->proto & (udp ? HV_FWD_UDP : HV_FWD_TCP))) continue;
+            Bridge **slot = udp ? &ap->udp6[k] : &ap->tcp6[k];
+            if (*slot) continue; /* open already (a retry) */
             int e = 0;
-            Bridge *br = bridge_start(udp, &w->a6[k], c->host_port, w->relay, &e);
-            if (udp) ap->udp6[k] = br;
-            else ap->tcp6[k] = br;
-            if (!br && !e6) e6 = e, p6 = udp ? "UDP" : "TCP";
+            *slot = bridge_start(udp, &w->a6[k], c->host_port, w->relay, &e);
+            if (!*slot) {
+                bad = 1;
+                if (!e6) e6 = e, p6 = udp ? "UDP" : "TCP", inet_ntop(AF_INET6, &w->a6[k], at6, sizeof at6);
+            }
         }
-        if ((ap->tcp6[k] || ap->udp6[k]) && o->nlisten < FWD_LISTEN) {
-            inet_ntop(AF_INET6, &w->a6[k], a, sizeof a);
-            snprintf(o->listen[o->nlisten++], sizeof o->listen[0], "[%s]:%d", a, c->host_port);
+        failed6 += bad;
+        if (ap->tcp6[k] || ap->udp6[k]) {
+            open6++;
+            if (o->nlisten < FWD_LISTEN) {
+                inet_ntop(AF_INET6, &w->a6[k], a, sizeof a);
+                snprintf(o->listen[o->nlisten++], sizeof o->listen[0], "[%s]:%d", a, c->host_port);
+            }
         }
     }
     if (e6) {
         char code[16], msg[140];
         errno_text(e6, c->host_port, p6, code, sizeof code, msg, sizeof msg);
         snprintf(o->warn, sizeof o->warn, "IPv6: %s", msg);
+        if (!open6) {
+            snprintf(o->st6, sizeof o->st6, "error");
+            snprintf(o->msg6, sizeof o->msg6, "%s", msg);
+        } else {
+            snprintf(o->st6, sizeof o->st6, "listening");
+            snprintf(o->msg6, sizeof o->msg6, "%d of %d addresses failed ([%.60s]: %.80s)", failed6, w->n6, at6, msg);
+        }
+    } else if (!w->n6 || w->note6[0]) {
+        snprintf(o->st6, sizeof o->st6, "none");
+        snprintf(o->msg6, sizeof o->msg6, "%s", w->note6);
+    } else {
+        snprintf(o->st6, sizeof o->st6, "listening");
     }
 }
 
@@ -1642,7 +1883,8 @@ typedef struct Snap {
     int used, removed, session, dirty, reopen, errored;
     uint64_t serial;
     HvFwdRule c;
-    char state[12], msg[160], warn[160], listen0[64];
+    char state[12], msg[160], warn[160], listen0[64], msg6[160];
+    int nlisten;
 } Snap;
 
 /* Make what is open match what the rules want: first close what changed, then open, so a forward that moved
@@ -1652,7 +1894,7 @@ static void fwd_reconcile(int periodic) {
     static Snap s[MAX_RULES];
     static Outcome o[MAX_RULES];
     static Want w[MAX_RULES];
-    int act[MAX_RULES]; /* 0: as it is, 1: a new state, 2: a new state after opening */
+    int act[MAX_RULES]; /* 0: as it is, 1: a new state, 2: a new state after opening, 3: after opening missing IPv6 relays */
     pthread_mutex_lock(&fwd_mu);
     uint64_t gen = fwd_change_gen;
     int need_vpn = 0, need_lan = 0;
@@ -1668,6 +1910,8 @@ static void fwd_reconcile(int periodic) {
         memcpy(s[i].msg, r->msg, sizeof s[i].msg);
         memcpy(s[i].warn, r->warn, sizeof s[i].warn);
         memcpy(s[i].listen0, r->nlisten ? r->listen[0] : "", r->nlisten ? sizeof s[i].listen0 : 1);
+        memcpy(s[i].msg6, r->msg6, sizeof s[i].msg6);
+        s[i].nlisten = r->nlisten;
         r->dirty = 0;
         need_vpn |= r->used && !r->removed && r->cfg.enabled && r->cfg.scope == HV_FWD_VPN;
         need_lan |= r->used && !r->removed && r->cfg.enabled && r->cfg.scope == HV_FWD_LAN;
@@ -1707,6 +1951,7 @@ static void fwd_reconcile(int periodic) {
         } else if (!s[i].reopen && !bridge_dead(ap) &&
                    (same_place(ap, c, &w[i]) || (!ap->on && s[i].errored && !s[i].dirty && !periodic))) {
             act[i] = 0; /* as it is (a failed one is tried again on the timer, or when it is changed) */
+            if (periodic && bridge_missing(c, ap)) act[i] = 3; /* an IPv6 address that failed: tried again */
         } else {
             if (ap->on) fwd_teardown(ap);
             act[i] = 2;
@@ -1714,6 +1959,7 @@ static void fwd_reconcile(int periodic) {
     }
     for (int i = 0; i < MAX_RULES; i++)
         if (act[i] == 2) fwd_apply(&s[i].c, &w[i], &rules[i].ap, &o[i]);
+        else if (act[i] == 3) fwd_open6(&s[i].c, &w[i], &rules[i].ap, &o[i]);
 
     pthread_mutex_lock(&fwd_mu);
     for (int i = 0; i < MAX_RULES; i++) {
@@ -1725,6 +1971,10 @@ static void fwd_reconcile(int periodic) {
         }
         set_state(r, o[i].state, o[i].code, o[i].msg);
         snprintf(r->warn, sizeof r->warn, "%s", o[i].warn);
+        memcpy(r->st4, o[i].st4, sizeof r->st4);
+        memcpy(r->st6, o[i].st6, sizeof r->st6);
+        memcpy(r->msg4, o[i].msg4, sizeof r->msg4);
+        memcpy(r->msg6, o[i].msg6, sizeof r->msg6);
         memcpy(r->listen, o[i].listen, sizeof r->listen);
         r->nlisten = o[i].nlisten;
     }
@@ -1734,15 +1984,21 @@ static void fwd_reconcile(int periodic) {
 
     for (int i = 0; i < MAX_RULES; i++) { /* the log: one line when a forward's state changes */
         if (!act[i] || (!strcmp(s[i].state, o[i].state) && !strcmp(s[i].msg, o[i].msg) && !strcmp(s[i].warn, o[i].warn) &&
+                        !strcmp(s[i].msg6, o[i].msg6) && s[i].nlisten == o[i].nlisten &&
                         !strcmp(s[i].listen0, o[i].nlisten ? o[i].listen[0] : "")))
             continue;
         const HvFwdRule *c = &s[i].c;
         if (s[i].removed)
             fprintf(stderr, "winvm: net: forward \"%s\" removed\n", c->name);
-        else if (!strcmp(o[i].state, "listening"))
-            fprintf(stderr, "winvm: net: forward \"%s\" %s %s%s%s -> 10.0.2.15:%d%s%s\n", c->name, proto_name(c->proto),
-                    o[i].listen[0], o[i].nlisten > 1 ? " " : "", o[i].nlisten > 1 ? o[i].listen[1] : "", c->guest_port,
-                    o[i].warn[0] ? "; " : "", o[i].warn);
+        else if (!strcmp(o[i].state, "listening")) {
+            char all[FWD_LISTEN * 66];
+            size_t n = 0;
+            all[0] = 0;
+            for (int k = 0; k < o[i].nlisten && n < sizeof all; k++)
+                n += (size_t)snprintf(all + n, sizeof all - n, "%s%s", k ? " " : "", o[i].listen[k]);
+            fprintf(stderr, "winvm: net: forward \"%s\" %s %s -> 10.0.2.15:%d%s%s%s%s\n", c->name, proto_name(c->proto), all,
+                    c->guest_port, o[i].msg4[0] ? "; IPv4: " : "", o[i].msg4, o[i].msg6[0] ? "; IPv6: " : "", o[i].msg6);
+        }
         else if (!strcmp(o[i].state, "error"))
             fprintf(stderr, "winvm: net: forward \"%s\" not open: %s\n", c->name, o[i].msg);
         else if (strcmp(s[i].state, "waiting"))
@@ -1881,8 +2137,8 @@ int hv_net_attach(HvMachine *m, HvVirtioNet *n) {
     if (!have_store && getenv("HV_NET_FWD_FILE")) hv_net_fwd_set_store(getenv("HV_NET_FWD_FILE")); /* the Mac tool */
     if (getenv("HV_NET_FWD")) {
         /* TCP forwards into the guest for this session, comma-separated: "hostport:guestport" listens on the
-           host's loopback, "lan:hostport:guestport" on every interface (other devices on the Wi-Fi or a VPN can
-           connect; iOS asks for Local Network access), "vpn:hostport:guestport" on the VPN's address; these are
+           host's loopback, "lan:hostport:guestport" on the local network's addresses (other devices on the Wi-Fi
+           can connect; iOS asks for Local Network access), "vpn:hostport:guestport" on the VPN's addresses; these are
            session forwards in the list (IPv4 and IPv6). "a.b.c.d:hostport:guestport" listens on one IPv4
            address, outside the list. */
         char spec[256];
