@@ -2255,7 +2255,7 @@ static void winios_type_run(NSString *text) {
     double hingeDeg = _hingeAngleDegrees;
     os_unfair_lock_unlock(&_metricsLock);
 
-    char gpuLine[1536] = "none";
+    char gpuLine[2048] = "none";
     if (running && hv_winvm_gpu_status(gpuLine, sizeof gpuLine) < 0) snprintf(gpuLine, sizeof gpuLine, "none");
 
     NSString *txt = [NSString stringWithFormat:

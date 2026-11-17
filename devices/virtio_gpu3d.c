@@ -1701,7 +1701,7 @@ int hv_vgpu3d_describe(HvVgpu3d *s, char *buf, unsigned len) {
     pthread_mutex_lock(&s->mu);
     int drain_on = s->drain.on;
     pthread_mutex_unlock(&s->mu);
-    char cleanup[512];
+    char cleanup[1024];
     hv_npt_cleanup_describe(cleanup, sizeof cleanup);
     char shared[384] = "shared-init=off";
     if (atomic_load(&shared_init_installed)) hv_dxmt_shared_init_describe(shared, sizeof shared);
