@@ -12,10 +12,19 @@
  * batch: proxy context destruction is asynchronous. No executable memory changes.
  *
  * Returns 1 when installed (including an identical repeated request), otherwise
- * 0 with a static diagnostic from hv_npt_hook_status(). Failed installation does
+ * 0 safely disabled, or -1 sticky incomplete rollback/protection failure: the
+ * caller MUST refuse backend device creation for the rest of the process.
+ * A static diagnostic is available from hv_npt_hook_status(). Failure does
  * not authorize immediate COM Release. The loaded image and callback must remain
  * alive for the process lifetime; there is deliberately no uninstall operation.
  */
+/* Dry-run BEFORE installing DXMT lifetime hooks: validates the loaded renderer,
+ * exact code/layout, canonical libc free import, and reversible data-page write
+ * access. Does not publish callbacks or mutate the GOT; does not require the
+ * DXMT check. Return values match install. A successful preflight is not a
+ * reservation: if actual free installation subsequently fails after device
+ * hooks installed, caller MUST refuse backend creation persistently. */
+int hv_npt_preflight_free_hook(void *virgl_symbol, void (*capture)(void *), void (*submit)(void));
 int hv_npt_install_free_hook(void *virgl_symbol, void (*capture)(void *), void (*submit)(void));
 const char *hv_npt_hook_status(void);
 

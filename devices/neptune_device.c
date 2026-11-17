@@ -161,8 +161,10 @@ static int stop_compiler(void *device, uintptr_t base)
     if ((!begin && (end || capacity)) || begin%8 || capacity%8 || end<begin ||
         capacity<end || (end-begin)%8 || (end-begin)/8>4096)
         return 0;
-    /* No valid producers remain at the final private-reference decision.
-     * Worker callbacks queue continuations but never grow the workers vector.
+    /* submit() can grow/reallocate the workers vector, but only CPU pipeline
+     * creation calls it; no valid API producer remains at the final private
+     * reference decision. Worker continuations push the internal deque directly
+     * and never call submit(), so this snapshot is stable during stop/join.
      * Holding the native worker mutex across stop publication prevents a lost
      * wake between the wait predicate and pthread_cond_wait. */
     pthread_mutex_t *mutex=(void *)scheduler;

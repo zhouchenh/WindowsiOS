@@ -25,9 +25,10 @@ enum HookStatus {
     HOOK_BAD_HEADER, HOOK_BAD_UUID, HOOK_BAD_LAYOUT, HOOK_BAD_CODE,
     HOOK_BAD_IMPORT, HOOK_BAD_PROTECTION, HOOK_PROTECT_FAILED,
     HOOK_BIND_RACE, HOOK_RESTORE_FAILED, HOOK_RETRY_REJECTED,
-    HOOK_ALREADY_DIFFERENT, HOOK_BAD_DXMT
+    HOOK_ALREADY_DIFFERENT, HOOK_BAD_DXMT, HOOK_PREFLIGHT_READY, HOOK_FATAL
 };
 static _Atomic int hook_status;
+static _Atomic bool hook_fatal;
 static pthread_mutex_t install_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 struct HookState {
@@ -66,15 +67,28 @@ const char *hv_npt_hook_status(void)
         "disabled: import page cannot be made writable", "disabled: free import changed during installation",
         "disabled: import-page protection could not be restored",
         "disabled: previous publication cannot be retried", "rejected: different hook already installed",
-        "disabled: DXMT build not verified"
+        "disabled: DXMT build not verified", "ready: guarded free-hook preflight only",
+        "fatal: free-hook protection or rollback incomplete; refuse backend devices"
     };
-    return messages[atomic_load_explicit(&hook_status, memory_order_relaxed)];
+    /* A concurrent read-only identity failure must never hide a fatal installer
+     * state, even if it passed failure()'s flag check just before publication. */
+    int status=atomic_load_explicit(&hook_fatal,memory_order_acquire)?HOOK_FATAL:
+        atomic_load_explicit(&hook_status,memory_order_relaxed);
+    return messages[status];
 }
 
 static int failure(enum HookStatus status)
 {
-    atomic_store_explicit(&hook_status, status, memory_order_relaxed);
+    if (!atomic_load_explicit(&hook_fatal,memory_order_acquire))
+        atomic_store_explicit(&hook_status, status, memory_order_relaxed);
     return 0;
+}
+
+static int fatal(void)
+{
+    atomic_store_explicit(&hook_status,HOOK_FATAL,memory_order_relaxed);
+    atomic_store_explicit(&hook_fatal,true,memory_order_release);
+    return -1;
 }
 
 static bool region(uintptr_t address, size_t length, vm_prot_t *protection)
@@ -323,9 +337,11 @@ static enum HookStatus validate_image(const struct mach_header_64 *mh, intptr_t 
     return HOOK_NOT_INSTALLED;
 }
 
-static int install_image(const struct mach_header_64 *mh, intptr_t slide,
-                         void (*capture)(void *), void (*submit)(void), uintptr_t expected_free)
+static int configure_image(const struct mach_header_64 *mh, intptr_t slide,
+                           void (*capture)(void *), void (*submit)(void), uintptr_t expected_free,
+                           bool dry_run)
 {
+    if (atomic_load_explicit(&hook_fatal,memory_order_acquire)) return -1;
     enum HookStatus check = validate_image(mh, slide);
     if (check != HOOK_NOT_INSTALLED)
         return failure(check);
@@ -351,6 +367,19 @@ static int install_image(const struct mach_header_64 *mh, intptr_t slide,
     if (vm_protect(mach_task_self(), page, vm_page_size, FALSE,
                    VM_PROT_READ | VM_PROT_WRITE | VM_PROT_COPY) != KERN_SUCCESS)
         return failure(HOOK_PROTECT_FAILED);
+    if (dry_run) {
+        /* Exercise page permission changes before any DXMT data slots change.
+         * Never publish callback state or replace the free import here. */
+        if (vm_protect(mach_task_self(),page,vm_page_size,FALSE,old_protection)!=KERN_SUCCESS) {
+            if (vm_protect(mach_task_self(),page,vm_page_size,FALSE,old_protection)!=KERN_SUCCESS)
+                return fatal();
+            return failure(HOOK_RESTORE_FAILED);
+        }
+        if (__atomic_load_n(slot,__ATOMIC_ACQUIRE)!=expected_free)
+            return failure(HOOK_BAD_IMPORT);
+        atomic_store_explicit(&hook_status,HOOK_PREFLIGHT_READY,memory_order_relaxed);
+        return 1;
+    }
     hook_state = (struct HookState){base, base + HV_NPT_HOOK_FREE_RETURN,
                                    base + HV_NPT_HOOK_FINISH_RETURN, (uintptr_t)slot, capture, submit};
     atomic_store_explicit(&published, &hook_state, memory_order_release);
@@ -360,12 +389,15 @@ static int install_image(const struct mach_header_64 *mh, intptr_t slide,
     if (vm_protect(mach_task_self(), page, vm_page_size, FALSE, old_protection) != KERN_SUCCESS) {
         /* State remains alive if a thread already loaded our hook. No immediate
          * cleanup is attempted here, even when the import is rolled back. */
+        bool rolled_back=true;
         if (bound) {
             expected = (uintptr_t)npt_free_hook;
-            __atomic_compare_exchange_n(slot, &expected, expected_free, false,
-                                         __ATOMIC_RELEASE, __ATOMIC_ACQUIRE);
+            rolled_back=__atomic_compare_exchange_n(slot, &expected, expected_free, false,
+                                                     __ATOMIC_RELEASE, __ATOMIC_ACQUIRE);
         }
-        vm_protect(mach_task_self(), page, vm_page_size, FALSE, old_protection);
+        bool protected_again=vm_protect(mach_task_self(), page, vm_page_size, FALSE,
+                                        old_protection)==KERN_SUCCESS;
+        if (!rolled_back || !protected_again) return fatal();
         return failure(HOOK_RESTORE_FAILED);
     }
     if (!bound)
@@ -375,11 +407,12 @@ static int install_image(const struct mach_header_64 *mh, intptr_t slide,
     return 1;
 }
 
-int hv_npt_install_free_hook(void *virgl_symbol, void (*capture)(void *), void (*submit)(void))
+static int configure_free_hook(void *virgl_symbol,void (*capture)(void *),void (*submit)(void),
+                               bool dry_run)
 {
     if (!virgl_symbol || !capture || !submit)
         return failure(HOOK_BAD_ARGUMENT);
-    if (!atomic_load_explicit(&trusted_dxmt_image, memory_order_acquire))
+    if (!dry_run && !atomic_load_explicit(&trusted_dxmt_image, memory_order_acquire))
         return failure(HOOK_BAD_DXMT);
     Dl_info info;
     if (!dladdr(virgl_symbol, &info))
@@ -404,8 +437,18 @@ int hv_npt_install_free_hook(void *virgl_symbol, void (*capture)(void *), void (
         dlclose(malloc_library);
     if (!canonical)
         return failure(HOOK_BAD_IMPORT);
+    return configure_image(mh,slide,capture,submit,(uintptr_t)libc_free,dry_run);
+}
+
+static int guarded_request(void *symbol,void (*capture)(void *),void (*submit)(void),bool dry_run)
+{
     pthread_mutex_lock(&install_mutex);
-    int result = install_image(mh, slide, capture, submit, (uintptr_t)libc_free);
+    int result=atomic_load_explicit(&hook_fatal,memory_order_acquire)?-1:
+        configure_free_hook(symbol,capture,submit,dry_run);
     pthread_mutex_unlock(&install_mutex);
     return result;
 }
+int hv_npt_preflight_free_hook(void *symbol,void (*capture)(void *),void (*submit)(void))
+{ return guarded_request(symbol,capture,submit,true); }
+int hv_npt_install_free_hook(void *symbol,void (*capture)(void *),void (*submit)(void))
+{ return guarded_request(symbol,capture,submit,false); }

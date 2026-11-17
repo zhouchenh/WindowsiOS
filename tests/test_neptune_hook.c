@@ -17,9 +17,10 @@ static kern_return_t test_protect(vm_map_t, vm_address_t, vm_size_t, boolean_t, 
 #include "../devices/neptune_hook.c"
 #undef free
 #undef vm_protect
+#define install_image(mh,slide,capture,submit,libc) configure_image(mh,slide,capture,submit,libc,false)
 
 static _Atomic unsigned frees, captures, submissions;
-static int protect_calls, fail_protect_call;
+static int protect_calls, fail_protect_call, fail_protect_again;
 static uintptr_t *race_slot;
 static _Thread_local void *held_record;
 
@@ -32,7 +33,8 @@ static void observed_free(void *p)
 static kern_return_t test_protect(vm_map_t task, vm_address_t address, vm_size_t size,
                                   boolean_t maximum, vm_prot_t protection)
 {
-    if (++protect_calls == fail_protect_call)
+    ++protect_calls;
+    if (protect_calls == fail_protect_call || protect_calls == fail_protect_again)
         return KERN_PROTECTION_FAILURE;
     kern_return_t result = vm_protect(task, address, size, maximum, protection);
     if (result == KERN_SUCCESS && race_slot && (protection & VM_PROT_WRITE)) {
@@ -173,6 +175,59 @@ static void test_install(const char *mode)
     munmap(image,0x3f4000);
 }
 
+static void test_preflight(const char *mode)
+{
+    uint8_t *image=fixture();uintptr_t *slot=(void *)(image+HV_NPT_HOOK_FREE_SLOT);
+    if(!strcmp(mode,"preflight-uuid"))image[40]^=1;
+    if(!strcmp(mode,"preflight-interposed"))*slot=1;
+    seal(image);
+    if(!strcmp(mode,"preflight-protect"))fail_protect_call=1;
+    if(!strcmp(mode,"preflight-restore"))fail_protect_call=2;
+    if(!strcmp(mode,"preflight-fatal")){fail_protect_call=2;fail_protect_again=3;}
+    if(!strcmp(mode,"preflight-race"))race_slot=slot;
+    int ok=configure_image((void *)image,(intptr_t)image,capture_and_free,submit,
+        (uintptr_t)observed_free,true);
+    assert(!atomic_load(&published) && !installed && !hook_state.capture);
+    vm_prot_t protection;assert(region((uintptr_t)slot,8,&protection));
+    if(!strcmp(mode,"preflight-fatal")) {
+        assert(ok==-1 && atomic_load(&hook_fatal));
+        assert(hv_npt_preflight_free_hook(NULL,NULL,NULL)==-1);
+        assert(hv_npt_install_free_hook(NULL,NULL,NULL)==-1);
+        assert(!hv_npt_check_dxmt(NULL) && atomic_load(&hook_status)==HOOK_FATAL);
+        assert(configure_image(NULL,0,NULL,NULL,0,true)==-1);
+        atomic_store(&hook_status,HOOK_BAD_DXMT); /* stale read-only failure race */
+        assert(strstr(hv_npt_hook_status(),"fatal:") && hv_npt_install_free_hook(NULL,NULL,NULL)==-1);
+    } else {
+        assert(protection==VM_PROT_READ);
+        if(!strcmp(mode,"preflight")) {
+            assert(ok==1 && protect_calls==2 && atomic_load(&hook_status)==HOOK_PREFLIGHT_READY);
+            assert(*slot==(uintptr_t)observed_free);
+            assert(configure_image((void *)image,(intptr_t)image,capture_and_free,submit,
+                (uintptr_t)observed_free,true)==1 && !published);
+            assert(install_image((void *)image,(intptr_t)image,capture_and_free,submit,
+                (uintptr_t)observed_free)==1 && installed);
+        } else {
+            assert(ok==0);
+            if(!strcmp(mode,"preflight-race") || !strcmp(mode,"preflight-interposed"))assert(*slot==1);
+            else assert(*slot==(uintptr_t)observed_free);
+            if(!strcmp(mode,"preflight-uuid") || !strcmp(mode,"preflight-interposed"))assert(!protect_calls);
+        }
+    }
+    munmap(image,0x3f4000);
+}
+static void test_install_fatal(void)
+{
+    uint8_t *image=fixture();seal(image);
+    fail_protect_call=2;fail_protect_again=3;
+    assert(install_image((void *)image,(intptr_t)image,capture_and_free,submit,(uintptr_t)observed_free)==-1);
+    assert(atomic_load(&published) && !installed && atomic_load(&hook_fatal));
+    assert(*(uintptr_t *)(image+HV_NPT_HOOK_FREE_SLOT)==(uintptr_t)observed_free);
+    assert(hv_npt_preflight_free_hook(NULL,NULL,NULL)==-1);
+    assert(hv_npt_install_free_hook(NULL,NULL,NULL)==-1);
+    assert(atomic_load(&hook_status)==HOOK_FATAL);
+    munmap(image,0x3f4000);
+}
+
 #if defined(__aarch64__)
 extern void npt_test_record_call(void *), npt_test_finish_call(void *);
 extern char npt_test_record_return, npt_test_finish_return;
@@ -273,6 +328,8 @@ int main(int argc,char **argv)
     assert(argc==2);
     if(!strcmp(argv[1],"guards")) test_guards();
     else if(!strcmp(argv[1],"parents")) test_parents();
+    else if(!strncmp(argv[1],"preflight",9)) test_preflight(argv[1]);
+    else if(!strcmp(argv[1],"install-fatal")) test_install_fatal();
 #if defined(__aarch64__)
     else if(!strcmp(argv[1],"callers")) test_callers();
     else if(!strcmp(argv[1],"publication")) test_publication();
