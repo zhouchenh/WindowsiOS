@@ -76,8 +76,13 @@ NSNotificationName const WinIOSDisplayWillReshapeNotification = @"WinIOSDisplayW
     uint8_t _tabletButtons;
     uint8_t _keysDown[32];
     CFAbsoluteTime _keyTapFreeAt; /* main thread: when the last queued key tap is up again (reserveKeyTap) */
+    /* battery passthrough (main thread): the running machine has BAT0/ADP0, the observers are in,
+       the last level (percent) and state handed to it */
+    BOOL _batteryOn, _batteryObserved;
+    int _batteryPct, _batteryState;
 }
 - (void)handleVMExitWithReason:(NSString *)reason;
+- (void)pushBattery;
 - (void)postDisplayStateChanged;
 - (void)updateUnpackProgress:(double)frac;
 - (void)startDiagTimer;
@@ -319,12 +324,72 @@ static void winios_log_memory_census(void) {
         if ([UIApplication sharedApplication].applicationState != UIApplicationStateBackground) {
             [self resumeFromBackground];
         }
+        [self pushBattery]; /* the phone may have been plugged in or out meanwhile */
     });
 }
 
 - (void)onAppActive:(NSNotification *)note {
     (void)note;
     [self resumeFromBackground];
+    [self pushBattery];
+}
+
+/* ---- Battery: the iPhone's battery as Windows' battery and AC adapter ---- */
+
+/* Settings > System > Battery (on unless turned off); read when Windows starts: the ACPI tables are
+   built once per run. Windows only. */
+static BOOL winios_battery_setting(void) {
+    NSUserDefaults *ud = [NSUserDefaults standardUserDefaults];
+    return [ud objectForKey:@"winios.battery"] == nil ? YES : [ud boolForKey:@"winios.battery"];
+}
+
+- (void)onBatteryChanged:(NSNotification *)note {
+    (void)note;
+    [self pushBattery];
+}
+
+/* Main thread (UIDevice). Windows is told only when something changed (hv_winvirt_set_battery).
+   HV_BATTERY_FAKE=<percent>,<state> in env.txt stands in for the iPhone's battery, to try Windows'
+   battery behaviour without draining the phone: 3,1 is 3% on battery (states: 1 unplugged, 2 charging,
+   3 full). */
+- (void)pushBattery {
+    if (!_vmRunning || !_batteryOn) return;
+    double level;
+    int state;
+    int fakePct = 0, fakeState = 0;
+    const char *fake = getenv("HV_BATTERY_FAKE");
+    if (fake && sscanf(fake, "%d,%d", &fakePct, &fakeState) == 2) {
+        level = fakePct / 100.0;
+        state = fakeState;
+    } else {
+        UIDevice *dev = UIDevice.currentDevice;
+        level = dev.batteryLevel;
+        state = (int)dev.batteryState;
+    }
+    int pct = level < 0.0 ? -1 : (int)lround(level * 100.0);
+    if (pct != _batteryPct || state != _batteryState) {
+        static const char *const names[] = {"unknown", "unplugged", "charging", "full"};
+        fprintf(stderr, "winvm: battery %d%% %s%s\n", pct, state >= 0 && state <= 3 ? names[state] : "?",
+                fake ? " (HV_BATTERY_FAKE)" : "");
+        _batteryPct = pct;
+        _batteryState = state;
+    }
+    hv_winvm_set_battery(level, state);
+}
+
+/* Right after the machine is marked running: the first push, then every change iOS reports. */
+- (void)startBatteryPassthrough {
+    if (!_batteryOn) return;
+    UIDevice.currentDevice.batteryMonitoringEnabled = YES;
+    if (!_batteryObserved) {
+        _batteryObserved = YES;
+        NSNotificationCenter *nc = [NSNotificationCenter defaultCenter];
+        [nc addObserver:self selector:@selector(onBatteryChanged:) name:UIDeviceBatteryLevelDidChangeNotification object:nil];
+        [nc addObserver:self selector:@selector(onBatteryChanged:) name:UIDeviceBatteryStateDidChangeNotification object:nil];
+    }
+    _batteryPct = -2; /* log the first state */
+    _batteryState = -1;
+    [self pushBattery];
 }
 
 - (void)onAppBackgroundOrTerminate:(NSNotification *)note {
@@ -1358,6 +1423,9 @@ static NSString *winios_unpack_resource(NSString *name, NSString *dst) {
        then cost microseconds, not a scheduler round trip. */
     setenv("HV_WFI_SPIN", "40", 0);
 
+    /* The iPhone's battery in Windows (Settings > System > Battery): not for Arch Linux. */
+    _batteryOn = !linuxGuest && winios_battery_setting() && !getenv("HV_NO_BATTERY");
+
     HvWinVmConfig cfg = {
         .code_fd = codePath.fileSystemRepresentation,
         .vars_fd = varsPath.fileSystemRepresentation,
@@ -1373,6 +1441,7 @@ static NSString *winios_unpack_resource(NSString *name, NSString *dst) {
         .prealloc_ram = preallocRam,
         .no_net = 0,
         .enable_sound = 1,
+        .battery = _batteryOn,
         .log = 0,
         .stats_interval = getenv("HV_STATS") ? atoi(getenv("HV_STATS")) : 0, /* seconds between engine stats lines on stderr */
     };
@@ -1410,6 +1479,7 @@ static NSString *winios_unpack_resource(NSString *name, NSString *dst) {
     _vmStatus = [NSString stringWithFormat:@"Running %@ (%d vCPUs, %llu MB RAM)",
                  winios_machine_is_linux() ? @"Arch Linux ARM" : @"Windows 11 ARM64", _configuredCPUs, _configuredRamMB];
     [[UIApplication sharedApplication] setIdleTimerDisabled:YES];
+    [self startBatteryPassthrough]; /* after _vmRunning: the board is there, the guest reads it at boot */
 
     hv_winvm_start(1, vm_exit_trampoline);
 
@@ -1541,6 +1611,9 @@ static void winios_type_run(NSString *text) {
     }
     [self writeDiagnosticsSnapshot];
     if (_vmRunning) dispatch_async(dispatch_get_main_queue(), ^{ [self refreshAppliedDisplay]; }); /* display hook */
+    /* battery backstop: iOS coalesces its battery notifications, and may hold them while the app runs in the
+       background (WINIOS_RUN_IN_BACKGROUND); a push that changed nothing costs nothing */
+    if (_vmRunning) dispatch_async(dispatch_get_main_queue(), ^{ [self pushBattery]; });
     if (_vmRunning) {
         if ((_diagTickCount % 4u) == 0u) {
             hv_winvm_flush_disks();
@@ -1672,6 +1745,8 @@ static void winios_type_run(NSString *text) {
 
 - (void)handleVMExitWithReason:(NSString *)reason {
     _vmRunning = NO;
+    if (_batteryOn) UIDevice.currentDevice.batteryMonitoringEnabled = NO;
+    _batteryOn = NO;
     [self stopDiagTimer];
     [self endReshapeWatch:WinIOSReshapeStateIdle]; /* display hook */
     hv_fb_metal_hold_for_size(0, 0, 0);

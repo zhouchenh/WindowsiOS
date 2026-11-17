@@ -200,7 +200,7 @@ int hv_winvm_create(const HvWinVmConfig *c, char *err, size_t errlen) {
     uint64_t ram_bytes = (c->ram_mb ? c->ram_mb : 4096ULL) << 20;
     static const uint8_t mac[6] = {0x02, 0x57, 0x49, 0x4e, 0x00, 0x01};
     if (hv_winvirt_create(&board, &m, cpus, ncpus, ram_bytes, c->prealloc_ram, c->code_fd, c->vars_fd,
-                          d0_ptr, d1_ptr, mac, c->enable_sound) != 0) {
+                          d0_ptr, d1_ptr, mac, c->enable_sound, c->battery) != 0) {
         return fail(err, errlen, "Cannot create virtual ARM64 Windows board (insufficient RAM or missing firmware).");
     }
     hv_winvirt_reset_cpu(&board);
@@ -315,6 +315,9 @@ int hv_winvm_run_cpu0(void) {
                 }
                 pthread_mutex_unlock(&board.gic->mu);
             }
+            /* GED events latched before the reset (a power button the old system never read) must not
+               ride along with the new system's first battery event. */
+            __atomic_store_n(&board.ged_events, 0, __ATOMIC_RELEASE);
             hv_gicv3_its_reset(board.its);
             hv_pcie_reset(board.pcie);
             if (board.flash1) {
@@ -370,6 +373,10 @@ void hv_winvm_stop(void) {
 
 void hv_winvm_power_button(void) {
     hv_winvirt_power_button(&board);
+}
+
+void hv_winvm_set_battery(double level, int state) {
+    hv_winvirt_set_battery(&board, level, state);
 }
 
 /* Bytes typed into the guest's serial console (Linux: its login on ttyAMA0). Waits while the

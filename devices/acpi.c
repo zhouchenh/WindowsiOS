@@ -1,5 +1,6 @@
 /* SPDX-License-Identifier: GPL-2.0-or-later */
 #include "acpi.h"
+#include "acpi_battery.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -182,6 +183,138 @@ static void aml_device(Buf *b, const char name[4], const Buf *body) {
     b_put(b, body->buf, body->len);
 }
 
+/* Package (n) { elems }: elems already encoded (n data objects) */
+static void aml_package(Buf *b, unsigned n, const Buf *elems) {
+    b_u8(b, 0x12); /* PackageOp */
+    aml_pkg_len(b, 1 + elems->len);
+    b_u8(b, (uint8_t)n);
+    b_put(b, elems->buf, elems->len);
+}
+
+static void aml_name_pkg(Buf *b, const char name[4], unsigned n, const Buf *elems) {
+    b_u8(b, 0x08); /* NameOp */
+    b_put(b, name, 4);
+    aml_package(b, n, elems);
+}
+
+/* Method (name, nargs | flags) { body }: flags 0x08 = Serialized */
+static void aml_method(Buf *b, const char name[4], uint8_t flags, const Buf *body) {
+    b_u8(b, 0x14); /* MethodOp */
+    aml_pkg_len(b, 4 + 1 + body->len);
+    b_put(b, name, 4);
+    b_u8(b, flags);
+    b_put(b, body->buf, body->len);
+}
+
+/* Store (src, Index (pkg, i)): 70 src 88 pkg i 00 */
+static void aml_store_index(Buf *b, const char src[4], const char pkg[4], unsigned i) {
+    b_u8(b, 0x70); /* StoreOp */
+    b_put(b, src, 4);
+    b_u8(b, 0x88); /* IndexOp */
+    b_put(b, pkg, 4);
+    aml_int(b, i);
+    b_u8(b, 0x00); /* no target */
+}
+
+/* Name (_PCL, Package () { \_SB }): the devices power the whole system */
+static void aml_pcl_sb(Buf *b) {
+    Buf e = {0};
+    b_put(&e, "\\_SB_", 5);
+    aml_name_pkg(b, "_PCL", 1, &e);
+    free(e.buf);
+}
+
+/* Battery (BAT0, PNP0C0A, Windows' inbox CmBatt) and AC adapter (ADP0, ACPI0003). Their state comes
+ * from four DWORD registers in the GED page (acpi_battery.h); the GED's _EVT notifies both on event
+ * bit 2. Capacities are in mWh on a fixed 10000 mWh scale, so the remaining capacity is the percentage
+ * times 100. The warning and low capacities are 0: Windows' own battery policy decides, and WinKit's
+ * POWER.bat turns every battery action off. */
+static void build_battery(Buf *sb) {
+    /* OperationRegion (BREG, SystemMemory, 0x09080100, 0x10) */
+    b_u8(sb, 0x5b);
+    b_u8(sb, 0x80);
+    b_put(sb, "BREG", 4);
+    b_u8(sb, 0x00); /* SystemMemory */
+    aml_int(sb, HV_ACPI_GED_BATTERY_PA);
+    aml_int(sb, 0x10);
+
+    /* Field (BREG, DWordAcc, NoLock, Preserve) { BSTA, 32, BRAT, 32, BCAP, 32, BPSR, 32 } */
+    {
+        Buf f = {0};
+        b_put(&f, "BREG", 4);
+        b_u8(&f, 0x03);
+        static const char *const names[4] = {"BSTA", "BRAT", "BCAP", "BPSR"};
+        for (int i = 0; i < 4; i++) {
+            b_put(&f, names[i], 4);
+            b_u8(&f, 0x20);
+        }
+        b_u8(sb, 0x5b);
+        b_u8(sb, 0x81);
+        aml_pkg_len(sb, f.len);
+        b_put(sb, f.buf, f.len);
+        free(f.buf);
+    }
+
+    {
+        Buf dev = {0}, e = {0}, m = {0};
+        aml_name_str(&dev, "_HID", "PNP0C0A");
+        aml_name_int(&dev, "_UID", 1);
+        aml_name_int(&dev, "_STA", 0x1f); /* present, enabled, shown, functioning, battery present */
+        aml_pcl_sb(&dev);
+
+        /* _BIF: unit mWh, design and last full capacity, rechargeable, voltage, warning 0, low 0,
+           granularities, model, serial, type, OEM */
+        aml_int(&e, 0);
+        aml_int(&e, HV_BATTERY_FULL_MWH);
+        aml_int(&e, HV_BATTERY_FULL_MWH);
+        aml_int(&e, 1);
+        aml_int(&e, HV_BATTERY_VOLTAGE_MV);
+        aml_int(&e, 0);
+        aml_int(&e, 0);
+        aml_int(&e, 100);
+        aml_int(&e, 100);
+        aml_str(&e, "Virtual battery");
+        aml_str(&e, "1");
+        aml_str(&e, "LION");
+        aml_str(&e, "WINIOS");
+        aml_name_pkg(&dev, "_BIF", 13, &e);
+        e.len = 0;
+
+        /* BSTP: _BST's package, filled from the registers on every call */
+        aml_int(&e, 0);
+        aml_int(&e, HV_BATTERY_RATE_UNKNOWN);
+        aml_int(&e, HV_BATTERY_FULL_MWH);
+        aml_int(&e, HV_BATTERY_VOLTAGE_MV);
+        aml_name_pkg(&dev, "BSTP", 4, &e);
+
+        /* Method (_BST, 0, Serialized) { BSTP[0] = BSTA; BSTP[1] = BRAT; BSTP[2] = BCAP; Return (BSTP) } */
+        aml_store_index(&m, "BSTA", "BSTP", 0);
+        aml_store_index(&m, "BRAT", "BSTP", 1);
+        aml_store_index(&m, "BCAP", "BSTP", 2);
+        b_u8(&m, 0xa4); /* ReturnOp */
+        b_put(&m, "BSTP", 4);
+        aml_method(&dev, "_BST", 0x08, &m);
+
+        aml_device(sb, "BAT0", &dev);
+        free(dev.buf);
+        free(e.buf);
+        free(m.buf);
+    }
+
+    {
+        Buf dev = {0}, m = {0};
+        aml_name_str(&dev, "_HID", "ACPI0003");
+        aml_pcl_sb(&dev);
+        /* Method (_PSR, 0) { Return (BPSR) } */
+        b_u8(&m, 0xa4);
+        b_put(&m, "BPSR", 4);
+        aml_method(&dev, "_PSR", 0x00, &m);
+        aml_device(sb, "ADP0", &dev);
+        free(dev.buf);
+        free(m.buf);
+    }
+}
+
 static void aml_crs_mem32_irq(Buf *crs, uint32_t base, uint32_t len, uint32_t gsi, int has_irq, int edge, int shared) {
     if (len) {
         /* Memory32Fixed descriptor (0x86, length 9) */
@@ -207,7 +340,7 @@ static void aml_crs_mem32_irq(Buf *crs, uint32_t base, uint32_t len, uint32_t gs
     b_u8(crs, 0x00);
 }
 
-static void build_dsdt(Buf *tabs, int ncpus) {
+static void build_dsdt(Buf *tabs, int ncpus, int battery) {
     size_t start = tabs->len;
     acpi_hdr(tabs, "DSDT", 0, 2, "WINVIRT ");
 
@@ -394,6 +527,8 @@ static void build_dsdt(Buf *tabs, int ncpus) {
         free(dev.buf);
     }
 
+    if (battery) build_battery(&sb);
+
     /* Power button (PWRB, PNP0C0C) + Generic Event Device (GED_, ACPI0013 at 0x09080000, GSI 41 / SPI 9) */
     {
         Buf pwrb = {0};
@@ -418,7 +553,20 @@ static void build_dsdt(Buf *tabs, int ncpus) {
             0xa0, 0x10, 0x93, 0x7b, 0x60, 0x0a, 0x02, 0x00, 0x0a, 0x02,
             0x86, 'P', 'W', 'R', 'B', 0x0a, 0x80,
         };
-        b_put(&ged, ged_evt, sizeof ged_evt);
+        /* With the battery: the same, then If ((Local0 & 4) == 4) { Notify (BAT0, 0x80); Notify (ADP0, 0x80) } */
+        static const uint8_t ged_evt_bat[] = {
+            0x5b, 0x80, 'E', 'R', 'E', 'G', 0x00, 0x0c, 0x00, 0x00, 0x08, 0x09, 0x0a, 0x04,
+            0x5b, 0x81, 0x0b, 'E', 'R', 'E', 'G', 0x43, 'E', 'S', 'E', 'L', 0x20,
+            0x14, 0x35, '_', 'E', 'V', 'T', 0x09,
+            0x70, 'E', 'S', 'E', 'L', 0x60,
+            0xa0, 0x10, 0x93, 0x7b, 0x60, 0x0a, 0x02, 0x00, 0x0a, 0x02,
+            0x86, 'P', 'W', 'R', 'B', 0x0a, 0x80,
+            0xa0, 0x17, 0x93, 0x7b, 0x60, 0x0a, 0x04, 0x00, 0x0a, 0x04,
+            0x86, 'B', 'A', 'T', '0', 0x0a, 0x80,
+            0x86, 'A', 'D', 'P', '0', 0x0a, 0x80,
+        };
+        if (battery) b_put(&ged, ged_evt_bat, sizeof ged_evt_bat);
+        else b_put(&ged, ged_evt, sizeof ged_evt);
         aml_device(&sb, "GED_", &ged);
         free(crs.buf);
         free(ged.buf);
@@ -908,7 +1056,8 @@ static void build_smbios(HvFwCfg *fw, int ncpus, uint64_t ram_size) {
     free(t.buf);
 }
 
-void hv_acpi_build_and_register(HvFwCfg *fw, int ncpus, uint64_t ram_size, int spi_msi_base, int spi_msi_count) {
+void hv_acpi_build_and_register(HvFwCfg *fw, int ncpus, uint64_t ram_size, int spi_msi_base, int spi_msi_count,
+                                int battery) {
     Buf tabs = {0};
     Loader ldr = {0};
 
@@ -916,7 +1065,7 @@ void hv_acpi_build_and_register(HvFwCfg *fw, int ncpus, uint64_t ram_size, int s
     loader_alloc(&ldr, "etc/acpi/tables", 64, 1); /* Zone 1 = HIGH */
 
     /* 1. DSDT at offset 0 */
-    build_dsdt(&tabs, ncpus);
+    build_dsdt(&tabs, ncpus, battery);
     uint32_t dsdt_len = (uint32_t)tabs.len;
     loader_add_cksum(&ldr, "etc/acpi/tables", 9, 0, dsdt_len);
 
