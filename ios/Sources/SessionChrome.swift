@@ -50,6 +50,12 @@ final class ChromeModel: ObservableObject {
     @Published var keyboardButtonShown: Bool = UserDefaults.standard.object(forKey: "winios.chrome.fabShown") as? Bool ?? true {
         didSet { UserDefaults.standard.set(keyboardButtonShown, forKey: "winios.chrome.fabShown") }
     }
+    /// The system Paste button in the toolbar. Off by default: iOS cannot put a paste control in the
+    /// Duo's vertical bar, so it would keep a top bar open just for itself. The Clipboard menu sends the
+    /// iPhone clipboard too (iOS may ask first), and Settings › Clipboard has the button.
+    @Published var pasteButtonShown: Bool = UserDefaults.standard.bool(forKey: "winios.chrome.pasteShown") {
+        didSet { UserDefaults.standard.set(pasteButtonShown, forKey: "winios.chrome.pasteShown") }
+    }
     @Published private(set) var hint: String? = nil
 
     // What the system reported, for Settings > Status and the log.
@@ -540,7 +546,7 @@ struct SessionToolbarItems {
         if !compact {
             ClipboardMenu()
         }
-        if !vm.isLinux {
+        if !vm.isLinux && chrome.pasteButtonShown {
             // Paste to Windows: the system paste button, so iOS never asks (ClipboardViews.swift). A paste
             // control cannot sit inside a menu, so it stays in the bar on narrow screens too.
             ClipboardButton() // clipboard hook
@@ -680,6 +686,12 @@ struct ClipboardMenu: View {
 
     var body: some View {
         Menu {
+            if ClipboardSync.shared.forWindows {
+                Button(L("把 iPhone 剪贴板发到 Windows", "Send the iPhone clipboard to Windows"),
+                       systemImage: "arrow.right.doc.on.clipboard") {
+                    Self.sendClipboard()
+                }
+            }
             Button(L("把 iPhone 剪贴板输入到 Windows", "Type the iPhone clipboard into Windows"),
                    systemImage: "doc.on.clipboard") {
                 typeClipboard()
@@ -691,6 +703,17 @@ struct ClipboardMenu: View {
         } label: {
             ChromeMenuLabel(title: L("剪贴板", "Clipboard"), symbol: "clipboard", style: style)
         }
+    }
+
+    /// To Windows' clipboard through the clipboard helper (iOS may ask "Allow Paste?" here, unlike the
+    /// system Paste button), then pasted in Windows if that is on.
+    @MainActor
+    static func sendClipboard() {
+        guard let text = UIPasteboard.general.string, !text.isEmpty else {
+            ChromeModel.shared.showHint(L("iPhone 剪贴板里没有文字", "There is no text on the iPhone clipboard"), seconds: 2.5)
+            return
+        }
+        ClipboardSync.shared.sendToWindows(text)
     }
 
     @MainActor

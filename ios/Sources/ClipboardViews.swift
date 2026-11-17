@@ -37,6 +37,7 @@ private struct AnyLabelStyle: LabelStyle {
 /// The clipboard's settings and the helper's status, as a Form section. Mount it in a settings Form.
 struct ClipboardSettingsSection: View {
     @ObservedObject private var sync = ClipboardSync.shared
+    @ObservedObject private var chrome = ChromeModel.shared
 
     var body: some View {
         Section {
@@ -60,6 +61,7 @@ struct ClipboardSettingsSection: View {
                 Spacer()
                 ClipboardButton()
             }
+            Toggle(L("工具栏里显示粘贴按钮", "Paste button in the toolbar"), isOn: $chrome.pasteButtonShown)
             TimelineView(.periodic(from: .now, by: 2)) { _ in
                 LabeledContent(L("Windows 里的剪贴板小助手", "Clipboard helper in Windows"), value: helperText)
             }
@@ -73,8 +75,8 @@ struct ClipboardSettingsSection: View {
         } header: {
             Text(L("剪贴板", "Clipboard"))
         } footer: {
-            Text(L("Windows 里拷贝的文字会自动出现在 iPhone 的剪贴板上（App 在前台时）。iPhone → Windows 用粘贴按钮，iOS 不会弹出询问。想在回到 App 时自动发送，需要在 iOS 设置 › Apple VM › 从其他 App 粘贴 里选“允许”（这一项在 App 第一次读剪贴板后才出现），然后点“检查”。Windows 那边需要 WinKit 的剪贴板小助手：运行 WINKIT 盘里的 START.bat 或 CLIPBOARD.bat。只同步文字，最多 1 MB。",
-                   "Text copied in Windows appears on the iPhone's clipboard (while the app is in front). iPhone → Windows goes through the paste button, which iOS never asks about. To send by itself when you return to the app, set iOS Settings › Apple VM › Paste from Other Apps › Allow (the item appears after the app first reads the clipboard), then tap Check. Windows needs WinKit's clipboard helper: run START.bat or CLIPBOARD.bat from the WINKIT drive. Text only, up to 1 MB."))
+            Text(L("Windows 里拷贝的文字会自动出现在 iPhone 的剪贴板上（App 在前台时）。iPhone → Windows 用粘贴按钮（这里，或打开上面的开关放进工具栏），iOS 不会弹出询问；剪贴板菜单里的“发到 Windows”也行，但 iOS 可能先问一下。想在回到 App 时自动发送，需要在 iOS 设置 › Apple VM › 从其他 App 粘贴 里选“允许”（这一项在 App 第一次读剪贴板后才出现），然后点“检查”。Windows 那边需要 WinKit 的剪贴板小助手：运行 WINKIT 盘里的 START.bat 或 CLIPBOARD.bat。只同步文字，最多 1 MB。",
+                   "Text copied in Windows appears on the iPhone's clipboard (while the app is in front). iPhone → Windows goes through the paste button (here, or in the toolbar with the switch above), which iOS never asks about; Clipboard › Send to Windows works too, though iOS may ask first. To send by itself when you return to the app, set iOS Settings › Apple VM › Paste from Other Apps › Allow (the item appears after the app first reads the clipboard), then tap Check. Windows needs WinKit's clipboard helper: run START.bat or CLIPBOARD.bat from the WINKIT drive. Text only, up to 1 MB."))
         }
     }
 
