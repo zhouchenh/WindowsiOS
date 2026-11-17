@@ -290,10 +290,10 @@ void hv_audio_set_machine_paused(int paused) {
     machine_paused = paused != 0;
     if (machine_paused) stop_out_locked();
     else if (out_wanted_locked()) rc = start_wanted_locked();
-    int running = hda_out_running;
+    int running = hda_out_running, now = machine_paused;
     pthread_mutex_unlock(&audio_mu);
-    if (was != machine_paused)
-        fprintf(stderr, "winvm: audio: machine %s: output %s%s\n", machine_paused ? "paused" : "resumed",
+    if (was != now)
+        fprintf(stderr, "winvm: audio: machine %s: output %s%s\n", now ? "paused" : "resumed",
                 running ? "running" : "stopped", rc ? " (could not start it)" : "");
 }
 

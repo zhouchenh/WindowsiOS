@@ -53,9 +53,11 @@ function Is404($err) {
 }
 
 if ($Watch) {
-    # The task's loop (SYSTEM). The request read first is from before this start: Windows' display driver started
-    # with whatever the device offered then, so it is only reported, never applied again. $seen stays $null until
-    # the share has answered (a file, a 404, or seq=0: nothing asked).
+    # The task's loop (SYSTEM). The app writes seq=0 at every machine start, and every request it applies is
+    # reported in gpu_mode_applied.txt; so a non-zero seq that is not reported yet was asked during this run, possibly
+    # after the display driver started (the task starts late, or Windows restarted by itself): it is applied, even
+    # when it is the first thing this task reads. $seen stays $null until the share has answered (a file, a 404,
+    # or seq=0: nothing asked).
     $wc = New-Object Net.WebClient
     $seen = $null
     while ($true) {
@@ -71,8 +73,6 @@ if ($Watch) {
             } elseif ($seq -and $mode -and $seq -ne $seen) {
                 if ($seq -eq (LastReported $wc)) {
                     # reported already (this task was restarted): never applied or reported again
-                } elseif ($null -eq $seen) {
-                    Report $wc $seq $mode 'at-start' 'Windows started with the mode offered then'
                 } else {
                     $g = Gpu
                     if (-not $g) {

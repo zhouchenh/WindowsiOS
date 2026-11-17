@@ -221,7 +221,9 @@ final class ServerModeController: ObservableObject {
         let normal = !hot && thermal != .serious && !empty
         if normal && resumedByUser { resumedByUser = false }
         let state = UIApplication.shared.applicationState
-        if !bridge.guardPaused && !reason.isEmpty && state == .background && !resumedByUser {
+        // only while Windows really keeps running in the background: otherwise the bridge's own background pause
+        // already holds it, and a guard pause would outlive the trip
+        if !bridge.guardPaused && !reason.isEmpty && state == .background && !resumedByUser && bridge.runningInBackground {
             guardReason = reason
             bridge.setGuardPaused(true, reason: reason)
             notify(L("Windows 已暂停", "Windows paused"),
@@ -381,12 +383,20 @@ final class ServerModeController: ObservableObject {
     private func appEnteredBackground() {
         if switchedTo2D { backgroundSince2D = true }
         refresh()
+        var pendingTo3D = false
+        if case .waiting(let to3D, _, _) = graphicsPhase { pendingTo3D = to3D }
         if enabled && !isLinux && bridge.isVMRunning && (graphicsPhase.busy || blocker == .switchPending) {
             // the bridge has paused Windows (and logged why): the switch goes on when the app is back
             FileHandle.standardError.write(Data("winvm: server mode: in the background with the graphics switch pending: Windows paused until the app is back\n".utf8))
-            notify(L("Windows 已暂停", "Windows paused"),
-                   body: L("切到 2D 还没完成，所以 Windows 在后台暂停了。打开 App 让它完成，之后就能在后台运行。",
-                           "The switch to 2D was not finished, so Windows is paused in the background. Open the app to let it finish; then it can run in the background."))
+            if pendingTo3D {
+                notify(L("Windows 已暂停", "Windows paused"),
+                       body: L("正在切回 3D，3D 不能在后台运行，所以 Windows 在后台暂停了。打开 App 继续。",
+                               "Windows is switching back to 3D, which cannot run in the background, so it is paused. Open the app to go on."))
+            } else {
+                notify(L("Windows 已暂停", "Windows paused"),
+                       body: L("切到 2D 还没完成，所以 Windows 在后台暂停了。打开 App 让它完成，之后就能在后台运行。",
+                               "The switch to 2D was not finished, so Windows is paused in the background. Open the app to let it finish; then it can run in the background."))
+            }
         }
         checkGuard() // a critical state pauses Windows now that the app is away
     }
