@@ -516,9 +516,10 @@ static BOOL winios_plans_equal(WinIOSDisplayPlan a, WinIOSDisplayPlan b) {
     [line writeToFile:[dir stringByAppendingPathComponent:@"res.txt"] atomically:YES encoding:NSASCIIStringEncoding error:nil];
 }
 
-/* The iPhone's time zone, where the WinKit helper reads it (http://10.0.2.4/tz.txt): its IANA name and
-   its offset from UTC in seconds, one per line ("Asia/Shanghai\r\n28800\r\n"). The helper sets Windows'
-   zone to match (tzutil) and reports it in tz_applied.txt. Windows only: Arch keeps UTC. */
+/* The iPhone's time zone, where the WinKit helper reads it (http://10.0.2.4/tz.txt): its IANA name, its
+   offset from UTC in seconds and what the RTC counts, one per line ("Asia/Shanghai\r\n28800\r\nrtc=utc\r\n").
+   The helper sets Windows' zone to match (tzutil) and reports it in tz_applied.txt; clock_setup.ps1 sets
+   RealTimeIsUniversal only for rtc=utc. Windows only: Arch keeps UTC. */
 - (void)publishTimeZone {
     if (winios_machine_is_linux()) return;
     [NSTimeZone resetSystemTimeZone];
@@ -527,7 +528,9 @@ static BOOL winios_plans_equal(WinIOSDisplayPlan a, WinIOSDisplayPlan b) {
     NSString *dir = [[self documentsPath] stringByAppendingPathComponent:@"Shared"];
     [[NSFileManager defaultManager] createDirectoryAtPath:dir withIntermediateDirectories:YES attributes:nil error:nil];
     NSString *path = [dir stringByAppendingPathComponent:@"tz.txt"];
-    NSString *text = [NSString stringWithFormat:@"%@\r\n%ld\r\n", tz.name, (long)tz.secondsFromGMT];
+    const char *rtc = getenv("HV_RTC");
+    NSString *text = [NSString stringWithFormat:@"%@\r\n%ld\r\nrtc=%s\r\n", tz.name, (long)tz.secondsFromGMT,
+                      rtc && !strcmp(rtc, "localtime") ? "localtime" : "utc"];
     NSString *old = [NSString stringWithContentsOfFile:path encoding:NSASCIIStringEncoding error:nil];
     if ([old isEqualToString:text]) return;
     [text writeToFile:path atomically:YES encoding:NSASCIIStringEncoding error:nil];
@@ -1335,7 +1338,9 @@ static NSString *winios_unpack_resource(NSString *name, NSString *dst) {
        time instead (QEMU's -rtc base=localtime): only for a Windows without RealTimeIsUniversal, never with
        it (the time would be shifted twice). Set or cleared on every start, never from env.txt, so it does not
        carry over to the other machine: Arch always reads the RTC as UTC. */
-    if (!linuxGuest && [[NSFileManager defaultManager] fileExistsAtPath:[dir stringByAppendingPathComponent:@"rtc-localtime.on"]])
+    NSString *win11Dir = [[[self documentsPath] stringByAppendingPathComponent:@"Machines"] stringByAppendingPathComponent:@"Win11"];
+    if (!linuxGuest && ([[NSFileManager defaultManager] fileExistsAtPath:[dir stringByAppendingPathComponent:@"rtc-localtime.on"]] ||
+                        [[NSFileManager defaultManager] fileExistsAtPath:[win11Dir stringByAppendingPathComponent:@"rtc-localtime.on"]]))
         setenv("HV_RTC", "localtime", 1);
     else
         unsetenv("HV_RTC");

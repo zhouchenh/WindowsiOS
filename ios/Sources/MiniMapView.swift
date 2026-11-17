@@ -328,14 +328,21 @@ final class MiniMapView: UIView {
     }
 
     private var ticks = 0
+    /// The width wanted at the last tick, also while hidden: the key bar may have left the map out
+    /// because it did not fit, and a narrower Windows shape can make it fit again.
+    private var lastPreferred: CGFloat = -1
     private func tick() {
-        guard window != nil, !isHidden, alpha > 0.01 else { return }
+        guard window != nil else { return }
+        // Windows took another shape: the key bar lays out again (the map's width, and whether it fits at all)
+        if let bar = superview as? WindowsKeyBar {
+            let want = preferredWidth(forHeight: isHidden || bounds.height < 1 ? 40 : bounds.height)
+            let changed = abs(want - lastPreferred) > 0.5 || (!isHidden && abs(want - bounds.width) > 0.5)
+            lastPreferred = want
+            if changed { bar.setNeedsLayout() }
+        }
+        guard !isHidden, alpha > 0.01 else { return }
         ticks += 1
         setNeedsLayout() // the pointer moves
-        // Windows took another shape: the key bar lays out again (the map's width, and whether it fits at all)
-        if let bar = superview as? WindowsKeyBar, abs(preferredWidth(forHeight: bounds.height) - bounds.width) > 0.5 {
-            bar.setNeedsLayout()
-        }
         if ticks % 12 == 0 { refreshPicture() } // the picture: every 3 s
     }
 

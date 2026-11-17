@@ -39,9 +39,10 @@ App 给 Windows 的硬件时钟（RTC）走的是 **UTC**。`START.bat` 的“Cl
   小助手几秒内用 `tzutil` 改好 Windows 的时区（不需要管理员），结果写在 `Shared/tz_applied.txt`（例如 `China Standard Time rtiu=1 w32time=Running`；`rtiu=0` 说明还没跑过新版 `START.bat`）。
   时区换算用 Windows 自带的 ICU（`WinKitTz.cs`），找不到的时区会写成 `unmapped ...`，Windows 的时区不变。
 
-- **撤销**：管理员运行 `C:\WinKit\clock_setup.ps1 -Uninstall`（删掉 `RealTimeIsUniversal` 和 WinKit Clock 任务，时间服务保持现状）。
-- **后备方案**：万一某个 Windows 不认 `RealTimeIsUniversal`（从 App 重启后时间仍差几个小时），先运行 `clock_setup.ps1 -Uninstall`，
-  再在“文件”App 里 Windows 虚拟机的文件夹（`Machines/Win11/`）放一个名为 `rtc-localtime.on` 的空文件，从 App 重新启动：硬件时钟改走 iPhone 的本地时间（和 QEMU、UTM 的做法一样；Mac 上的 `build/winvm` 用环境变量 `HV_RTC=localtime`）。
+- **撤销**：在管理员 PowerShell 里运行 `powershell -NoProfile -ExecutionPolicy Bypass -File C:\WinKit\clock_setup.ps1 -Uninstall`（删掉 `RealTimeIsUniversal` 和 WinKit Clock 任务，时间服务保持现状）。
+- **后备方案**：万一某个 Windows 不认 `RealTimeIsUniversal`（从 App 重启后时间仍差几个小时），在“文件”App 里 Windows 虚拟机的文件夹
+  （`Machines/Win11/`；老安装是 App 文稿目录本身，两处都认）放一个名为 `rtc-localtime.on` 的空文件，从 App 启动 Windows，再运行一次 `START.bat`
+  （它从 `tz.txt` 的 `rtc=localtime` 看出来，会删掉 `RealTimeIsUniversal` 而不是设置它），然后关机、从 App 再启动：硬件时钟改走 iPhone 的本地时间（和 QEMU、UTM 的做法一样；Mac 上的 `build/winvm` 用环境变量 `HV_RTC=localtime`）。
   **两者不能同时用**，否则时间会被换算两次。这个开关只对 Windows 有效，不放在 `env.txt` 里；Arch Linux 始终是 UTC。
 - 在一次 App 运行期间，Windows 写进硬件时钟的值会保留到下次从 App 启动，所以调整时钟相关设置后要“关机 + 从 App 启动”，不要用“重启”。
 
@@ -117,14 +118,14 @@ App 会把 iPhone 的电池交给 Windows：Windows 右下角显示 iPhone 的�
 App 的“设置 → 系统 → 电池”可以关掉（只对 Windows，Arch Linux 没有），改动在下次启动 Windows 时生效。
 
 使用电池时，Windows 默认会关屏幕、调暗、提示电量低、打开节电模式，电量很低时还会自己关机。`START.bat` 会运行 `power.ps1` 把这些都关掉；
-以前跑过旧版 WinKit 的，双击 WINKIT 盘（或 `C:\WinKit`）里的 `POWER.bat`，权限提示点“是”。它对**每一个**电源计划、接通电源和使用电池两种情况都设置：
+以前跑过旧版 WinKit 的，双击 WINKIT 盘里的 `POWER.bat`（`C:\WinKit` 里的副本要等跑过新版 `START.bat` 才有），权限提示点“是”。它对**每一个**电源计划、接通电源和使用电池两种情况都设置：
 
 - 使用电池时的每一项都和接通电源时一样（处理器、PCIe、USB 等），然后：
 - 睡眠、休眠、关闭显示器、调暗显示器、锁屏后关闭显示器、关闭硬盘：从不；混合睡眠：关；休眠功能关闭（`powercfg /h off`）
 - 电量低和电量严重不足时的操作：不采取任何操作；电量低、严重不足、保留电量的级别：允许的最低值；电量低提醒：关
 - 节电模式：不会自己打开（阈值 0）
 - 合上盖子、睡眠按钮：不采取任何操作。**电源按钮保持“关机”**，因为 App 的“关机（通知 Windows）”就是按它；
-  想让它也什么都不做，管理员运行 `C:\WinKit\power.ps1 -PowerButtonDoesNothing`（之后 App 的关机按钮就没有作用了）。
+  想让它也什么都不做，在管理员 PowerShell 里运行 `powershell -NoProfile -ExecutionPolicy Bypass -File C:\WinKit\power.ps1 -PowerButtonDoesNothing`（之后 App 的关机按钮就没有作用了）。
 
 只用 powercfg，不用组策略：这些设置在 Windows 里仍然可以改。可以重复运行，只改不一样的地方，并逐条列出改了什么；结果也会写到 App 文件夹的 `Shared/power.txt`。
 

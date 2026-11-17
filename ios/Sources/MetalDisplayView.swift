@@ -144,7 +144,7 @@ final class MetalCanvasUIView: UIView, UITextInput {
         addInteraction(UIPointerInteraction(delegate: self))
         inputAssistantItem.leadingBarButtonGroups = []
         inputAssistantItem.trailingBarButtonGroups = []
-        NotificationCenter.default.addObserver(self, selector: #selector(releaseAllKeys),
+        NotificationCenter.default.addObserver(self, selector: #selector(releaseAllInput),
                                                name: UIApplication.willResignActiveNotification, object: nil)
         NotificationCenter.default.addObserver(self, selector: #selector(displayWillReshape),
                                                name: .WinIOSDisplayWillReshape, object: nil)
@@ -731,7 +731,7 @@ final class MetalCanvasUIView: UIView, UITextInput {
         let r = super.resignFirstResponder()
         if r {
             keys.releaseAll(keepLatches: false)
-            releaseAllKeys()
+            if resigningForSession { releaseAllInput() } else { releaseAllKeys() } // a plain keyboard hide keeps fingers down
             pendingHide?.cancel()
             pendingHide = nil
             keyboardAutoShown = false
@@ -765,7 +765,7 @@ final class MetalCanvasUIView: UIView, UITextInput {
         viewport.onChange = { [weak self] in self?.viewportChanged() }
         keyBar.miniMap.onReturnToCaret = { [weak self] in self?.returnToCaret() }
         let nc = NotificationCenter.default
-        nc.addObserver(self, selector: #selector(releaseAllKeys), name: UIApplication.didEnterBackgroundNotification, object: nil)
+        nc.addObserver(self, selector: #selector(releaseAllInput), name: UIApplication.didEnterBackgroundNotification, object: nil)
         nc.addObserver(self, selector: #selector(keyboardFrameWillChange(_:)),
                        name: UIResponder.keyboardWillChangeFrameNotification, object: nil)
         nc.addObserver(self, selector: #selector(keyboardFrameWillChange(_:)),
@@ -927,15 +927,22 @@ final class MetalCanvasUIView: UIView, UITextInput {
         pressesEnded(presses, with: event)
     }
 
-    /// Keys still held when the app loses focus (Cmd-Tab away, a sheet opens) would stay down in Windows.
-    /// So would touch screen fingers: they are cancelled.
+    /// Keys still held when the view loses the keyboard focus (Cmd-Tab away, a sheet opens, the keyboard
+    /// hides) would stay down in Windows. Touch screen fingers are not touched here: the keyboard hiding by
+    /// itself (focus left a text box) must not cancel a finger still down; releaseAllInput() ends those.
     @objc func releaseAllKeys() {
         for k in keysDown { WinIOSBridge.shared.sendKeyHid(k, down: false) }
         keysDown.removeAll()
         endPinch()
+        keys.releaseAll(keepLatches: UIApplication.shared.applicationState == .active)
+    }
+
+    /// The app really loses input (inactive, background, the view goes away, the session takes the focus):
+    /// keys and touch screen fingers are released, so Windows never keeps a stuck key or finger.
+    @objc func releaseAllInput() {
+        releaseAllKeys()
         takeTouchGestureBack()
         WinIOSBridge.shared.cancelAllTouchContacts()
-        keys.releaseAll(keepLatches: UIApplication.shared.applicationState == .active)
     }
 
     static func asciiToHID(_ ch: Character) -> (UInt8, Bool)? {
@@ -1020,7 +1027,7 @@ struct MetalCanvasRepresentable: UIViewRepresentable {
     }
 
     static func dismantleUIView(_ uiView: MetalCanvasUIView, coordinator: ()) {
-        uiView.releaseAllKeys()
+        uiView.releaseAllInput()
     }
 
     func updateUIView(_ uiView: MetalCanvasUIView, context: Context) {

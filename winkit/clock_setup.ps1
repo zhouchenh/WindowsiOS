@@ -13,8 +13,8 @@
 #   powershell -ExecutionPolicy Bypass -File clock_setup.ps1              set it up
 #   powershell -ExecutionPolicy Bypass -File clock_setup.ps1 -Uninstall   RealTimeIsUniversal and the task removed
 #                                                                         (w32time stays as it is)
-# For a Windows that should read the RTC as local time instead (the app's rtc-localtime.on), run -Uninstall:
-# the two must never be combined.
+# What the RTC counts comes from the app (tz.txt's "rtc=" line): with the app's rtc-localtime.on it counts local
+# time, and this script removes RealTimeIsUniversal instead of setting it (the two must never be combined).
 param([switch]$Uninstall, [switch]$Watch)
 $u = 'http://10.0.2.4'
 $task = 'WinKit Clock'
@@ -56,11 +56,22 @@ if ($Uninstall) {
     return
 }
 
-# ---- 1. the RTC counts UTC
+# ---- 1. how Windows reads the RTC: as UTC, unless the app says it counts local time (rtc-localtime.on)
+$rtcLocal = $false
+try {
+    $lines = (New-Object Net.WebClient).DownloadString("$u/tz.txt") -split "`r?`n"
+    $rtcLocal = @($lines | Where-Object { $_.Trim() -eq 'rtc=localtime' }).Count -gt 0
+} catch { } # an older app, or no share: its RTC counts UTC
 $was = (Get-ItemProperty -Path $tzi -Name 'RealTimeIsUniversal' -ErrorAction SilentlyContinue).RealTimeIsUniversal
-& reg.exe add 'HKLM\SYSTEM\CurrentControlSet\Control\TimeZoneInformation' /v RealTimeIsUniversal /t REG_DWORD /d 1 /f | Out-Null
-if ($was -eq 1) { Write-Host '  RTC read as UTC: already set' }
-else { Write-Host '  RTC read as UTC: set (takes effect after a shut-down and a start from the app)' }
+if ($rtcLocal) {
+    Remove-ItemProperty -Path $tzi -Name 'RealTimeIsUniversal' -ErrorAction SilentlyContinue
+    if ($was -eq 1) { Write-Host '  RTC read as local time (the app counts local time): RealTimeIsUniversal removed (takes effect after a shut-down and a start from the app)' }
+    else { Write-Host '  RTC read as local time (the app counts local time)' }
+} else {
+    & reg.exe add 'HKLM\SYSTEM\CurrentControlSet\Control\TimeZoneInformation' /v RealTimeIsUniversal /t REG_DWORD /d 1 /f | Out-Null
+    if ($was -eq 1) { Write-Host '  RTC read as UTC: already set' }
+    else { Write-Host '  RTC read as UTC: set (takes effect after a shut-down and a start from the app)' }
+}
 
 # ---- 2. Windows Time: starts with Windows, hourly, any correction size (the clock stands still in sleep)
 & sc.exe config w32time start= delayed-auto | Out-Null

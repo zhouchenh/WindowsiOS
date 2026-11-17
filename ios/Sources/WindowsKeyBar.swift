@@ -631,7 +631,12 @@ final class WindowsKeyBar: UIView {
         let ch = noticeWide.height
         var frame: CGRect? = nil
         if noticeLabel.text != nil, ch > 0 {
-            if let row = noticeRows.first(where: { $0.width >= (transientNotice ? 260 : 140) }) {
+            // the app keys' own row (never wider than its keys) takes a short notice from 140 pt; the
+            // scrolling row needs 260 pt for one
+            let fits = noticeRows.enumerated().first { i, r in
+                r.width >= (transientNotice && !(i == 0 && noticeRows.count == 2) ? 260 : 140)
+            }
+            if let row = fits?.element {
                 frame = row
             } else if transientNotice && noticeWide.width >= 100 {
                 frame = noticeWide
