@@ -267,6 +267,9 @@ private final class FadingScroller: UIView, UIScrollViewDelegate {
 ///   (Esc) (Start, Search, Task View) (Undo, Redo) (Tab, Ctrl, Alt, Shift, Win) (arrows, Home, End,
 ///   PgUp, PgDn, Del: scrolls) (Shortcuts) (hide keyboard) [map of the screen]
 /// Glyphs, with text only where Windows' own keys have it. Every key says its Windows name to VoiceOver.
+/// Narrower (KeyBarLayout): the app keys follow the arrows in one scrolling row; narrower still (Split View,
+/// a small phone) that row goes and its keys are at the top of Shortcuts. The map shows only where the
+/// regular bar fits.
 final class WindowsKeyBar: UIView {
     private weak var canvas: MetalCanvasUIView?
     private let keys: WindowsKeyState
@@ -287,6 +290,14 @@ final class WindowsKeyBar: UIView {
     private let noticeLabel = UILabel()
     private var noticeTimer: Timer?
     private var persistentNotice: String?
+    /// The text showing is a short-lived notice (not the persistent one).
+    private var transientNotice = false
+    /// Where a notice may lie: over a row (the app keys' own row first; none with no row), or between Esc
+    /// and Shortcuts (over the modifiers).
+    private var noticeRows: [CGRect] = []
+    private var noticeWide: CGRect = .zero
+    /// No room for the scrolling row: its keys are in the Shortcuts menu.
+    private var rowHidden = false
     private var lastSize: CGSize = .zero
     private var holdTimers: [ObjectIdentifier: Timer] = [:]
     private var holding: Set<ObjectIdentifier> = []
@@ -375,9 +386,9 @@ final class WindowsKeyBar: UIView {
         noticeCapsule.isHidden = true
         noticeCapsule.isUserInteractionEnabled = false
         noticeLabel.textColor = .white
-        noticeLabel.font = .systemFont(ofSize: 13, weight: .medium)
-        noticeLabel.adjustsFontSizeToFitWidth = true
-        noticeLabel.minimumScaleFactor = 0.75
+        noticeLabel.font = Self.noticeFont(13)
+        noticeLabel.numberOfLines = 1 // layoutNotice() picks the size and lines that fit
+        noticeLabel.lineBreakMode = .byTruncatingTail
         noticeCapsule.addSubview(noticeLabel)
         addSubview(noticeCapsule)
 
@@ -413,18 +424,13 @@ final class WindowsKeyBar: UIView {
             }
             lastSize = bounds.size
         }
-        let compact = bounds.width < 560
-        let kw: CGFloat = compact ? 34 : 42
-        let gap: CGFloat = compact ? 5 : 9
         let ch: CGFloat = min(40, bounds.height - 10)
         let y = (bounds.height - ch) / 2
-        let pad: CGFloat = 3
-        let left = safeAreaInsets.left + (compact ? 4 : 8)
-        let right = bounds.width - safeAreaInsets.right - (compact ? 4 : 8)
-
-        func capW(_ n: Int) -> CGFloat { CGFloat(n) * kw + 2 * pad }
+        let l = KeyBarLayout.make(width: bounds.width, insetLeft: safeAreaInsets.left, insetRight: safeAreaInsets.right,
+                                  mapPreferred: miniMap.preferredWidth(forHeight: ch), arrowCount: arrowKeys.count)
+        let kw = l.kw, pad = l.pad, gap = l.gap
         func lay(_ capsule: UIView, _ x: CGFloat, _ n: Int) {
-            capsule.frame = CGRect(x: x, y: 0, width: capW(n), height: ch)
+            capsule.frame = CGRect(x: x, y: 0, width: l.capW(n), height: ch)
             capsule.layer.cornerRadius = ch / 2
             var bx = pad
             for case let b as BarKeyButton in capsule.subviews {
@@ -433,75 +439,52 @@ final class WindowsKeyBar: UIView {
             }
         }
 
-        let mapW = compact ? 0 : miniMap.preferredWidth(forHeight: ch)
-        miniMap.isHidden = compact
-        let fixed = capW(1) /* esc */ + capW(5) /* mods */ + capW(1) /* palette */ + capW(1) /* hide */ + mapW
-        let gaps = gap * (compact ? 5 : 6)
-        let leadContent = capW(3) + gap + capW(2)
-        let arrowContent = capW(arrowKeys.count)
-        let avail = max(0, right - left - fixed - gaps)
-        var leadW: CGFloat, arrowW: CGFloat
-        if avail >= leadContent + arrowContent {
-            leadW = leadContent
-            arrowW = arrowContent
-        } else {
-            arrowW = min(arrowContent, max(capW(2) + kw / 2, avail - leadContent))
-            leadW = max(0, avail - arrowW)
-            if leadW < capW(1) {
-                leadW = 0
-                arrowW = avail
-            }
-        }
-
-        var x = left
-        escCapsule.frame.origin = CGPoint(x: x, y: y)
-        lay(escCapsule, x, 1)
+        miniMap.isHidden = l.compact
+        lay(escCapsule, l.escX, 1)
         escCapsule.frame.origin.y = y
-        x += capW(1) + gap
         // no room for the app keys of their own (a phone): they follow the arrows in that row
-        let merged = leadW <= 0
-        let host = merged ? arrows.scroll : lead.scroll
+        let host = l.merged ? arrows.scroll : lead.scroll
         if systemCapsule.superview !== host {
             host.addSubview(systemCapsule)
             host.addSubview(editCapsule)
         }
-        lead.isHidden = merged
-        lead.frame = CGRect(x: x, y: y, width: leadW, height: ch)
-        let appKeysAt = merged ? arrowContent + gap : 0
+        lead.isHidden = l.merged
+        lead.frame = CGRect(x: l.leadX, y: y, width: l.leadW, height: ch)
+        let arrowContent = l.capW(arrowKeys.count)
+        let appKeysAt = l.merged ? arrowContent + gap : 0
         lay(systemCapsule, appKeysAt, 3)
-        lay(editCapsule, appKeysAt + capW(3) + gap, 2)
-        lead.scroll.contentSize = CGSize(width: leadContent, height: ch)
-        if !merged { x += leadW + gap }
-        lay(modsCapsule, x, 5)
+        lay(editCapsule, appKeysAt + l.capW(3) + gap, 2)
+        lead.scroll.contentSize = CGSize(width: l.leadContent, height: ch)
+        lay(modsCapsule, l.modsX, 5)
         modsCapsule.frame.origin.y = y
-        x += capW(5) + gap
-        arrows.frame = CGRect(x: x, y: y, width: max(0, arrowW), height: ch)
+        // no room for even one row: it goes, and its keys are in Shortcuts (rowKeysMenu)
+        arrows.isHidden = l.rowHidden
+        arrows.frame = CGRect(x: l.arrowsX, y: y, width: l.arrowsW, height: ch)
         lay(arrowCapsule, 0, arrowKeys.count)
-        arrows.scroll.contentSize = CGSize(width: merged ? appKeysAt + leadContent : arrowContent, height: ch)
+        arrows.scroll.contentSize = CGSize(width: l.merged ? appKeysAt + l.leadContent : arrowContent, height: ch)
+        for s in [lead, arrows] { // a row made narrower keeps no offset past its end
+            let maxX = max(0, s.scroll.contentSize.width - s.bounds.width)
+            if s.scroll.contentOffset.x > maxX { s.scroll.contentOffset.x = maxX }
+        }
 
         // the rest from the right edge
-        var rx = right
-        if !compact {
-            rx -= mapW
-            miniMap.frame = CGRect(x: rx, y: y, width: mapW, height: ch)
-            rx -= gap
-        }
-        rx -= capW(1)
-        lay(hideCapsule, rx, 1)
+        if !l.compact { miniMap.frame = CGRect(x: l.mapX, y: y, width: l.mapW, height: ch) }
+        lay(hideCapsule, l.hideX, 1)
         hideCapsule.frame.origin.y = y
-        rx -= gap + capW(1)
-        paletteCapsule.frame = CGRect(x: rx, y: y, width: capW(1), height: ch)
+        paletteCapsule.frame = CGRect(x: l.paletteX, y: y, width: l.capW(1), height: ch)
         paletteCapsule.layer.cornerRadius = ch / 2
         paletteButton.frame = CGRect(x: pad, y: 3, width: kw, height: ch - 6)
-
-        // a notice covers the app keys while it shows
-        if lead.isHidden { // over the arrows (scrolling), never over the modifiers
-            noticeCapsule.frame = arrows.frame
-        } else {
-            noticeCapsule.frame = lead.frame
+        if rowHidden != l.rowHidden {
+            rowHidden = l.rowHidden // Shortcuts lists the row's keys while it is gone (its menu reads this when opened)
+            paletteButton.accessibilityHint = rowHidden
+                ? L("方向键、Home/End、开始、撤销，以及剪贴板历史、表情、截图等", "Arrows, Home/End, Start, Undo, plus clipboard history, emoji, snip and more")
+                : L("剪贴板历史、表情、截图、Ctrl+Alt+Del 等", "Clipboard history, emoji, snip, Ctrl+Alt+Del and more")
         }
-        noticeCapsule.layer.cornerRadius = ch / 2
-        noticeLabel.frame = noticeCapsule.bounds.insetBy(dx: 12, dy: 0)
+
+        // where a notice may go: over the row (the app keys' own row first), or between Esc and Shortcuts
+        noticeRows = l.rowHidden ? [] : l.merged ? [arrows.frame] : [lead.frame, arrows.frame]
+        noticeWide = CGRect(x: l.wideNoticeX, y: y, width: min(520, l.wideNoticeW), height: ch)
+        layoutNotice()
     }
 
     override func didMoveToWindow() {
@@ -617,22 +600,65 @@ final class WindowsKeyBar: UIView {
 
     // MARK: notices
 
-    /// A short line over the app keys: transient (a few seconds) or persistent (until cleared).
+    /// A short line over the app keys: transient (a few seconds) or persistent (until cleared). Always
+    /// announced to VoiceOver; drawn where there is room (layoutNotice).
     func showNotice(_ text: String?, persistent: Bool = false) {
         noticeTimer?.invalidate()
         noticeTimer = nil
         if persistent { persistentNotice = text }
         let shown = text ?? persistentNotice
+        transientNotice = !persistent && text != nil
         noticeLabel.text = shown
-        noticeCapsule.isHidden = shown == nil
+        layoutNotice()
         if let shown { UIAccessibility.post(notification: .announcement, argument: shown) }
         if !persistent && text != nil {
             noticeTimer = Timer.scheduledTimer(withTimeInterval: 3.5, repeats: false) { [weak self] _ in
                 guard let self else { return }
+                self.transientNotice = false
                 self.noticeLabel.text = self.persistentNotice
-                self.noticeCapsule.isHidden = self.persistentNotice == nil
+                self.layoutNotice()
             }
         }
+    }
+
+    private static func noticeFont(_ size: CGFloat) -> UIFont { .systemFont(ofSize: size, weight: .medium) }
+
+    /// Places the notice. Over the row when it is wide enough to read; a short-lived one otherwise lies
+    /// between Esc and Shortcuts for its few seconds (it takes no touches: the modifiers under it still
+    /// work). The persistent one (a password field) never covers the modifiers: with no room over the row
+    /// it is only announced. The text gets the largest size (13 down to 10 points) and lines that fit.
+    private func layoutNotice() {
+        let ch = noticeWide.height
+        var frame: CGRect? = nil
+        if noticeLabel.text != nil, ch > 0 {
+            if let row = noticeRows.first(where: { $0.width >= (transientNotice ? 260 : 140) }) {
+                frame = row
+            } else if transientNotice && noticeWide.width >= 100 {
+                frame = noticeWide
+            }
+        }
+        guard let frame else {
+            noticeCapsule.isHidden = true
+            return
+        }
+        noticeCapsule.frame = frame
+        noticeCapsule.layer.cornerRadius = ch / 2
+        let box = noticeCapsule.bounds.insetBy(dx: 12, dy: 2)
+        noticeLabel.frame = box
+        let text = noticeLabel.text ?? ""
+        var font = Self.noticeFont(10)
+        for size in stride(from: CGFloat(13), through: 10, by: -1) {
+            let f = Self.noticeFont(size)
+            let h = (text as NSString).boundingRect(with: CGSize(width: box.width, height: .greatestFiniteMagnitude),
+                                                    options: .usesLineFragmentOrigin, attributes: [.font: f], context: nil).height
+            if h.rounded(.up) <= box.height {
+                font = f
+                break
+            }
+        }
+        noticeLabel.font = font
+        noticeLabel.numberOfLines = max(1, Int(box.height / font.lineHeight)) // what does not fit ends in "…"
+        noticeCapsule.isHidden = false
     }
 
     // MARK: Shortcuts palette
@@ -687,12 +713,56 @@ final class WindowsKeyBar: UIView {
         }
         let top = UIMenu(title: "", options: .displayInline, children: windows)
         if #available(iOS 16.0, *) { top.preferredElementSize = .medium }
+        // the scrolling row's keys while the bar is too narrow for it: read each time the menu opens, so a
+        // menu built before a resize is never stale
+        let rowKeys = UIDeferredMenuElement.uncached { [weak self] done in
+            guard let self, self.rowHidden else { return done([]) }
+            done([self.rowKeysMenu()])
+        }
         return UIMenu(title: L("快捷键", "Shortcuts"), children: [
+            rowKeys,
             top,
             UIMenu(title: L("编辑", "Edit"), options: .displayInline, children: edit),
             UIMenu(title: L("系统", "System"), options: .displayInline, children: system),
             UIMenu(title: "", options: .displayInline, children: [zoom]),
         ])
+    }
+
+    /// The scrolling row's keys, for a bar too narrow to show it. The arrows and Home...Del keep the menu
+    /// open (arrow, arrow, ...); Start, Search, Task View, Undo and Redo close it. Keys take the latched
+    /// modifiers as on the bar (a Shift tapped once is spent on the first arrow, so Select has its own row).
+    /// No hold-to-repeat here: each tap is one press.
+    private func rowKeysMenu() -> UIMenu {
+        func item(_ k: BarKey, title: String? = nil, extra: [UInt8] = [], stays: Bool) -> UIAction {
+            let a = UIAction(title: title ?? k.name, image: k.symbol.flatMap { UIImage(systemName: $0) },
+                             attributes: stays ? .keepsMenuPresented : []) { [weak self] _ in
+                guard let self else { return }
+                switch k.kind {
+                case .key(let u): self.keys.tap(u, extra: extra)
+                case .combo(let m, let u): self.keys.combo(m, u)
+                default: break
+                }
+            }
+            a.subtitle = k.hint
+            return a
+        }
+        let arrows4 = Array(arrowKeys.prefix(4))
+        let dpad = UIMenu(title: "", options: .displayInline, children: arrows4.map { item($0, stays: true) })
+        let selectTitles = [L("向左选择", "Select left"), L("向上选择", "Select up"),
+                            L("向下选择", "Select down"), L("向右选择", "Select right")]
+        let select = UIMenu(title: L("选择（Shift+方向键）", "Select (Shift+arrow)"), options: .displayInline,
+                            children: zip(arrows4, selectTitles).map { item($0, title: $1, extra: [WindowsKeyState.shift], stays: true) })
+        dpad.preferredElementSize = .small
+        select.preferredElementSize = .small
+        let menu = UIMenu(title: L("方向键与应用键", "Arrows and app keys"),
+                          image: UIImage(systemName: "arrow.up.and.down.and.arrow.left.and.right"), children: [
+            dpad,
+            select,
+            UIMenu(title: "", options: .displayInline, children: arrowKeys.dropFirst(4).map { item($0, stays: true) }),
+            UIMenu(title: "", options: .displayInline, children: (systemKeys + editKeys).map { item($0, stays: false) }),
+        ])
+        menu.subtitle = L("键条太窄，放在这里", "Here while the key bar is too narrow")
+        return menu
     }
 }
 
