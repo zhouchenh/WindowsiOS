@@ -94,7 +94,7 @@ class GuardTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             binary = Path(tmp) / "test-neptune-hook"
             subprocess.run(["xcrun", "clang", "-std=c11", "-Wall", "-Wextra", "-Werror", "-O2",
-                            "-pthread", str(ROOT / "tests/test_neptune_hook.c"), "-o", str(binary)], check=True)
+                            "-pthread", str(ROOT / "tests/test_neptune_hook.c"), str(ROOT / "devices/dxmt_data_lock.c"), "-o", str(binary)], check=True)
             for case in ("guards", "install", "interposed", "protect-fail", "rollback", "race",
                          "parents", "callers", "publication", "preflight", "preflight-uuid",
                          "preflight-interposed", "preflight-protect", "preflight-restore",

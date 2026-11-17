@@ -32,6 +32,8 @@
 #include "neptune_cleanup.h"
 #include "neptune_device.h"
 #include "dxmt_shared_init.h"
+#include "dxmt_data_lock.h"
+#include "gpu_map_diagnostics.h"
 
 /* ---- protocol ---- */
 #define F_VIRGL (1ull << 0)
@@ -270,6 +272,7 @@ static void shm_path(char *out, size_t n, const char *name) {
 }
 
 static int hv_shm_open(const char *name, int oflag, ...) {
+    uintptr_t caller = (uintptr_t)__builtin_extract_return_addr(__builtin_return_address(0));
     mode_t mode = 0600;
     if (oflag & O_CREAT) {
         va_list ap;
@@ -279,7 +282,11 @@ static int hv_shm_open(const char *name, int oflag, ...) {
     }
     char p[PATH_MAX];
     shm_path(p, sizeof p, name);
-    return open(p, oflag | O_CLOEXEC, mode);
+    int result = open(p, oflag | O_CLOEXEC, mode);
+    int saved = errno;
+    if (result < 0) hv_gpu_map_diagnostics_open_failed(caller, oflag | O_CLOEXEC, saved);
+    errno = saved;
+    return result;
 }
 
 static int hv_shm_unlink(const char *name) {
@@ -322,13 +329,33 @@ static int rebind_image(const struct mach_header_64 *mh, intptr_t slide) {
                 const char *nm = strs + syms[si].n_un.n_strx;
                 void *to = !strcmp(nm, "_shm_open") ? (void *)hv_shm_open
                            : !strcmp(nm, "_shm_unlink") ? (void *)hv_shm_unlink : NULL;
-                if (!to) continue;
+                if (!to || ptrs[j] == to) continue;
                 vm_address_t page = (vm_address_t)&ptrs[j] & ~(vm_address_t)(vm_page_size - 1);
-                kern_return_t kr = vm_protect(mach_task_self(), page, vm_page_size, 0,
+                vm_address_t region_start = page;
+                vm_size_t region_size = 0;
+                vm_region_basic_info_data_64_t region_info;
+                mach_msg_type_number_t count = VM_REGION_BASIC_INFO_COUNT_64;
+                mach_port_t object = MACH_PORT_NULL;
+                kern_return_t kr = vm_region_64(mach_task_self(), &region_start, &region_size,
+                    VM_REGION_BASIC_INFO_64, (vm_region_info_t)&region_info, &count, &object);
+                if (MACH_PORT_VALID(object)) mach_port_deallocate(mach_task_self(), object);
+                if (kr != KERN_SUCCESS || count < VM_REGION_BASIC_INFO_COUNT_64 || region_start > page || region_size < vm_page_size ||
+                    page - region_start > region_size - vm_page_size ||
+                    !(region_info.protection & VM_PROT_READ) || (region_info.protection & VM_PROT_EXECUTE)) continue;
+                kr = vm_protect(mach_task_self(), page, vm_page_size, 0,
                                               VM_PROT_READ | VM_PROT_WRITE | VM_PROT_COPY);
-                if (kr != KERN_SUCCESS) continue;
+                if (kr != KERN_SUCCESS) {
+                    if (vm_protect(mach_task_self(), page, vm_page_size, 0, region_info.protection) != KERN_SUCCESS) {
+                        hv_gpu_map_diagnostics_poison_imports();
+                        return -1;
+                    }
+                    continue;
+                }
                 ptrs[j] = to;
-                vm_protect(mach_task_self(), page, vm_page_size, 0, VM_PROT_READ);
+                if (vm_protect(mach_task_self(), page, vm_page_size, 0, region_info.protection) != KERN_SUCCESS) {
+                    hv_gpu_map_diagnostics_poison_imports();
+                    return -1;
+                }
                 n++;
             }
         }
@@ -339,10 +366,18 @@ static int rebind_image(const struct mach_header_64 *mh, intptr_t slide) {
 static int rebind_shm(void *any_symbol_in_image) {
     Dl_info info;
     if (!dladdr(any_symbol_in_image, &info)) return 0;
-    for (uint32_t i = 0; i < _dyld_image_count(); i++)
-        if (_dyld_get_image_header(i) == info.dli_fbase)
-            return rebind_image((const struct mach_header_64 *)info.dli_fbase, _dyld_get_image_vmaddr_slide(i));
-    return 0;
+    int result = 0;
+    hv_dxmt_data_lock();
+    if (hv_gpu_map_diagnostics_fatal()) result = -1;
+    else if (!hv_gpu_map_diagnostics_used()) {
+        for (uint32_t i = 0; i < _dyld_image_count(); i++)
+            if (_dyld_get_image_header(i) == info.dli_fbase) {
+                result = rebind_image((const struct mach_header_64 *)info.dli_fbase, _dyld_get_image_vmaddr_slide(i));
+                break;
+            }
+    }
+    hv_dxmt_data_unlock();
+    return result;
 }
 
 /* ---- loading ---- */
@@ -376,6 +411,10 @@ static void *open_fw(const char *dir, const char *rel, int global) {
 }
 
 static int load_libs(HvVgpu3d *s) {
+    if (hv_gpu_map_diagnostics_fatal()) {
+        snprintf(s->why, sizeof s->why, "GPU import page restoration failed; restart required");
+        return -1;
+    }
     if (cleanup_install_fatal) {
         snprintf(s->why, sizeof s->why, "Neptune cleanup installation failed; restart required");
         return -1;
@@ -485,6 +524,18 @@ static int load_libs(HvVgpu3d *s) {
         dxmt_symbol = sym;
         int rb2 = sym ? rebind_shm(sym) : -1;
         LOG("shm_open rebound in dxmt: %d slots\n", rb2);
+    }
+    if (hv_gpu_map_diagnostics_fatal() || rb < 0) {
+        snprintf(s->why, sizeof s->why, "Shared-memory import page restoration failed");
+        return -1;
+    }
+    int map_vr = hv_gpu_map_diagnostics_install((void *)V.virgl_renderer_init, HV_GPU_MAP_VIRGL);
+    int map_dx = map_vr < 0 ? -1 : hv_gpu_map_diagnostics_install(dxmt_symbol, HV_GPU_MAP_DXMT);
+    LOG("GPU mapping diagnostics: virgl=%s; dxmt=%s; limit=64 line attempts/process (concurrent reports skipped)\n",
+        hv_gpu_map_diagnostics_status(HV_GPU_MAP_VIRGL), hv_gpu_map_diagnostics_status(HV_GPU_MAP_DXMT));
+    if (map_vr < 0 || map_dx < 0) {
+        snprintf(s->why, sizeof s->why, "GPU mapping diagnostic import rollback failed; restart required");
+        return -1;
     }
     const char *defer = getenv("HV_NPT_DEFER_RELEASE");
     const char *backend = getenv("NPT_BACKEND");
@@ -646,6 +697,10 @@ static int renderer_init(HvVgpu3d *s) {
     int flags = VIRGL_RENDERER_NEPTUNE | VIRGL_RENDERER_RENDER_SERVER | VIRGL_RENDERER_ASYNC_FENCE_CB |
                 VIRGL_RENDERER_THREAD_SYNC | VIRGL_RENDERER_NATIVE_SHARE_TEXTURE;
     if (getenv("HV_GPU3D_VENUS")) flags |= VIRGL_RENDERER_VENUS;
+    if (hv_gpu_map_diagnostics_mark_used() < 0) {
+        snprintf(s->why, sizeof s->why, "GPU import protection failure; restart required");
+        return -1;
+    }
     hv_npt_device_hooks_mark_used();
     int rc = V.virgl_renderer_init(s, flags, &cbs);
     if (rc != 0) {
@@ -1701,15 +1756,17 @@ int hv_vgpu3d_describe(HvVgpu3d *s, char *buf, unsigned len) {
     pthread_mutex_lock(&s->mu);
     int drain_on = s->drain.on;
     pthread_mutex_unlock(&s->mu);
+    uint64_t map_attempts, map_suppressed;
+    hv_gpu_map_diagnostics_counts(&map_attempts, &map_suppressed);
     char cleanup[1024];
     hv_npt_cleanup_describe(cleanup, sizeof cleanup);
     char shared[384] = "shared-init=off";
     if (atomic_load(&shared_init_installed)) hv_dxmt_shared_init_describe(shared, sizeof shared);
     return snprintf(buf, len,
-                    "on cleanup=%s capsets=%u ctxs=%llu cmds=%llu submits=%llu (%lluKB) blobs=%llu maps=%llu fences=%llu "
+                    "on cleanup=%s map_diag=%llu/64 suppressed>=%llu capsets=%u ctxs=%llu cmds=%llu submits=%llu (%lluKB) blobs=%llu maps=%llu fences=%llu "
                     "(ring %llu global %llu) errors=%llu submit_errors=%llu live_ctxs=%u (neptune %u, peak %u) scanout=%u %ux%u%s "
                     "resets=%llu (skipped %llu) hostmem@%#llx %s %s drain=%s trips=%llu drained=%llu (ring %llu global %llu, this trip %llu, oldest %llums)",
-                    cleanup_status(), s->ncapsets, (unsigned long long)s->ctxs, (unsigned long long)s->cmds,
+                    cleanup_status(), (unsigned long long)map_attempts, (unsigned long long)map_suppressed, s->ncapsets, (unsigned long long)s->ctxs, (unsigned long long)s->cmds,
                     (unsigned long long)s->submits, (unsigned long long)(s->submit_bytes >> 10),
                     (unsigned long long)s->blobs, (unsigned long long)s->maps, (unsigned long long)s->fences,
                     (unsigned long long)s->fenced_ring, (unsigned long long)s->fenced_global,
