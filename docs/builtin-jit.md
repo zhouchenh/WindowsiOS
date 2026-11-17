@@ -147,6 +147,38 @@ The server must forward IPv4 (`net.ipv4.ip_forward=1`) and its firewall must all
 service through it (which would still need the pairing). Several devices take one reflector address
 and one rule each.
 
+**IPv6 reflector (NAT66)**: the simplest when the device has a global IPv6 address in the VPN, and
+tested: Test connection reaches RemotePairing through it and opens a session. Three addresses of the VPN's prefix: the device's own
+`T` = `2001:db8:0:1::abcd`, the reflector `R` = `2001:db8:0:2::abcd` and a source `S` =
+`2001:db8:0:3::abcd`, for example the same interface identifier in three /64s. `R` and `S` are not
+assigned to anything: the server rewrites `R` to `T` before routing and puts `S` on the packets it
+sends back. The device's peer must route `R` into the tunnel and accept `S` as a source (both in
+AllowedIPs, or `::/0`). With nftables:
+
+```
+table ip6 jit_reflector6 {
+    chain prerouting {
+        type nat hook prerouting priority dstnat;
+        iifname "wg0" ip6 saddr 2001:db8:0:1::abcd ip6 daddr 2001:db8:0:2::abcd dnat to 2001:db8:0:1::abcd
+    }
+    chain postrouting {
+        type nat hook postrouting priority srcnat;
+        oifname "wg0" ip6 daddr 2001:db8:0:1::abcd ct status dnat snat to 2001:db8:0:3::abcd
+    }
+}
+```
+
+or with ip6tables:
+
+```
+ip6tables -t nat -A PREROUTING -i wg0 -s 2001:db8:0:1::abcd -d 2001:db8:0:2::abcd -j DNAT --to-destination 2001:db8:0:1::abcd
+ip6tables -t nat -A POSTROUTING -o wg0 -d 2001:db8:0:1::abcd -m conntrack --ctstate DNAT -j SNAT --to-source 2001:db8:0:3::abcd
+```
+
+`masquerade` / `-j MASQUERADE` in place of the SNAT works too, with the server's own IPv6 address on
+`wg0` as the source (the device's peer must then accept that one). The server must forward IPv6
+(`net.ipv6.conf.all.forwarding=1`) and allow `wg0` to `wg0`. In Apple VM, enter `R`.
+
 **IPv6 reflector to the device's IPv4 address (NAT64)**: useful when the device has a global IPv6
 address in the VPN and you would rather not spend IPv4 addresses. `R` is an IPv6 address routed to the
 server, for example one in a second /64 of the VPN's prefix with the device's interface identifier
