@@ -1,3 +1,9 @@
+// Apple VM's JIT script, run by the built-in JIT helper or by StikDebug.
+// Origin: StikDebug's StikDebug/Scripts/universal.js (https://github.com/StephenDev0/StikDebug), as adapted
+// by Henge (https://github.com/Leviidev/Henge), with small changes in this repository (see its git history).
+// The upstream file carries no licence header of its own; the StikDebug repository is licensed under the
+// GNU Affero General Public License, version 3 (legal/LICENSE-AGPL-3.0.txt). This file is distributed under
+// those terms. Its source is this file itself, and it is also in the Apple VM source repository.
 const CMD_DETACH = 0;
 const CMD_PREPARE_REGION = 1;
 const CMD_NEW_BREAKPOINTS = 2;
